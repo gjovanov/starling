@@ -1,0 +1,37 @@
+# Python
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+
+# Media files
+media/
+*.wav
+*.mp3
+*.flac
+*.ogg
+
+# Models
+*.bin
+*.onnx
+*.safetensors
+*.pt
+
+# Logs
+*.log
+crash.log
+
+# IDE
+.idea/
+.vscode/
+*.DS_Store
+
+# Benchmark results
+scripts/benchmark_results/

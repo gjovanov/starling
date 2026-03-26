@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>COTURN Test</title>
+<style>
+  body { font-family: monospace; padding: 20px; background: #1a1a1a; color: #e0e0e0; }
+  input, button { font-family: monospace; font-size: 14px; padding: 6px; margin: 4px 0; }
+  input { background: #2a2a2a; color: #e0e0e0; border: 1px solid #555; }
+  button { background: #4a9eff; color: white; border: none; cursor: pointer; padding: 8px 16px; }
+  button:hover { background: #3a8eef; }
+  #log { white-space: pre-wrap; font-size: 13px; line-height: 1.5; margin-top: 16px; }
+  .pass { color: #4caf50; } .fail { color: #f44336; } .info { color: #aaa; }
+  label { display: inline-block; width: 120px; }
+</style>
+</head>
+<body>
+<h3>COTURN Connectivity Test</h3>
+<div>
+  <label>Shared Secret:</label>
+  <input id="secret" type="text" value="" style="width: 500px" placeholder="leave empty for static credentials"/>
+</div>
+<div>
+  <label>Username:</label>
+  <input id="username" type="text" value="" style="width: 500px"/>
+</div>
+<div>
+  <label>Credential:</label>
+  <input id="credential" type="text" value="" style="width: 500px"/>
+</div>
+<div>
+  <label>TURN URLs:</label>
+  <input id="urls" type="text" value="" style="width: 500px" placeholder="comma-separated"/>
+</div>
+<div>
+  <label>Timeout (ms):</label>
+  <input id="timeout" type="number" value="10000" style="width: 100px"/>
+</div>
+<br/>
+<button onclick="runTests()">Run Tests</button>
+<button onclick="loadFromServer()">Load from Server Config</button>
+<div id="log"></div>
+
+<script>
+const log = document.getElementById('log');
+function logMsg(msg, cls='') { log.innerHTML += cls ? `<span class="${cls}">${msg}</span>\n` : msg + '\n'; }
+function timestamp() { return new Date().toLocaleTimeString('de-AT', {hour12:false, hour:'2-digit',minute:'2-digit',second:'2-digit',fractionalSecondDigits:3}); }
+
+// Generate ephemeral TURN credentials (RFC 5389 HMAC-SHA1)
+async function generateEphemeralCreds(secret) {
+  const expiry = Math.floor(Date.now() / 1000) + 3600;
+  const username = `${expiry}:coturntest`;
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(secret), {name:'HMAC', hash:'SHA-1'}, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(username));
+  const credential = btoa(String.fromCharCode(...new Uint8Array(sig)));
+  return { username, credential };
+}
+
+async function loadFromServer() {
+  try {
+    const resp = await fetch('/api/config');
+    const config = await resp.json();
+    const data = config.data || config;
+    const iceServers = data.iceServers || [];
+    const turnServer = iceServers.find(s => {
+      const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+      return urls.some(u => u.startsWith('turn:') || u.startsWith('turns:'));
+    });
+    if (turnServer) {
+      const urls = Array.isArray(turnServer.urls) ? turnServer.urls : [turnServer.urls];
+      document.getElementById('urls').value = urls.join(', ');
+      document.getElementById('username').value = turnServer.username || '';
+      document.getElementById('credential').value = turnServer.credential || '';
+      document.getElementById('secret').value = '';
+      logMsg(`${timestamp()} Loaded from /api/config: ${urls.join(', ')}`, 'info');
+    } else {
+      logMsg(`${timestamp()} No TURN server found in /api/config`, 'fail');
+    }
+  } catch(e) {
+    logMsg(`${timestamp()} Failed to load config: ${e.message}`, 'fail');
+  }
+}
+
+function testTURN(url, username, credential, timeout) {
+  return new Promise((resolve) => {
+    let resolved = false;
+    const timer = setTimeout(() => {
+      if (!resolved) { resolved = true; resolve(false); logMsg(`${timestamp()} ${url} => TIMEOUT (no relay candidate in ${timeout}ms)`, 'fail'); }
+    }, timeout);
+
+    try {
+      const pc = new RTCPeerConnection({
+        iceServers: [{ urls: url, username, credential }],
+        iceTransportPolicy: 'relay'
+      });
+      pc.createDataChannel('test');
+      pc.createOffer().then(offer => {
+        logMsg(`${timestamp()} ${url} offer created, setting local description...`);
+        if (offer.sdp.indexOf('typ relay') > -1) {
+          if (!resolved) { resolved = true; clearTimeout(timer); resolve(true); logMsg(`${timestamp()} ${url} => PASS (relay in SDP)`, 'pass'); }
+        }
+        return pc.setLocalDescription(offer);
+      }).then(() => {
+        logMsg(`${timestamp()} ${url} ICE gathering started...`);
+      }).catch(err => {
+        if (!resolved) { resolved = true; clearTimeout(timer); resolve(false); logMsg(`${timestamp()} ${url} => ERROR: ${err.message}`, 'fail'); }
+      });
+
+      pc.onicegatheringstatechange = () => {
+        logMsg(`${timestamp()} ${url} gathering: ${pc.iceGatheringState}`, 'info');
+      };
+      pc.onicecandidate = (ice) => {
+        if (resolved || !ice || !ice.candidate) return;
+        const c = ice.candidate.candidate;
+        logMsg(`${timestamp()} ${url} candidate: ${c}`, 'info');
+        if (c.indexOf('typ relay') > -1) {
+          resolved = true; clearTimeout(timer); resolve(true);
+          logMsg(`${timestamp()} ${url} => PASS (relay candidate found)`, 'pass');
+        }
+      };
+    } catch(err) {
+      if (!resolved) { resolved = true; clearTimeout(timer); resolve(false); logMsg(`${timestamp()} ${url} => ERROR: ${err.message}`, 'fail'); }
+    }
+  });
+}
+
+async function runTests() {
+  log.innerHTML = '';
+  const secret = document.getElementById('secret').value.trim();
+  const timeout = parseInt(document.getElementById('timeout').value) || 10000;
+  let username = document.getElementById('username').value.trim();
+  let credential = document.getElementById('credential').value.trim();
+
+  logMsg(`${timestamp()} === Starting COTURN test ===`);
+
+  if (secret) {
+    const creds = await generateEphemeralCreds(secret);
+    username = creds.username;
+    credential = creds.credential;
+    logMsg(`${timestamp()} Auth mode: ephemeral credentials (use-auth-secret)`);
+  } else {
+    logMsg(`${timestamp()} Auth mode: static credentials`);
+  }
+  logMsg(`${timestamp()} Username: ${username}`);
+  logMsg(`${timestamp()} Credential: ${credential}`);
+
+  const rawUrls = document.getElementById('urls').value.trim();
+  const urls = rawUrls.split(',').map(u => u.trim()).filter(Boolean);
+  logMsg(`${timestamp()} Testing ${urls.length} URL(s) with ${timeout}ms timeout each...`);
+  logMsg('');
+
+  let passCount = 0;
+  for (const url of urls) {
+    logMsg(`${timestamp()} --- Testing: ${url} ---`);
+    const ok = await testTURN(url, username, credential, timeout);
+    if (ok) passCount++;
+    logMsg('');
+  }
+
+  if (passCount > 0) {
+    logMsg(`${timestamp()} === Result: ${passCount}/${urls.length} TURN endpoints REACHABLE ===`, 'pass');
+  } else {
+    logMsg(`${timestamp()} === Result: TURN server NOT reachable ===`, 'fail');
+  }
+}
+
+// Auto-load config from server on page load
+window.onload = async () => {
+  await loadFromServer();
+  // Also set shared secret field for manual ephemeral testing
+  document.getElementById('secret').value = '';
+};
+</script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+[project]
+name = "voxtral-server"
+version = "0.1.0"
+description = "Standalone Voxtral ASR server with vLLM backend"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "websockets>=14.0",
+    "aiortc>=1.9",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "python-multipart>=0.0.18",
+    "aiofiles>=24.0",
+]
+
+[project.scripts]
+voxtral-server = "voxtral_server.main:run"
