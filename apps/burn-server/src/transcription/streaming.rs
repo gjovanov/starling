@@ -60,67 +60,6 @@ pub fn split_sentences(text: &str) -> Vec<String> {
     sentences
 }
 
-/// Tracks growing text for the "growing_segments" transcription mode.
-///
-/// Accumulates partial text updates and detects when a sentence is complete.
-pub struct GrowingTextTracker {
-    confirmed_text: String,
-    partial_text: String,
-    segment_index: u32,
-}
-
-impl GrowingTextTracker {
-    pub fn new() -> Self {
-        Self {
-            confirmed_text: String::new(),
-            partial_text: String::new(),
-            segment_index: 0,
-        }
-    }
-
-    /// Update with new transcription output. Returns (final_sentences, partial_text).
-    pub fn update(&mut self, new_text: &str) -> (Vec<(String, u32)>, Option<(String, u32)>) {
-        let full_text = format!("{}{}", self.confirmed_text, new_text);
-        let sentences = split_sentences(&full_text);
-
-        let mut finals = Vec::new();
-
-        if sentences.len() > 1 {
-            // All but last are confirmed/final
-            for sentence in &sentences[..sentences.len() - 1] {
-                finals.push((sentence.clone(), self.segment_index));
-                self.segment_index += 1;
-            }
-            // Update confirmed text to include finalized sentences
-            self.confirmed_text = sentences[..sentences.len() - 1].join(" ") + " ";
-            self.partial_text = sentences.last().cloned().unwrap_or_default();
-        } else {
-            self.partial_text = full_text;
-        }
-
-        let partial = if !self.partial_text.is_empty() {
-            Some((self.partial_text.clone(), self.segment_index))
-        } else {
-            None
-        };
-
-        (finals, partial)
-    }
-
-    /// Flush any remaining partial text as a final segment.
-    pub fn flush(&mut self) -> Option<(String, u32)> {
-        if !self.partial_text.is_empty() {
-            let text = self.partial_text.clone();
-            let idx = self.segment_index;
-            self.partial_text.clear();
-            self.segment_index += 1;
-            Some((text, idx))
-        } else {
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,24 +86,5 @@ mod tests {
     fn test_split_sentences_empty() {
         assert!(split_sentences("").is_empty());
         assert!(split_sentences("   ").is_empty());
-    }
-
-    #[test]
-    fn test_growing_text_tracker() {
-        let mut tracker = GrowingTextTracker::new();
-
-        // Partial update
-        let (finals, partial) = tracker.update("Hello world");
-        assert!(finals.is_empty());
-        assert_eq!(partial.unwrap().0, "Hello world");
-
-        // Sentence boundary detected
-        let (finals, partial) = tracker.update(". How are you");
-        assert_eq!(finals.len(), 1);
-        assert!(partial.is_some());
-
-        // Flush remaining
-        let flushed = tracker.flush();
-        assert!(flushed.is_some());
     }
 }

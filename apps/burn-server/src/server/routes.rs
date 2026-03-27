@@ -346,9 +346,7 @@ pub async fn start_session(
         session_id: session_id.clone(),
         media_path,
         language: session_info.language.clone(),
-        mode: session_info.mode.clone(),
         quant: session_info.quant.clone(),
-        batch_duration_ms: 500,
     };
 
     tokio::spawn(async move {

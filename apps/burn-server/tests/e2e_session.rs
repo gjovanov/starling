@@ -14,7 +14,7 @@ use axum::{
 };
 use burn_server::{
     config::{Config, Quantization},
-    inference::InferenceEngine,
+    inference::{InferenceEngine, InferenceSession},
     server::{routes, state::AppState},
 };
 use tower::ServiceExt;
@@ -23,26 +23,47 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 
-/// Mock inference engine that returns fixed text.
+/// Mock inference session returning fixed text per commit.
+struct MockSession {
+    response: String,
+    commits: usize,
+}
+
+impl InferenceSession for MockSession {
+    fn send_audio(&mut self, _samples: &[f32]) {}
+    fn commit(&mut self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        self.commits += 1;
+        Ok(self.response.clone())
+    }
+    fn reset(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.commits = 0;
+        Ok(())
+    }
+    fn commit_count(&self) -> usize {
+        self.commits
+    }
+}
+
+/// Mock inference engine.
 struct MockEngine {
     response: String,
 }
 
 impl MockEngine {
     fn new(response: &str) -> Self {
-        Self {
-            response: response.to_string(),
-        }
+        Self { response: response.to_string() }
     }
 }
 
 impl InferenceEngine for MockEngine {
-    fn transcribe(
+    fn create_session(
         &self,
-        _audio: &[f32],
         _language: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.response.clone())
+    ) -> Result<Box<dyn InferenceSession>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Box::new(MockSession {
+            response: self.response.clone(),
+            commits: 0,
+        }))
     }
 }
 
