@@ -14,5 +14,8 @@ dependencies = [
     "aiofiles>=24.0",
 ]
 
+[tool.setuptools.packages.find]
+include = ["voxtral_server*"]
+
 [project.scripts]
 voxtral-server = "voxtral_server.main:run"
