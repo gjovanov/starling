@@ -276,15 +276,87 @@ pub async fn start_session(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
-    let mut sessions = state.sessions.write().await;
-    match sessions.get_mut(&session_id) {
-        Some(ctx) => {
-            ctx.info.state = SessionState::Starting;
-            // TODO: spawn transcription task
-            ApiResponse::ok(ctx.info.clone()).into_response()
+    // Validate session exists and get its info
+    let session_info = {
+        let mut sessions = state.sessions.write().await;
+        match sessions.get_mut(&session_id) {
+            Some(ctx) => {
+                if ctx.info.state != SessionState::Created {
+                    return error_response("Session already started").into_response();
+                }
+                ctx.info.state = SessionState::Starting;
+                ctx.info.clone()
+            }
+            None => return error_response("Session not found").into_response(),
         }
-        None => error_response("Session not found").into_response(),
+    };
+
+    // Check that we have an inference engine
+    let engine = match &state.engine {
+        Some(e) => e.clone(),
+        None => return error_response("Inference engine not loaded").into_response(),
+    };
+
+    // Resolve media file path
+    let media_path = match &session_info.media_id {
+        Some(media_id) => state.config.media_dir.join(media_id),
+        None => return error_response("No media_id specified").into_response(),
+    };
+
+    if !media_path.exists() {
+        return error_response(&format!("Media file not found: {}", media_path.display()))
+            .into_response();
     }
+
+    // Create subtitle broadcast channel
+    let (subtitle_tx, mut subtitle_rx) =
+        tokio::sync::mpsc::channel::<crate::server::state::SubtitleMessage>(256);
+
+    // Create state update channel
+    let (state_tx, mut state_rx) =
+        tokio::sync::mpsc::channel::<(String, SessionState)>(16);
+
+    // Spawn task to forward subtitles to session subscribers
+    let state_clone = state.clone();
+    let sid = session_id.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = subtitle_rx.recv().await {
+            let sessions = state_clone.sessions.read().await;
+            if let Some(ctx) = sessions.get(&sid) {
+                for sub in &ctx.subscribers {
+                    let _ = sub.send(msg.clone()).await;
+                }
+            }
+        }
+    });
+
+    // Spawn task to update session state
+    let state_clone2 = state.clone();
+    tokio::spawn(async move {
+        while let Some((sid, new_state)) = state_rx.recv().await {
+            let mut sessions = state_clone2.sessions.write().await;
+            if let Some(ctx) = sessions.get_mut(&sid) {
+                ctx.info.state = new_state;
+            }
+        }
+    });
+
+    // Spawn the transcription session
+    let runner_config = crate::transcription::session::SessionRunnerConfig {
+        session_id: session_id.clone(),
+        media_path,
+        language: session_info.language.clone(),
+        mode: session_info.mode.clone(),
+        quant: session_info.quant.clone(),
+        batch_duration_ms: 500,
+    };
+
+    tokio::spawn(async move {
+        crate::transcription::session::run_session(runner_config, engine, subtitle_tx, state_tx)
+            .await;
+    });
+
+    ApiResponse::ok(session_info).into_response()
 }
 
 // ── Config ──────────────────────────────────────────────────────────

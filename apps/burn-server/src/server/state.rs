@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::inference::InferenceEngine;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
@@ -69,6 +70,8 @@ pub struct AppState {
     pub sessions: RwLock<HashMap<String, SessionContext>>,
     pub clients: Mutex<HashMap<String, ClientConnection>>,
     pub client_count: AtomicU64,
+    /// Shared inference engine (Q4 or BF16, loaded at startup)
+    pub engine: Option<Arc<dyn InferenceEngine>>,
 }
 
 impl AppState {
@@ -79,6 +82,12 @@ impl AppState {
             sessions: RwLock::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
             client_count: AtomicU64::new(0),
+            engine: None,
         }
+    }
+
+    pub fn with_engine(mut self, engine: Arc<dyn InferenceEngine>) -> Self {
+        self.engine = Some(engine);
+        self
     }
 }
