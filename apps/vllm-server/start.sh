@@ -8,6 +8,7 @@
 #      vllm serve mistralai/Voxtral-Mini-4B-Realtime-2602 --port 8001
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 VENV_DIR="$SCRIPT_DIR/.venv"
 
 # Activate venv if it exists
@@ -18,8 +19,8 @@ elif ! python3 -c "import voxtral_server" 2>/dev/null; then
     exit 1
 fi
 
-export VOXTRAL_FRONTEND_PATH="${VOXTRAL_FRONTEND_PATH:-$SCRIPT_DIR/frontend}"
-export VOXTRAL_MEDIA_DIR="${VOXTRAL_MEDIA_DIR:-$SCRIPT_DIR/media}"
+export VOXTRAL_FRONTEND_PATH="${VOXTRAL_FRONTEND_PATH:-$PROJECT_DIR/frontend}"
+export VOXTRAL_MEDIA_DIR="${VOXTRAL_MEDIA_DIR:-$PROJECT_DIR/media}"
 export VOXTRAL_PORT="${VOXTRAL_PORT:-80}"
 export VOXTRAL_VLLM_URL="${VOXTRAL_VLLM_URL:-ws://localhost:8001/v1/realtime}"
 

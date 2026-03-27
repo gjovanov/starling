@@ -18,8 +18,9 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 VENV_DIR="$SCRIPT_DIR/.venv"
+MODELS_DIR="${STARLING_MODELS_DIR:-$PROJECT_DIR/models/cache}"
 MODEL_ID="mistralai/Voxtral-Mini-4B-Realtime-2602"
 
 # Parse args
@@ -258,9 +259,21 @@ download_model() {
 
     echo "[6/6] Ensuring model is cached: $MODEL_ID"
 
-    # Check HF token
+    # Use shared model download script if available
+    local download_script="$PROJECT_DIR/models/download.sh"
+    if [ -x "$download_script" ]; then
+        echo "  Using shared model downloader..."
+        "$download_script" --bf16-only
+        return 0
+    fi
+
+    # Fallback: download directly
+    # Check HF token from app .env, root .env, or environment
     local hf_token=""
-    if [ -f "$PROJECT_DIR/.env" ]; then
+    if [ -f "$SCRIPT_DIR/.env" ]; then
+        hf_token=$(grep -E "^HF_TOKEN=" "$SCRIPT_DIR/.env" 2>/dev/null | cut -d'=' -f2 || echo "")
+    fi
+    if [ -z "$hf_token" ] && [ -f "$PROJECT_DIR/.env" ]; then
         hf_token=$(grep -E "^HF_TOKEN=" "$PROJECT_DIR/.env" 2>/dev/null | cut -d'=' -f2 || echo "")
     fi
     hf_token="${hf_token:-$HF_TOKEN}"
@@ -271,23 +284,23 @@ download_model() {
         echo "  [INFO] Using HF token for authentication"
     fi
 
-    # Use hf cli to download (comes with huggingface_hub)
-    # "hf download" is the current command; "huggingface-cli download" is deprecated
+    # Download to shared models directory
+    mkdir -p "$MODELS_DIR/bf16"
+
     if command -v hf &>/dev/null; then
         echo "  Downloading via hf cli (this may take a while on first run)..."
-        hf download "$MODEL_ID" --quiet 2>&1 | tail -3
-        echo "  [DONE] Model cached"
+        hf download "$MODEL_ID" --local-dir "$MODELS_DIR/bf16" --quiet 2>&1 | tail -3
+        echo "  [DONE] Model cached at $MODELS_DIR/bf16"
     elif command -v huggingface-cli &>/dev/null; then
         echo "  Downloading via huggingface-cli (this may take a while on first run)..."
-        huggingface-cli download "$MODEL_ID" --quiet 2>&1 | tail -3
-        echo "  [DONE] Model cached"
+        huggingface-cli download "$MODEL_ID" --local-dir "$MODELS_DIR/bf16" --quiet 2>&1 | tail -3
+        echo "  [DONE] Model cached at $MODELS_DIR/bf16"
     else
-        # Install huggingface_hub and download
         pip install --quiet huggingface_hub
         python -c "
 from huggingface_hub import snapshot_download
 print('  Downloading model (this may take a while on first run)...')
-path = snapshot_download('$MODEL_ID')
+path = snapshot_download('$MODEL_ID', local_dir='$MODELS_DIR/bf16')
 print(f'  [DONE] Model cached at: {path}')
 "
     fi
@@ -394,7 +407,7 @@ echo "  1. Activate the venv:"
 echo "     source $VENV_DIR/bin/activate"
 echo ""
 echo "  2. Start vLLM (GPU server, separate terminal):"
-echo "     vllm serve $MODEL_ID --port 8001"
+echo "     ./start-vllm.sh"
 echo ""
 echo "  3. Start voxtral-server (another terminal):"
 echo "     cd $SCRIPT_DIR && ./start.sh"

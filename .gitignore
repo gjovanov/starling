@@ -8,6 +8,10 @@ __pycache__/
 dist/
 build/
 
+# Rust
+target/
+wasm/pkg/
+
 # Environment
 .env
 
@@ -18,11 +22,13 @@ media/
 *.flac
 *.ogg
 
-# Models
+# Models (shared cache)
+models/cache/
 *.bin
 *.onnx
 *.safetensors
 *.pt
+*.gguf
 
 # Logs
 *.log
