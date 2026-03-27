@@ -129,6 +129,9 @@ function cacheElements() {
   elements.fileInput = document.getElementById('file-input');
   elements.mediaList = document.getElementById('media-list');
 
+  // Quantization select
+  elements.quantSelect = document.getElementById('quant-select');
+
   // Noise cancellation and diarization elements
   elements.noiseSelect = document.getElementById('noise-select');
   elements.diarizationSelect = document.getElementById('diarization-select');
@@ -396,6 +399,7 @@ function setupEventListeners() {
     const noiseCancellation = elements.noiseSelect?.value || 'none';
     const diarization = elements.diarizationSelect?.value !== 'none';
     const sentenceCompletion = elements.sentenceCompletionSelect?.value || 'minimal';
+    const quant = elements.quantSelect?.value || 'q4';
 
     // Determine source based on active tab
     let mediaId = null;
@@ -475,7 +479,8 @@ function setupEventListeners() {
         fabEnabled,
         fabUrl,
         fabSendType,
-        withoutTranscription
+        withoutTranscription,
+        quant
       });
       // Auto-start the session
       await sessionManager.startSession(session.id);

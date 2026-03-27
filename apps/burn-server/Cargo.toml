@@ -5,6 +5,10 @@ edition = "2021"
 description = "Real-time Voxtral ASR server using Burn ML framework with Q4/BF16 inference and WASM browser mode"
 license = "MIT"
 
+[lib]
+name = "burn_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "burn-server"
 path = "src/main.rs"
@@ -51,6 +55,9 @@ base64 = "0.22"
 hmac = "0.12"
 sha1 = "0.10"
 libc = "0.2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 [features]
 default = ["native"]

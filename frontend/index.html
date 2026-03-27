@@ -424,6 +424,18 @@
             </select>
           </div>
 
+          <div class="form-group" id="quant-select-group">
+            <label for="quant-select">Quantization</label>
+            <select id="quant-select">
+              <option value="q4">Q4 (fast, ~700MB)</option>
+              <option value="bf16">BF16 (accurate, ~9GB)</option>
+            </select>
+          </div>
+
+          <!-- WASM Mode (hidden by default, shown when Q4 is selected) -->
+          <div id="wasm-mode-container" style="display: none;">
+          </div>
+
           <!-- Source Type Tabs -->
           <div class="form-group">
             <label>Audio Source</label>

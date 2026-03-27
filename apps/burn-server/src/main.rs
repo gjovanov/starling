@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Media
         .route("/api/media", get(server::routes::list_media))
         .route("/api/media/upload", post(server::routes::upload_media))
-        .route("/api/media/{id}", delete(server::routes::delete_media))
+        .route("/api/media/:id", delete(server::routes::delete_media))
         // Modes
         .route("/api/modes", get(server::routes::list_modes))
         // Noise cancellation
@@ -120,14 +120,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Sessions
         .route("/api/sessions", get(server::routes::list_sessions))
         .route("/api/sessions", post(server::routes::create_session))
-        .route("/api/sessions/{id}", get(server::routes::get_session))
-        .route("/api/sessions/{id}", delete(server::routes::stop_session))
+        .route("/api/sessions/:id", get(server::routes::get_session))
+        .route("/api/sessions/:id", delete(server::routes::stop_session))
         .route(
-            "/api/sessions/{id}/start",
+            "/api/sessions/:id/start",
             post(server::routes::start_session),
         )
         // WebSocket
-        .route("/ws/{session_id}", get(server::ws::ws_handler))
+        .route("/ws/:session_id", get(server::ws::ws_handler))
         // Static frontend
         .fallback_service(ServeDir::new(&frontend_path))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)) // 2GB upload

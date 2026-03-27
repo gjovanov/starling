@@ -1086,6 +1086,7 @@ dependencies = [
  "sha1",
  "tokenizers",
  "tokio",
+ "tower",
  "tower-http 0.5.2",
  "tracing",
  "uuid",

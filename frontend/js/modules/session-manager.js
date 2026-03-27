@@ -154,6 +154,7 @@ export class SessionManager {
    * @param {string} [options.fabEnabled='default'] - FAB forwarding ("default", "enabled", "disabled")
    * @param {string} [options.fabUrl=''] - FAB endpoint URL override
    * @param {string} [options.fabSendType='default'] - FAB send type ("default", "growing", "confirmed")
+   * @param {string} [options.quant='q4'] - Quantization level ("q4" or "bf16")
    */
   async createSession(modelId, options = {}) {
     const {
@@ -169,7 +170,8 @@ export class SessionManager {
       fabEnabled = 'default',
       fabUrl = '',
       fabSendType = 'default',
-      withoutTranscription = false
+      withoutTranscription = false,
+      quant = 'q4'
     } = options;
 
     try {
@@ -178,7 +180,8 @@ export class SessionManager {
         language,
         noise_cancellation: noiseCancellation,
         diarization: diarization,
-        sentence_completion: sentenceCompletion
+        sentence_completion: sentenceCompletion,
+        quant
       };
 
       if (withoutTranscription) {
