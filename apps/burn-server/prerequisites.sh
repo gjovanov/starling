@@ -9,6 +9,7 @@
 #
 # What this installs:
 #   - Rust toolchain (via rustup)
+#   - Vulkan SDK + loader (GPU compute via wgpu)
 #   - wasm-pack (for WASM browser builds)
 #   - pkg-config, libsndfile (audio processing)
 #   - FFmpeg (media file decoding)
@@ -62,6 +63,31 @@ if command -v wasm-pack &>/dev/null; then
     ok "wasm-pack ($(wasm-pack --version 2>/dev/null | awk '{print $2}'))"
 else
     warn "wasm-pack not installed (needed for WASM browser builds)"
+fi
+
+# Vulkan (required by wgpu for GPU compute)
+VULKAN_OK=false
+if ldconfig -p 2>/dev/null | grep -q libvulkan; then
+    VULKAN_OK=true
+    # Try to get version from vulkaninfo
+    if command -v vulkaninfo &>/dev/null; then
+        VK_VER=$(vulkaninfo --summary 2>/dev/null | grep "apiVersion" | head -1 | awk '{print $NF}' || echo "")
+        if [ -n "$VK_VER" ]; then
+            ok "Vulkan $VK_VER"
+        else
+            ok "Vulkan (libvulkan found)"
+        fi
+    else
+        ok "Vulkan (libvulkan found, vulkaninfo not installed)"
+    fi
+elif [ -f /usr/lib/x86_64-linux-gnu/libvulkan.so.1 ] || [ -f /usr/lib/aarch64-linux-gnu/libvulkan.so.1 ]; then
+    VULKAN_OK=true
+    ok "Vulkan (libvulkan.so.1 found)"
+else
+    fail "Vulkan (libvulkan1 + mesa-vulkan-drivers)"
+    echo -e "         ${YELLOW}Vulkan is required by wgpu for GPU compute.${NC}"
+    echo -e "         Install with: sudo apt install libvulkan1 mesa-vulkan-drivers vulkan-tools"
+    ALL_OK=false
 fi
 
 # FFmpeg
@@ -159,7 +185,11 @@ $SUDO apt-get install -y -qq \
     pkg-config \
     libsndfile1-dev \
     curl \
-    git
+    git \
+    libvulkan1 \
+    libvulkan-dev \
+    mesa-vulkan-drivers \
+    vulkan-tools
 
 echo ""
 echo "========================================"
