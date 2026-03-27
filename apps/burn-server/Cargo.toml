@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 # ML framework
-burn = { version = "0.20", features = ["wgpu", "default"] }
+burn = { version = "0.20", features = ["wgpu", "default", "template"] }
 cubecl = { version = "0.9", features = ["wgpu"] }
 
 # HTTP server
@@ -28,6 +28,9 @@ num-complex = "0.4"
 # Model loading
 safetensors = "0.7"
 half = "2.7"
+byteorder = "1.5"
+anyhow = "1.0"
+tracing = "0.1"
 memmap2 = "0.9"
 tokenizers = "0.22"
 

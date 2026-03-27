@@ -7,5 +7,4 @@
 //!
 //! Left-padding: 32 silence tokens (standard, upstream default)
 
-// TODO: Port from voxtral-mini-realtime-rs src/models/
-// Files to port: encoder.rs, decoder.rs, adapter.rs, attention.rs, kv_cache.rs, rope.rs
+pub mod layers;

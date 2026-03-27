@@ -1,4 +1,5 @@
 pub mod bf16;
+pub mod config;
 pub mod q4;
 
 /// Inference engine trait — abstracts over Q4 and BF16 model implementations.

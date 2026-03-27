@@ -1062,10 +1062,12 @@ dependencies = [
 name = "burn-server"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "audiopus",
  "axum 0.7.9",
  "base64 0.22.1",
  "burn",
+ "byteorder",
  "bytes",
  "clap",
  "cubecl",
@@ -1085,6 +1087,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tower-http 0.5.2",
+ "tracing",
  "uuid",
  "webrtc",
 ]
