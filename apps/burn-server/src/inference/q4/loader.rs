@@ -278,11 +278,16 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
     }
 
     /// Load the language model decoder.
+    ///
+    /// Uses Q4 token embeddings with CPU byte lookup to avoid allocating a
+    /// 1.6 GB f32 GPU buffer (131k vocab × 3072 dim × 4 bytes).
     fn load_decoder(&mut self, device: &WgpuDevice) -> Result<Q4LanguageModel> {
         let dec_config = config::LanguageModelConfig::default();
 
-        // Token embeddings -- Q4_0 in the GGUF, dequantize to f32 for tied lm_head
-        let tok_embeddings = self.load_tok_embeddings(device)?;
+        // Token embeddings — keep as Q4 on GPU (for lm_head matmul) with
+        // CPU byte copy for embed_tokens row lookups. This avoids the 1.6 GB
+        // f32 GPU allocation that exceeds wgpu's single-buffer limit.
+        let (tok_embed_q4, tok_embed_bytes) = self.load_tok_embeddings_q4(device)?;
 
         let rope = RoPEConfig::new(dec_config.head_dim, 16384)
             .with_theta(dec_config.rope_theta)
@@ -298,14 +303,73 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
 
         let norm = self.load_rms_norm(prefixes::FINAL_NORM, dec_config.norm_eps, device)?;
 
-        Ok(Q4LanguageModel::new(tok_embeddings, rope, layers, norm))
+        Ok(Q4LanguageModel::new_q4_embeddings(
+            tok_embed_q4,
+            tok_embed_bytes,
+            dec_config.dim,
+            device.clone(),
+            rope,
+            layers,
+            norm,
+        ))
     }
 
-    /// Load token embeddings (Q4_0 -> dequantized f32).
+    /// Load token embeddings as Q4 — keeps on GPU for lm_head, CPU bytes for lookup.
     ///
-    /// Dequantizes on CPU to avoid a synchronous GPU readback, which panics
-    /// on WASM where `block_on()` is unavailable.
-    fn load_tok_embeddings(&mut self, device: &WgpuDevice) -> Result<Tensor<WgpuBackend, 2>> {
+    /// This avoids the 1.6 GB f32 GPU buffer allocation that exceeds wgpu limits.
+    /// The Q4Tensor stays on GPU for the lm_head matmul, while the raw bytes
+    /// are kept on CPU for embed_tokens row lookups (dequantized per-token).
+    fn load_tok_embeddings_q4(
+        &mut self,
+        device: &WgpuDevice,
+    ) -> Result<(super::tensor::Q4Tensor, Vec<u8>)> {
+        let name = prefixes::TOK_EMBEDDINGS;
+        let info = self
+            .reader
+            .tensor_info(name)
+            .with_context(|| format!("Tensor '{name}' not found"))?
+            .clone();
+
+        let shape = reverse_gguf_dims(info.shape());
+        let bytes = self.reader.tensor_data(name)?;
+
+        match info.dtype() {
+            GgmlDtype::Q4_0 => {
+                // The full embedding (131k × 3072) as Q4 is ~226 MB, which may
+                // exceed Vulkan's maxStorageBufferRange (128 MB on mesa).
+                // Truncate to 32k vocab for the GPU tensor (used for lm_head).
+                // Full CPU bytes are kept for embed_tokens row lookups.
+                let max_gpu_vocab = 32768; // 32k rows → ~55 MB as Q4
+                let gpu_rows = shape[0].min(max_gpu_vocab);
+                let block_size = 18; // Q4_0: 18 bytes per 32-element block
+                let blocks_per_row = shape[1] / 32;
+                let bytes_per_row = blocks_per_row * block_size;
+                let gpu_bytes = &bytes[..gpu_rows * bytes_per_row];
+
+                let q4_tensor =
+                    super::tensor::Q4Tensor::from_q4_bytes(gpu_bytes, [gpu_rows, shape[1]], device)
+                        .context("Failed to upload Q4 tok_embeddings to GPU")?;
+
+                if gpu_rows < shape[0] {
+                    eprintln!(
+                        "[Q4Loader] Truncated GPU embedding from {} to {} rows (CPU has full {})",
+                        shape[0], gpu_rows, shape[0]
+                    );
+                }
+
+                // Keep full CPU copy for embed_tokens row lookups
+                Ok((q4_tensor, bytes.to_vec()))
+            }
+            other => bail!(
+                "Expected Q4_0 for tok_embeddings, got {:?}. Use load_tok_embeddings for f32.",
+                other
+            ),
+        }
+    }
+
+    /// Load token embeddings as dequantized f32 (original method — may exceed GPU buffer limit).
+    #[allow(dead_code)]
+    fn load_tok_embeddings_f32(&mut self, device: &WgpuDevice) -> Result<Tensor<WgpuBackend, 2>> {
         let name = prefixes::TOK_EMBEDDINGS;
         let info = self
             .reader

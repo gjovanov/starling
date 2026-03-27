@@ -11,6 +11,7 @@ use crate::audio::AudioBuffer;
 use super::q4::loader::Q4ModelLoader;
 use super::q4::model::Q4VoxtralModel;
 use super::q4::WgpuBackend;
+use super::tokenizer::TekkenDecoder;
 use super::{InferenceEngine, InferenceSession};
 
 use burn::backend::wgpu::WgpuDevice;
@@ -19,7 +20,7 @@ use burn::tensor::{Tensor, TensorData};
 /// Q4 inference engine — holds the loaded model weights.
 pub struct Q4Engine {
     model: Arc<Mutex<Q4VoxtralModel>>,
-    tokenizer: Arc<tokenizers::Tokenizer>,
+    tokenizer: Arc<TekkenDecoder>,
     device: WgpuDevice,
 }
 
@@ -44,11 +45,10 @@ impl Q4Engine {
             "[Q4Engine] Loading tokenizer from {}...",
             tokenizer_path.display()
         );
-        let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
+        let tokenizer = TekkenDecoder::from_file(tokenizer_path)?;
         eprintln!(
             "[Q4Engine] Tokenizer loaded ({} vocab)",
-            tokenizer.get_vocab_size(false)
+            tokenizer.vocab_size()
         );
 
         Ok(Self {
@@ -83,7 +83,7 @@ impl InferenceEngine for Q4Engine {
 /// Each `commit()` processes accumulated audio: PCM → pad → mel → model → tokens → text.
 pub struct Q4Session {
     model: Arc<Mutex<Q4VoxtralModel>>,
-    tokenizer: Arc<tokenizers::Tokenizer>,
+    tokenizer: Arc<TekkenDecoder>,
     device: WgpuDevice,
     _language: String,
     mel_spec: MelSpectrogram,
@@ -95,19 +95,7 @@ pub struct Q4Session {
 
 impl Q4Session {
     fn decode_tokens(&self, token_ids: &[i32]) -> String {
-        let text_tokens: Vec<u32> = token_ids
-            .iter()
-            .filter(|&&t| t >= 1000)
-            .map(|&t| t as u32)
-            .collect();
-
-        if text_tokens.is_empty() {
-            return String::new();
-        }
-
-        self.tokenizer
-            .decode(&text_tokens, true)
-            .unwrap_or_default()
+        self.tokenizer.decode(token_ids)
     }
 }
 

@@ -2,6 +2,7 @@ pub mod bf16;
 pub mod config;
 pub mod engine;
 pub mod q4;
+pub mod tokenizer;
 
 /// Streaming inference session — mirrors the vLLM Realtime API protocol.
 ///

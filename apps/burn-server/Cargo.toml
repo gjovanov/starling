@@ -36,7 +36,6 @@ byteorder = "1.5"
 anyhow = "1.0"
 tracing = "0.1"
 memmap2 = "0.9"
-tokenizers = "0.22"
 
 # WebRTC
 webrtc = "0.11"

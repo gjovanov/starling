@@ -297,9 +297,22 @@ pub async fn start_session(
         None => return error_response("Inference engine not loaded").into_response(),
     };
 
-    // Resolve media file path
+    // Resolve media file path (try with common audio extensions if not found)
     let media_path = match &session_info.media_id {
-        Some(media_id) => state.config.media_dir.join(media_id),
+        Some(media_id) => {
+            let direct = state.config.media_dir.join(media_id);
+            if direct.exists() {
+                direct
+            } else {
+                // Try common audio extensions
+                let extensions = ["wav", "mp3", "flac", "ogg", "m4a", "aac", "opus"];
+                extensions
+                    .iter()
+                    .map(|ext| state.config.media_dir.join(format!("{}.{}", media_id, ext)))
+                    .find(|p| p.exists())
+                    .unwrap_or(direct)
+            }
+        }
         None => return error_response("No media_id specified").into_response(),
     };
 

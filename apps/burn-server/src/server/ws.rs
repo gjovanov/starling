@@ -41,6 +41,13 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
         }
     }
 
+    // Send welcome message (matches vllm-server protocol)
+    let _ = ws_tx
+        .send(Message::Text(
+            serde_json::json!({"type": "welcome", "session_id": session_id}).to_string(),
+        ))
+        .await;
+
     // Forward subtitle messages to WebSocket
     let send_task = tokio::spawn(async move {
         while let Some(msg) = sub_rx.recv().await {
