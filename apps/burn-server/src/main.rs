@@ -90,9 +90,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_setting_engine(setting_engine)
         .build();
 
+    // Load inference engine
+    let tokenizer_path = config.tokenizer_path();
+    let model_path = config.active_model_path();
+
+    eprintln!("Loading inference engine...");
+    let engine: Arc<dyn inference::InferenceEngine> = match config.quant {
+        config::Quantization::Q4 => {
+            let q4_engine = inference::engine::Q4Engine::load(&model_path, &tokenizer_path)
+                .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            Arc::new(q4_engine)
+        }
+        config::Quantization::Bf16 => {
+            eprintln!("BF16 engine not yet implemented — use Q4 for now");
+            std::process::exit(1);
+        }
+    };
+    eprintln!("Inference engine ready.");
+
     let frontend_path = config.frontend.clone();
     let port = config.port;
-    let state = Arc::new(AppState::new(config, webrtc_api));
+    let state = Arc::new(AppState::new(config, webrtc_api).with_engine(engine));
 
     // Build router (same API contract as vllm-server and parakeet-rs)
     let app = Router::new()

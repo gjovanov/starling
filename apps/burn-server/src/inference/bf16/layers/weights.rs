@@ -1,16 +1,16 @@
-//! Weight name constants and helpers for loading Voxtral model weights.
+//! Weight name constants for loading Voxtral model weights from TrevorJS GGUF.
 //!
-//! Provides structured weight name mappings for GGUF and SafeTensors formats.
-//! Weight names follow the Voxtral HuggingFace convention.
+//! Names match the TrevorJS/voxtral-mini-realtime-gguf GGUF file format,
+//! which uses Mistral's original naming convention.
 
 /// Common weight name prefixes.
 pub mod prefixes {
-    /// Token embedding table (shared with LM head when tied).
-    pub const TOK_EMBEDDINGS: &str = "model.embed_tokens.weight";
+    /// Token embedding table.
+    pub const TOK_EMBEDDINGS: &str = "mm_streams_embeddings.embedding_module.tok_embeddings.weight";
     /// Final layer norm before LM head.
-    pub const FINAL_NORM: &str = "model.norm.weight";
+    pub const FINAL_NORM: &str = "norm.weight";
     /// Audio encoder prefix.
-    pub const ENCODER: &str = "model.audio_encoder";
+    pub const ENCODER: &str = "mm_streams_embeddings.embedding_module.whisper_encoder";
 }
 
 /// Weight names for a single encoder transformer layer.
@@ -33,10 +33,7 @@ pub struct EncoderLayerWeightNames {
 
 /// Get weight names for encoder layer `i`.
 pub fn encoder_layer_weight_names(i: usize) -> EncoderLayerWeightNames {
-    let prefix = format!(
-        "{}.transformer.layers.{i}",
-        prefixes::ENCODER
-    );
+    let prefix = format!("{}.transformer.layers.{i}", prefixes::ENCODER);
     EncoderLayerWeightNames {
         attention_norm: format!("{prefix}.attention_norm.weight"),
         wq_weight: format!("{prefix}.attention.wq.weight"),
@@ -72,7 +69,7 @@ pub struct DecoderLayerWeightNames {
 
 /// Get weight names for decoder layer `i`.
 pub fn decoder_layer_weight_names(i: usize) -> DecoderLayerWeightNames {
-    let prefix = format!("model.layers.{i}");
+    let prefix = format!("layers.{i}");
     DecoderLayerWeightNames {
         attention_norm: format!("{prefix}.attention_norm.weight"),
         wq_weight: format!("{prefix}.attention.wq.weight"),
@@ -83,8 +80,8 @@ pub fn decoder_layer_weight_names(i: usize) -> DecoderLayerWeightNames {
         w1_weight: format!("{prefix}.feed_forward.w1.weight"),
         w2_weight: format!("{prefix}.feed_forward.w2.weight"),
         w3_weight: format!("{prefix}.feed_forward.w3.weight"),
-        ada_norm_down: format!("{prefix}.ada_rms_norm.w0.weight"),
-        ada_norm_up: format!("{prefix}.ada_rms_norm.w2.weight"),
+        ada_norm_down: format!("{prefix}.ada_rms_norm_t_cond.0.weight"),
+        ada_norm_up: format!("{prefix}.ada_rms_norm_t_cond.2.weight"),
     }
 }
 
@@ -98,12 +95,12 @@ pub struct ConvWeightNames {
 
 /// Get weight names for the conv downsampler.
 pub fn conv_weight_names() -> ConvWeightNames {
-    let prefix = format!("{}.conv_downsample", prefixes::ENCODER);
+    let prefix = format!("{}.conv_layers", prefixes::ENCODER);
     ConvWeightNames {
-        conv1_weight: format!("{prefix}.0.weight"),
-        conv1_bias: format!("{prefix}.0.bias"),
-        conv2_weight: format!("{prefix}.2.weight"),
-        conv2_bias: format!("{prefix}.2.bias"),
+        conv1_weight: format!("{prefix}.0.conv.weight"),
+        conv1_bias: format!("{prefix}.0.conv.bias"),
+        conv2_weight: format!("{prefix}.1.conv.weight"),
+        conv2_bias: format!("{prefix}.1.conv.bias"),
     }
 }
 
@@ -115,8 +112,9 @@ pub struct AdapterWeightNames {
 
 /// Get weight names for the adapter MLP.
 pub fn adapter_weight_names() -> AdapterWeightNames {
+    let prefix = "mm_streams_embeddings.embedding_module.audio_language_projection";
     AdapterWeightNames {
-        linear1_weight: "model.multi_modal_projector.linear_1.weight".to_string(),
-        linear2_weight: "model.multi_modal_projector.linear_2.weight".to_string(),
+        linear1_weight: format!("{prefix}.0.weight"),
+        linear2_weight: format!("{prefix}.2.weight"),
     }
 }
