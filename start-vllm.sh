@@ -30,4 +30,4 @@ vllm serve "$MODEL_ID" \
     --dtype bfloat16 \
     --enforce-eager \
     --max-model-len 16384 \
-    --gpu-memory-utilization 0.95
+    --gpu-memory-utilization 0.90

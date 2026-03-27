@@ -124,10 +124,18 @@ async def run_session(ctx: SessionContext, media_path: Path | str | None) -> Non
                 audio_batch.extend(samples_16k)
 
                 if len(audio_batch) >= BATCH_SAMPLES:
-                    # Send to vLLM
+                    # Send to vLLM (track how long this blocks the audio loop)
+                    t0 = time.monotonic()
                     await vllm.send_audio(audio_batch)
                     await vllm.commit()
+                    vllm_ms = (time.monotonic() - t0) * 1000
                     audio_batch = []
+
+                    if vllm_ms > 200:
+                        print(
+                            f"[Session {session_id}] WARNING: vLLM send+commit took {vllm_ms:.0f}ms (>200ms)",
+                            file=sys.stderr,
+                        )
 
                     # Small wait for vLLM to produce some deltas
                     await asyncio.sleep(0.1)
