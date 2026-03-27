@@ -135,8 +135,9 @@ impl InferenceSession for Q4Session {
         let mel_tensor: Tensor<WgpuBackend, 3> =
             Tensor::from_data(TensorData::new(flat, [1, n_mels, n_frames]), &self.device);
 
-        // t-embedding (zeros — t-conditioning disabled in Voxtral Realtime)
-        let t_embed: Tensor<WgpuBackend, 3> = Tensor::zeros([1, 1, 32], &self.device);
+        // t-embedding (zeros — t-conditioning value is 0.0 for streaming)
+        // The TimeEmbedding produces a d_model-dimensional vector (3072)
+        let t_embed: Tensor<WgpuBackend, 3> = Tensor::zeros([1, 1, 3072], &self.device);
 
         // Run inference (lock the model)
         let token_ids = {

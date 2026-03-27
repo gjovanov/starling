@@ -402,6 +402,7 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
         let names = decoder_layer_weight_names(layer_idx);
 
         // ADA RMSNorm conditioning -- Q4_0 in GGUF
+        // Same [in, out] convention as other weights, reversed to [N, K]
         let ada_w0 = self.load_q4_linear(&names.ada_norm_down, device)?;
         let ada_w2 = self.load_q4_linear(&names.ada_norm_up, device)?;
         let ada_rms_norm = Q4AdaRmsNorm::new(ada_w0, ada_w2);
@@ -465,9 +466,33 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
             bail!("Expected Q4_0 for '{name}', got {:?}", info.dtype());
         }
 
+        // GGUF stores most linear weights as [in_features, out_features].
+        // Reverse to get [out, in] = [N, K] for Q4 matmul.
         let shape = reverse_gguf_dims(info.shape());
         let bytes = self.reader.tensor_data(name)?;
         let q4 = Q4Tensor::from_q4_bytes(&bytes, [shape[0], shape[1]], device)?;
+        Ok(Q4Linear::new(q4, None))
+    }
+
+    /// Load a Q4_0 tensor using GGUF dims directly (no reversal).
+    ///
+    /// Used for ADA RMSNorm weights which are stored as [out, in] in GGUF
+    /// (matching Q4 matmul's [N, K] convention directly).
+    fn load_q4_linear_raw_dims(&mut self, name: &str, device: &WgpuDevice) -> Result<Q4Linear> {
+        let info = self
+            .reader
+            .tensor_info(name)
+            .with_context(|| format!("Tensor '{name}' not found"))?
+            .clone();
+
+        if info.dtype() != GgmlDtype::Q4_0 {
+            bail!("Expected Q4_0 for '{name}', got {:?}", info.dtype());
+        }
+
+        let gguf_dims = info.shape();
+        let shape = [gguf_dims[0] as usize, gguf_dims[1] as usize];
+        let bytes = self.reader.tensor_data(name)?;
+        let q4 = Q4Tensor::from_q4_bytes(&bytes, shape, device)?;
         Ok(Q4Linear::new(q4, None))
     }
 
@@ -491,6 +516,7 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
             );
         }
 
+        // Reverse GGUF [in, out] to [out, in] = [N, K] for Q4 matmul
         let shape = reverse_gguf_dims(info.shape());
         let bytes = self.reader.tensor_data(weight_name)?;
         let q4 = Q4Tensor::from_q4_bytes(&bytes, [shape[0], shape[1]], device)?;
