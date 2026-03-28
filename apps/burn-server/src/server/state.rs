@@ -10,6 +10,9 @@ use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 /// Subtitle message broadcast to WebSocket subscribers
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SubtitleMessage {
+    /// Always "subtitle" — frontend dispatches on this field
+    #[serde(rename = "type")]
+    pub msg_type: String,
     pub session_id: String,
     pub text: String,
     pub is_final: bool,
@@ -29,16 +32,26 @@ pub enum SessionState {
     Error,
 }
 
-/// Per-session information
+/// Per-session information (matches vllm-server's SessionInfo for frontend compat)
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionInfo {
     pub id: String,
     pub state: SessionState,
     pub model_id: String,
+    pub model_name: String,
     pub quant: String,
     pub media_id: Option<String>,
+    pub media_filename: String,
     pub language: String,
     pub mode: String,
+    pub duration_secs: f64,
+    pub progress_secs: f64,
+    pub created_at: f64,
+    pub client_count: u32,
+    pub source_type: String,
+    pub noise_cancellation: String,
+    pub diarization: bool,
+    pub sentence_completion: String,
 }
 
 /// Client connection with WebRTC peer
@@ -61,6 +74,8 @@ pub struct SessionContext {
     pub info: SessionInfo,
     pub subscribers: Vec<mpsc::Sender<SubtitleMessage>>,
     pub audio_state: Option<SessionAudioState>,
+    /// Audio track for WebRTC RTP writing (set by WS handler on "ready")
+    pub rtp_track: Option<Arc<TrackLocalStaticRTP>>,
 }
 
 /// Shared application state

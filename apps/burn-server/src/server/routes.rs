@@ -4,11 +4,35 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use base64::Engine;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use std::sync::Arc;
 
 use super::state::{AppState, SessionInfo, SessionState};
 use crate::config::Quantization;
+
+/// Generate ephemeral TURN credentials using HMAC-SHA1 (RFC 5389).
+/// Matches vllm-server and parakeet-rs implementation:
+/// - username = "<unix_expiry_timestamp>:parakeet"
+/// - credential = base64(HMAC-SHA1(shared_secret, username))
+pub(crate) fn generate_turn_credentials(shared_secret: &str) -> (String, String) {
+    let ttl = 86400u64; // 24 hours
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + ttl;
+    let username = format!("{}:parakeet", expiry);
+
+    let mut mac =
+        Hmac::<Sha1>::new_from_slice(shared_secret.as_bytes()).expect("HMAC accepts any key size");
+    mac.update(username.as_bytes());
+    let credential = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+
+    (username, credential)
+}
 
 /// Standard API response envelope
 #[derive(Serialize)]
@@ -49,6 +73,7 @@ pub struct ModelInfo {
     pub display_name: String,
     pub languages: Vec<String>,
     pub quant_options: Vec<String>,
+    pub is_loaded: bool,
 }
 
 pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -60,6 +85,7 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoRespons
         quant_options.push("bf16".to_string());
     }
 
+    let is_loaded = !quant_options.is_empty();
     let models = vec![ModelInfo {
         id: "voxtral-mini-4b".to_string(),
         display_name: "Voxtral Mini 4B (Burn)".to_string(),
@@ -70,6 +96,7 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoRespons
         .map(String::from)
         .collect(),
         quant_options,
+        is_loaded,
     }];
 
     ApiResponse::ok(models)
@@ -229,20 +256,48 @@ pub async fn create_session(
 
     let quant_str = req.quant.unwrap_or_else(|| state.config.quant.to_string().to_lowercase());
 
+    // Resolve display names for frontend
+    let model_name = if req.model_id == "voxtral-mini-4b" {
+        "Voxtral Mini 4B (Burn)".to_string()
+    } else {
+        req.model_id.clone()
+    };
+    let media_filename = req
+        .media_id
+        .as_deref()
+        .unwrap_or("")
+        .to_string();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+
     let info = SessionInfo {
         id: session_id.clone(),
         state: SessionState::Created,
         model_id: req.model_id,
+        model_name,
         quant: quant_str,
         media_id: req.media_id,
+        media_filename,
         language: req.language,
         mode: req.mode,
+        duration_secs: 0.0,
+        progress_secs: 0.0,
+        created_at: now,
+        client_count: 0,
+        source_type: "file".to_string(),
+        noise_cancellation: "none".to_string(),
+        diarization: false,
+        sentence_completion: "off".to_string(),
     };
 
     let ctx = super::state::SessionContext {
         info: info.clone(),
         subscribers: vec![],
         audio_state: None,
+        rtp_track: None,
     };
 
     state.sessions.write().await.insert(session_id, ctx);
@@ -334,11 +389,16 @@ pub async fn start_session(
     let sid = session_id.clone();
     tokio::spawn(async move {
         while let Some(msg) = subtitle_rx.recv().await {
-            let sessions = state_clone.sessions.read().await;
-            if let Some(ctx) = sessions.get(&sid) {
-                for sub in &ctx.subscribers {
-                    let _ = sub.send(msg.clone()).await;
-                }
+            // Clone subscriber list under lock, then release before sending
+            let subs = {
+                let sessions = state_clone.sessions.read().await;
+                sessions
+                    .get(&sid)
+                    .map(|ctx| ctx.subscribers.clone())
+                    .unwrap_or_default()
+            };
+            for sub in &subs {
+                let _ = sub.send(msg.clone()).await;
             }
         }
     });
@@ -359,12 +419,18 @@ pub async fn start_session(
         session_id: session_id.clone(),
         media_path,
         language: session_info.language.clone(),
-        quant: session_info.quant.clone(),
     };
 
+    let state_for_runner = state.clone();
     tokio::spawn(async move {
-        crate::transcription::session::run_session(runner_config, engine, subtitle_tx, state_tx)
-            .await;
+        crate::transcription::session::run_session(
+            runner_config,
+            engine,
+            subtitle_tx,
+            state_tx,
+            state_for_runner,
+        )
+        .await;
     });
 
     ApiResponse::ok(session_info).into_response()
@@ -389,19 +455,49 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
 
     let ws_url = format!("ws://{}:{}/ws", ws_host, state.config.port);
 
-    let mut config = serde_json::json!({
-        "ws_url": ws_url,
-    });
+    // Build ICE servers list (matches vllm-server format)
+    let mut ice_servers = vec![serde_json::json!({"urls": "stun:stun.l.google.com:19302"})];
 
     if let Some(ref turn) = state.config.turn_server {
-        config["turn_server"] = serde_json::json!(turn);
-    }
-    if let Some(ref user) = state.config.turn_username {
-        config["turn_username"] = serde_json::json!(user);
-    }
-    if let Some(ref pass) = state.config.turn_password {
-        config["turn_password"] = serde_json::json!(pass);
+        let (username, credential) = if let Some(ref secret) = state.config.turn_shared_secret {
+            generate_turn_credentials(secret)
+        } else {
+            (
+                state.config.turn_username.clone().unwrap_or_default(),
+                state.config.turn_password.clone().unwrap_or_default(),
+            )
+        };
+
+        let mut turn_urls = vec![turn.clone()];
+        if !turn.contains("?transport=") {
+            turn_urls.push(format!("{}?transport=tcp", turn));
+        }
+
+        ice_servers.push(serde_json::json!({
+            "urls": turn_urls,
+            "username": username,
+            "credential": credential,
+        }));
     }
 
-    ApiResponse::ok(config)
+    let ice_transport_policy = if state.config.force_relay { "relay" } else { "all" };
+
+    // Return raw JSON (no ApiResponse wrapper) — frontend merges directly
+    Json(serde_json::json!({
+        "wsUrl": ws_url,
+        "iceServers": ice_servers,
+        "iceTransportPolicy": ice_transport_policy,
+        "audio": {"sampleRate": 16000, "channels": 1, "bufferSize": 4096},
+        "subtitles": {"maxSegments": 1000, "autoScroll": true, "showTimestamps": true},
+        "speakerColors": [
+            "#4A90D9", "#50C878", "#E9967A", "#DDA0DD",
+            "#F0E68C", "#87CEEB", "#FFB6C1", "#98FB98"
+        ],
+        "reconnect": {
+            "enabled": true,
+            "delay": 2000,
+            "maxDelay": 30000,
+            "maxAttempts": 10
+        }
+    }))
 }

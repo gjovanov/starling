@@ -148,6 +148,13 @@ impl InferenceSession for Q4Session {
         // Decode tokens
         let full_text = self.decode_tokens(&token_ids);
 
+        eprintln!(
+            "[Q4Commit] #{} tokens={} full_text={:?}",
+            self.commit_count,
+            token_ids.len(),
+            &full_text[..full_text.len().min(80)]
+        );
+
         // Compute delta
         let delta = if full_text.len() > self.prev_text.len()
             && full_text.starts_with(&self.prev_text)
