@@ -1,22 +1,21 @@
-//! BF16 inference engine — loads SafeTensors, runs full-precision inference.
+//! BF16 inference engine — encoder resident, decoder streams per-layer.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::audio::mel::{MelConfig, MelSpectrogram};
 use crate::audio::pad::{pad_audio, PadConfig};
 use crate::audio::AudioBuffer;
+use crate::inference::bf16::model::{AudioEncoder, AudioLanguageAdapter};
+use crate::inference::bf16::weights::OwnedSafeTensors;
 use crate::inference::tokenizer::TekkenDecoder;
 use crate::inference::{InferenceEngine, InferenceSession};
 
-use burn::backend::wgpu::WgpuDevice;
 use burn::tensor::{Tensor, TensorData};
 
-/// Backend type for BF16 inference — non-fused wgpu (same as Q4).
-/// The fused `Wgpu` backend causes trait solver overflow with `Send + Sync`.
-pub type Bf16Backend = crate::inference::q4::WgpuBackend;
+pub type Bf16Backend =
+    crate::inference::q4::WgpuBackend;
 
-/// Compute sinusoidal time embedding (same as Q4 engine).
-fn compute_time_embedding(t: f32, dim: usize, device: &WgpuDevice) -> Tensor<Bf16Backend, 3> {
+fn compute_time_embedding(t: f32, dim: usize, device: &burn::backend::wgpu::WgpuDevice) -> Tensor<Bf16Backend, 3> {
     let half_dim = dim / 2;
     let log_theta = 10000.0f32.ln();
     let mut embedding = Vec::with_capacity(dim);
@@ -31,13 +30,13 @@ fn compute_time_embedding(t: f32, dim: usize, device: &WgpuDevice) -> Tensor<Bf1
     Tensor::from_data(TensorData::new(embedding, [1, 1, dim]), device)
 }
 
-/// BF16 inference engine — stores the model directory path for phased loading.
-/// On WSL2/DZN, the WDDM budget (~10 GB) can't hold both encoder and decoder.
-/// Each commit() loads encoder → encode → free → load decoder → decode → free.
+/// BF16 engine — encoder+adapter stay on GPU, decoder streams per-layer.
 pub struct Bf16Engine {
-    model_dir: std::path::PathBuf,
+    encoder: Arc<Mutex<AudioEncoder<Bf16Backend>>>,
+    adapter: Arc<Mutex<AudioLanguageAdapter<Bf16Backend>>>,
+    safetensors: Arc<OwnedSafeTensors>,
     tokenizer: Arc<TekkenDecoder>,
-    device: WgpuDevice,
+    device: burn::backend::wgpu::WgpuDevice,
 }
 
 impl Bf16Engine {
@@ -45,25 +44,27 @@ impl Bf16Engine {
         model_dir: &std::path::Path,
         tokenizer_path: &std::path::Path,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let device = WgpuDevice::default();
-
-        // Verify SafeTensors file exists
+        let device = burn::backend::wgpu::WgpuDevice::default();
         let st_path = model_dir.join("consolidated.safetensors");
-        if !st_path.exists() {
-            return Err(format!("SafeTensors not found: {}", st_path.display()).into());
-        }
-        eprintln!("[BF16Engine] SafeTensors verified: {}", st_path.display());
+
+        eprintln!("[BF16Engine] Loading SafeTensors from {}", st_path.display());
+        let owned = OwnedSafeTensors::from_file(&st_path)
+            .map_err(|e| format!("SafeTensors load: {}", e))?;
+
+        eprintln!("[BF16Engine] Loading encoder + adapter (resident on GPU)...");
+        let (encoder, adapter) =
+            crate::inference::bf16::loader::load_encoder_and_adapter(&owned, &device)
+                .map_err(|e| format!("Encoder load: {}", e))?;
+        eprintln!("[BF16Engine] Encoder + adapter loaded (~4.2 GB VRAM)");
 
         let tokenizer = TekkenDecoder::from_file(tokenizer_path)
-            .map_err(|e| format!("Tokenizer load failed: {}", e))?;
-
-        eprintln!(
-            "[BF16Engine] Tokenizer loaded ({} vocab)",
-            tokenizer.vocab_size()
-        );
+            .map_err(|e| format!("Tokenizer: {}", e))?;
+        eprintln!("[BF16Engine] Tokenizer loaded ({} vocab)", tokenizer.vocab_size());
 
         Ok(Self {
-            model_dir: model_dir.to_path_buf(),
+            encoder: Arc::new(Mutex::new(encoder)),
+            adapter: Arc::new(Mutex::new(adapter)),
+            safetensors: Arc::new(owned),
             tokenizer: Arc::new(tokenizer),
             device,
         })
@@ -76,7 +77,9 @@ impl InferenceEngine for Bf16Engine {
         language: &str,
     ) -> Result<Box<dyn InferenceSession>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(Bf16Session {
-            model_dir: self.model_dir.clone(),
+            encoder: self.encoder.clone(),
+            adapter: self.adapter.clone(),
+            safetensors: self.safetensors.clone(),
             tokenizer: self.tokenizer.clone(),
             device: self.device.clone(),
             _language: language.to_string(),
@@ -90,9 +93,11 @@ impl InferenceEngine for Bf16Engine {
 }
 
 pub struct Bf16Session {
-    model_dir: std::path::PathBuf,
+    encoder: Arc<Mutex<AudioEncoder<Bf16Backend>>>,
+    adapter: Arc<Mutex<AudioLanguageAdapter<Bf16Backend>>>,
+    safetensors: Arc<OwnedSafeTensors>,
     tokenizer: Arc<TekkenDecoder>,
-    device: WgpuDevice,
+    device: burn::backend::wgpu::WgpuDevice,
     _language: String,
     mel_spec: MelSpectrogram,
     pad_config: PadConfig,
@@ -113,41 +118,36 @@ impl InferenceSession for Bf16Session {
 
         self.commit_count += 1;
 
-        // Pad audio
         let audio_buf = AudioBuffer::new(self.audio_buffer.clone(), 16000);
         let padded = pad_audio(&audio_buf, &self.pad_config);
 
-        // Compute mel spectrogram
         let log_mel = self.mel_spec.compute_log(&padded.samples);
         let n_frames = log_mel.len();
         let n_mels = if n_frames > 0 { log_mel[0].len() } else { 128 };
+        if n_frames == 0 { return Ok(String::new()); }
 
-        if n_frames == 0 {
-            return Ok(String::new());
-        }
-
-        // Build tensor [1, n_mels, n_frames]
         let mut flat = vec![0.0f32; n_mels * n_frames];
         for (t, frame) in log_mel.iter().enumerate() {
             for (m, &val) in frame.iter().enumerate() {
                 flat[m * n_frames + t] = val;
             }
         }
-
         let mel_tensor: Tensor<Bf16Backend, 3> =
             Tensor::from_data(TensorData::new(flat, [1, n_mels, n_frames]), &self.device);
 
-        // Time embedding (delay=6)
         let t_embed = compute_time_embedding(6.0, 3072, &self.device);
 
-        // Phased inference to fit within ~10 GB WDDM budget on WSL2/DZN.
-        // Phase 1: encoder (~5 GB) + adapter → audio_embeds → free encoder
-        // Phase 2: decoder (~10 GB) → decode → free decoder
-        let token_ids = crate::inference::bf16::loader::phased_transcribe::<Bf16Backend>(
-            &self.model_dir, &self.device, mel_tensor, t_embed,
-        ).map_err(|e| format!("BF16 phased inference: {}", e))?;
+        let enc = self.encoder.lock().map_err(|e| format!("encoder lock: {}", e))?;
+        let adp = self.adapter.lock().map_err(|e| format!("adapter lock: {}", e))?;
+        let token_ids = crate::inference::bf16::loader::transcribe::<Bf16Backend>(
+            &self.safetensors,
+            &enc,
+            &adp,
+            &self.device,
+            mel_tensor,
+            t_embed,
+        ).map_err(|e| format!("BF16 transcribe: {}", e))?;
 
-        // Decode tokens (offset by 1000)
         let full_text = self.tokenizer.decode(&token_ids);
 
         eprintln!(
@@ -158,7 +158,6 @@ impl InferenceSession for Bf16Session {
             &full_text[..full_text.len().min(80)]
         );
 
-        // Compute delta
         let delta = if full_text.len() > self.prev_text.len()
             && full_text.starts_with(&self.prev_text)
         {
@@ -169,7 +168,6 @@ impl InferenceSession for Bf16Session {
 
         self.prev_text = full_text;
         self.audio_buffer.clear();
-
         Ok(delta)
     }
 

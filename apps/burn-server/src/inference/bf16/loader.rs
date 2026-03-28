@@ -1,13 +1,12 @@
 //! SafeTensors BF16 model loader for Voxtral.
 //!
-//! Inspired by antirez/voxtral.c: weights stay as BF16 in mmap'd memory.
-//! Per-layer forward: BF16→f32 into GPU scratch buffer, matmul, free.
-//! Peak VRAM: one decoder layer (~445 MB) + KV cache + activations.
+//! Inspired by antirez/voxtral.c: decoder layers stream from mmap.
+//! Encoder + adapter stay resident (~4.2 GB). Decoder loads one layer
+//! at a time from mmap (~0.5 GB peak). Total: ~5 GB VRAM.
 
 use anyhow::{Context, Result};
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
-use std::sync::Arc;
 
 use super::layers::*;
 use super::model::*;
@@ -20,14 +19,17 @@ fn gpu_sync() {
     let device = WgpuDevice::default();
     let client = burn::backend::wgpu::WgpuRuntime::client(&device);
     client.flush();
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::thread::sleep(std::time::Duration::from_millis(30));
 }
 
 // ---------------------------------------------------------------------------
-// Encoder (bulk-loaded to GPU — fits in ~4.2 GB, freed after encoding)
+// Encoder + Adapter (kept resident on GPU)
 // ---------------------------------------------------------------------------
 
-fn load_encoder<B: Backend>(st: &safetensors::SafeTensors, device: &B::Device) -> Result<AudioEncoder<B>> {
+pub fn load_encoder_and_adapter<B: Backend>(
+    st: &safetensors::SafeTensors,
+    device: &B::Device,
+) -> Result<(AudioEncoder<B>, AudioLanguageAdapter<B>)> {
     let cfg = config::AudioEncoderConfig::default();
 
     let cn = conv_names();
@@ -35,22 +37,26 @@ fn load_encoder<B: Backend>(st: &safetensors::SafeTensors, device: &B::Device) -
         conv1: conv1d_from_weights(load_tensor(st, &cn.conv1_weight, device)?, load_tensor(st, &cn.conv1_bias, device)?),
         conv2: conv1d_from_weights(load_tensor(st, &cn.conv2_weight, device)?, load_tensor(st, &cn.conv2_bias, device)?),
     };
-
     let rope = RoPEConfig::new(cfg.head_dim, 4096).with_theta(cfg.rope_theta).init(device);
 
     let mut layers = Vec::with_capacity(cfg.n_layers);
     for i in 0..cfg.n_layers {
         layers.push(load_encoder_layer(st, i, &cfg, device).with_context(|| format!("encoder layer {i}"))?);
-        if (i + 1) % 4 == 0 {
-            gpu_sync();
-            if (i + 1) % 8 == 0 { eprintln!("[BF16]   encoder layer {}/{}", i + 1, cfg.n_layers); }
-        }
+        if (i + 1) % 4 == 0 { gpu_sync(); }
+        if (i + 1) % 8 == 0 { eprintln!("[BF16]   encoder layer {}/{}", i + 1, cfg.n_layers); }
     }
 
     let norm_w: Tensor<B, 1> = load_tensor(st, &format!("{}.transformer.norm.weight", prefixes::ENCODER), device)?;
     let norm = create_rms_norm(norm_w, cfg.norm_eps);
+    let encoder = AudioEncoder { conv, rope, layers, norm };
 
-    Ok(AudioEncoder { conv, rope, layers, norm })
+    let an = adapter_names();
+    let adapter = AudioLanguageAdapter {
+        linear1: load_linear(st, &an.linear1_weight, None, device)?,
+        linear2: load_linear(st, &an.linear2_weight, None, device)?,
+    };
+
+    Ok((encoder, adapter))
 }
 
 fn create_rms_norm<B: Backend>(weight: Tensor<B, 1>, eps: f64) -> RmsNorm<B> {
@@ -84,116 +90,12 @@ fn load_encoder_layer<B: Backend>(
 }
 
 // ---------------------------------------------------------------------------
-// Adapter (small — loaded to GPU, freed after use)
+// Decoder helpers
 // ---------------------------------------------------------------------------
 
-fn load_adapter<B: Backend>(st: &safetensors::SafeTensors, device: &B::Device) -> Result<AudioLanguageAdapter<B>> {
-    let n = adapter_names();
-    Ok(AudioLanguageAdapter {
-        linear1: load_linear(st, &n.linear1_weight, None, device)?,
-        linear2: load_linear(st, &n.linear2_weight, None, device)?,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Streaming decoder layer — load from mmap, forward, free
-// ---------------------------------------------------------------------------
-
-/// Load a single decoder layer from SafeTensors to GPU, run forward, free.
-fn load_and_forward_decoder_layer<B: Backend>(
+pub fn load_decoder_metadata(
     st: &safetensors::SafeTensors,
-    layer_idx: usize,
-    cfg: &config::LanguageModelConfig,
-    device: &B::Device,
-    x: Tensor<B, 3>,
-    t_embed: Tensor<B, 3>,
-    rope: &RoPE<B>,
-    cache: &mut KVCache<B>,
-) -> Result<Tensor<B, 3>> {
-    let n = decoder_layer_names(layer_idx);
-
-    // Load layer weights from mmap → GPU (~445 MB f32)
-    let attention = Attention::new(
-        load_linear(st, &n.wq_weight, None, device)?,
-        load_linear(st, &n.wk_weight, None, device)?,
-        load_linear(st, &n.wv_weight, None, device)?,
-        load_linear(st, &n.wo_weight, None, device)?,
-        cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, Some(cfg.sliding_window),
-    );
-
-    let ada_w0: Tensor<B, 2> = load_tensor(st, &n.ada_norm_down, device)?;
-    let ada_w2: Tensor<B, 2> = load_tensor(st, &n.ada_norm_up, device)?;
-
-    let layer = DecoderLayer::new(
-        ada_w0, ada_w2,
-        load_tensor(st, &n.attention_norm, device)?,
-        attention,
-        load_tensor(st, &n.ffn_norm, device)?,
-        load_linear(st, &n.w1_weight, None, device)?,
-        load_linear(st, &n.w2_weight, None, device)?,
-        load_linear(st, &n.w3_weight, None, device)?,
-        32,
-        cfg.norm_eps,
-    );
-
-    // Forward pass — layer weights are on GPU
-    let out = layer.forward_with_cache(x, t_embed, rope, cache);
-
-    // layer dropped here → GPU memory freed for next layer
-    Ok(out)
-}
-
-// ---------------------------------------------------------------------------
-// Phased transcription: encoder → free → streaming decoder
-// ---------------------------------------------------------------------------
-
-/// Phased transcription with per-layer decoder streaming.
-/// Peak VRAM: max(encoder ~4.2 GB, one decoder layer ~0.5 GB + KV cache).
-pub fn phased_transcribe<B: Backend>(
-    model_dir: &std::path::Path,
-    device: &B::Device,
-    mel: Tensor<B, 3>,
-    t_embed: Tensor<B, 3>,
-) -> Result<Vec<i32>> {
-    let st_path = model_dir.join("consolidated.safetensors");
-    let owned = Arc::new(OwnedSafeTensors::from_file(&st_path)?);
-    let st = &*owned;
-
-    // ── Phase 1: Encoder + Adapter → audio_embeds ──
-    eprintln!("[BF16 Phase 1] Loading encoder + adapter...");
-    let encoder = load_encoder(st, device)?;
-    let adapter = load_adapter(st, device)?;
-    eprintln!("[BF16 Phase 1] Encoding audio...");
-
-    let encoder_out = encoder.forward(mel, 0);
-    let reshaped = reshape_encoder_output(encoder_out, 4);
-    let audio_embeds = adapter.forward(reshaped);
-
-    let [_, seq_len, d_model] = audio_embeds.dims();
-    // Diagnostic: check audio embeddings
-    {
-        let flat = audio_embeds.clone().reshape([seq_len * d_model]);
-        let data = flat.into_data();
-        let vals = data.as_slice::<f32>().unwrap_or(&[]);
-        let nonzero = vals.iter().filter(|&&v| v.abs() > 1e-10).count();
-        let min_v = vals.iter().cloned().fold(f32::INFINITY, f32::min);
-        let max_v = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        eprintln!(
-            "[BF16 Phase 1] Audio encoded: seq_len={} nonzero={}/{} min={:.4} max={:.4}",
-            seq_len, nonzero, vals.len(), min_v, max_v
-        );
-    }
-
-    // Free encoder + adapter
-    drop(encoder);
-    drop(adapter);
-    gpu_sync();
-    eprintln!("[BF16 Phase 1] Encoder freed");
-
-    // ── Phase 2: Streaming decoder (one layer at a time) ──
-    let dec_cfg = config::LanguageModelConfig::default();
-
-    // Load tok_embeddings on CPU (for embed_tokens and lm_head)
+) -> Result<(Vec<f32>, usize, usize)> {
     let tok_view = st.tensor(prefixes::TOK_EMBEDDINGS).context("tok_embeddings not found")?;
     let tok_shape: Vec<usize> = tok_view.shape().to_vec();
     let tok_embed_data: Vec<f32> = match tok_view.dtype() {
@@ -205,59 +107,126 @@ pub fn phased_transcribe<B: Backend>(
             .collect(),
         other => anyhow::bail!("Unsupported tok_embeddings dtype: {:?}", other),
     };
-    let vocab_size = tok_shape[0];
+    Ok((tok_embed_data, tok_shape[0], tok_shape[1]))
+}
 
-    // Load final norm (tiny — stays on GPU)
+/// Load one decoder layer on-the-fly from SafeTensors, forward, drop.
+fn load_and_forward_decoder_layer<B: Backend>(
+    st: &safetensors::SafeTensors,
+    layer_idx: usize,
+    cfg: &config::LanguageModelConfig,
+    device: &B::Device,
+    x: Tensor<B, 3>,
+    t_embed: Tensor<B, 3>,
+    rope: &RoPE<B>,
+    cache: &mut KVCache<B>,
+) -> Result<Tensor<B, 3>> {
+    let n = decoder_layer_names(layer_idx);
+    let attention = Attention::new(
+        load_linear(st, &n.wq_weight, None, device)?,
+        load_linear(st, &n.wk_weight, None, device)?,
+        load_linear(st, &n.wv_weight, None, device)?,
+        load_linear(st, &n.wo_weight, None, device)?,
+        cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, Some(cfg.sliding_window),
+    );
+    let ada_w0: Tensor<B, 2> = load_tensor(st, &n.ada_norm_down, device)?;
+    let ada_w2: Tensor<B, 2> = load_tensor(st, &n.ada_norm_up, device)?;
+    let layer = DecoderLayer::new(
+        ada_w0, ada_w2,
+        load_tensor(st, &n.attention_norm, device)?,
+        attention,
+        load_tensor(st, &n.ffn_norm, device)?,
+        load_linear(st, &n.w1_weight, None, device)?,
+        load_linear(st, &n.w2_weight, None, device)?,
+        load_linear(st, &n.w3_weight, None, device)?,
+        32, cfg.norm_eps,
+    );
+    Ok(layer.forward_with_cache(x, t_embed, rope, cache))
+}
+
+// ---------------------------------------------------------------------------
+// Transcription with streaming decoder
+// ---------------------------------------------------------------------------
+
+/// Transcribe: encoder (resident) encodes audio, decoder streams per-layer.
+pub fn transcribe<B: Backend>(
+    st: &safetensors::SafeTensors,
+    encoder: &AudioEncoder<B>,
+    adapter: &AudioLanguageAdapter<B>,
+    device: &B::Device,
+    mel: Tensor<B, 3>,
+    t_embed: Tensor<B, 3>,
+) -> Result<Vec<i32>> {
+    // Encode audio (encoder stays resident)
+    eprintln!("[BF16] Encoding audio...");
+    let encoder_out = encoder.forward(mel, 0);
+    let reshaped = reshape_encoder_output(encoder_out, 4);
+    let audio_embeds = adapter.forward(reshaped);
+    let [_, seq_len, d_model] = audio_embeds.dims();
+    eprintln!("[BF16] Audio encoded: seq_len={}, d_model={}", seq_len, d_model);
+
+    // Decoder config
+    let dec_cfg = config::LanguageModelConfig::default();
+
+    // Load tok_embeddings on CPU
+    let (tok_embed_data, vocab_size, _d) = load_decoder_metadata(st)?;
+    eprintln!("[BF16] tok_embeddings on CPU ({} × {})", vocab_size, d_model);
+
+    // Final norm (tiny, stays on GPU)
     let norm_w: Tensor<B, 1> = load_tensor(st, prefixes::FINAL_NORM, device)?;
     let norm = create_rms_norm(norm_w, dec_cfg.norm_eps);
 
-    // RoPE (tiny — stays on GPU)
+    // RoPE (tiny, stays on GPU)
     let rope = RoPEConfig::new(dec_cfg.head_dim, 16384).with_theta(dec_cfg.rope_theta).init(device);
 
-    // KV cache (pre-allocated for all 26 layers)
+    // KV cache
     let mut caches = LayerCaches::new_preallocated(
         dec_cfg.n_layers, 1, dec_cfg.n_kv_heads, seq_len, dec_cfg.head_dim, device,
     );
 
-    eprintln!("[BF16 Phase 2] Streaming decoder ({} layers × {} positions)...", dec_cfg.n_layers, seq_len);
-
-    // Helper: embed tokens from CPU data
-    let embed_tokens = |ids: &[i32], batch: usize, seq: usize| -> Tensor<B, 3> {
-        let mut output = vec![0.0f32; ids.len() * d_model];
+    // Helpers
+    let embed_tokens = |ids: &[i32]| -> Tensor<B, 3> {
+        let seq = ids.len();
+        let mut out = vec![0.0f32; seq * d_model];
         for (i, &id) in ids.iter().enumerate() {
-            let row_start = (id as usize) * d_model;
-            let row_end = row_start + d_model;
-            if row_end <= tok_embed_data.len() {
-                output[i * d_model..(i + 1) * d_model]
-                    .copy_from_slice(&tok_embed_data[row_start..row_end]);
+            let start = (id as usize) * d_model;
+            let end = start + d_model;
+            if end <= tok_embed_data.len() {
+                out[i * d_model..(i + 1) * d_model].copy_from_slice(&tok_embed_data[start..end]);
             }
         }
-        Tensor::from_data(burn::tensor::TensorData::new(output, [batch, seq, d_model]), device)
+        Tensor::from_data(burn::tensor::TensorData::new(out, [1, seq, d_model]), device)
     };
 
-    // Helper: chunked lm_head
     let lm_head = |hidden: Tensor<B, 3>| -> Tensor<B, 3> {
         let [batch, seq, _] = hidden.dims();
         let max_rows = 128 * 1024 * 1024 / (d_model * 4);
         let mut parts = Vec::new();
-        let mut offset = 0;
-        while offset < vocab_size {
-            let rows = (vocab_size - offset).min(max_rows);
-            let chunk = &tok_embed_data[offset * d_model..(offset + rows) * d_model];
+        let mut off = 0;
+        while off < vocab_size {
+            let rows = (vocab_size - off).min(max_rows);
+            let chunk = &tok_embed_data[off * d_model..(off + rows) * d_model];
             let ct: Tensor<B, 2> = Tensor::from_data(
                 burn::tensor::TensorData::new(chunk.to_vec(), [rows, d_model]), device,
             );
             parts.push(hidden.clone().matmul(ct.transpose().unsqueeze::<3>()));
-            offset += rows;
+            off += rows;
         }
-        if parts.len() == 1 {
-            parts.pop().unwrap().reshape([batch, seq, vocab_size])
-        } else {
-            Tensor::cat(parts, 2).reshape([batch, seq, vocab_size])
-        }
+        if parts.len() == 1 { parts.pop().unwrap().reshape([batch, seq, vocab_size]) }
+        else { Tensor::cat(parts, 2).reshape([batch, seq, vocab_size]) }
     };
 
-    // ── Prefill: process all prefix positions through 26 layers ──
+    // Forward through 26 decoder layers (one at a time)
+    let forward_decoder = |mut x: Tensor<B, 3>, caches: &mut LayerCaches<B>| -> Result<Tensor<B, 3>> {
+        for i in 0..dec_cfg.n_layers {
+            let cache = caches.get_mut(i).unwrap();
+            x = load_and_forward_decoder_layer(st, i, &dec_cfg, device, x, t_embed.clone(), &rope, cache)?;
+            if (i + 1) % 8 == 0 { gpu_sync(); }
+        }
+        Ok(norm.forward(x))
+    };
+
+    // ── Prefill ──
     const PREFIX_LEN: usize = 38;
     const BOS_TOKEN: i32 = 1;
     const STREAMING_PAD: i32 = 32;
@@ -269,44 +238,32 @@ pub fn phased_transcribe<B: Backend>(
     let mut prefix: Vec<i32> = vec![BOS_TOKEN];
     prefix.extend(std::iter::repeat_n(STREAMING_PAD, PREFIX_LEN - 1));
 
-    let prefix_text = embed_tokens(&prefix, 1, PREFIX_LEN);
+    let prefix_text = embed_tokens(&prefix);
     let prefix_audio = audio_embeds.clone().slice([0..1, 0..PREFIX_LEN, 0..d_model]);
-    let mut x = prefix_audio + prefix_text;
+    let x = prefix_audio + prefix_text;
 
-    // Stream through 26 decoder layers (prefill)
-    for i in 0..dec_cfg.n_layers {
-        let cache = caches.get_mut(i).unwrap();
-        x = load_and_forward_decoder_layer(st, i, &dec_cfg, device, x, t_embed.clone(), &rope, cache)?;
-        // Layer weights freed automatically (dropped at end of function)
-        if (i + 1) % 4 == 0 {
-            gpu_sync();
-        }
-    }
-    let hidden = norm.forward(x);
+    eprintln!("[BF16] Prefill ({} positions through {} layers)...", PREFIX_LEN, dec_cfg.n_layers);
+    let hidden = forward_decoder(x, &mut caches)?;
     let logits = lm_head(hidden);
 
     let vocab = logits.dims()[2];
     let last_logits = logits.slice([0..1, (PREFIX_LEN - 1)..PREFIX_LEN, 0..vocab]);
-    // Diagnostic: check logit distribution
+
+    // Diagnostic
     {
         let flat = last_logits.clone().reshape([vocab]);
         let data = flat.into_data();
         let vals = data.as_slice::<f32>().unwrap_or(&[]);
         if !vals.is_empty() {
-            let mut indexed: Vec<(usize, f32)> = vals.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let top5: Vec<String> = indexed.iter().take(5).map(|(i, v)| format!("{}:{:.3}", i, v)).collect();
-            let min_v = vals.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max_v = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let nonzero = vals.iter().filter(|&&v| v.abs() > 1e-10).count();
-            eprintln!(
-                "[BF16] prefill logits: vocab={} nonzero={} min={:.4} max={:.4} top5=[{}]",
-                vocab, nonzero, min_v, max_v, top5.join(", ")
-            );
+            let mut idx: Vec<(usize, f32)> = vals.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+            idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top5: Vec<String> = idx.iter().take(5).map(|(i, v)| format!("{}:{:.3}", i, v)).collect();
+            eprintln!("[BF16] prefill logits: top5=[{}]", top5.join(", "));
         }
     }
+
     let first_token: i32 = last_logits.argmax(2).into_data().as_slice::<i32>().unwrap()[0];
-    eprintln!("[BF16 Phase 2] Prefill done, first_token={}", first_token);
+    eprintln!("[BF16] Prefill done, first_token={}", first_token);
 
     let mut generated = prefix;
     generated.push(first_token);
@@ -317,27 +274,24 @@ pub fn phased_transcribe<B: Backend>(
         .collect();
     drop(audio_embeds);
 
-    // ── Autoregressive decode: each position streams through 26 layers ──
+    // ── Autoregressive decode ──
     let decode_steps = seq_len - PREFIX_LEN - 1;
+    eprintln!("[BF16] Decode: {} steps (each = {} layers from mmap)...", decode_steps, dec_cfg.n_layers);
+
     for step in 0..decode_steps {
         let pos = PREFIX_LEN + 1 + step;
         let prev_token = generated[pos - 1];
-        let text_embed = embed_tokens(&[prev_token], 1, 1);
+        let text_embed = embed_tokens(&[prev_token]);
         let audio_pos = audio_slices[pos - 1 - PREFIX_LEN].clone();
-        let mut x = audio_pos + text_embed;
+        let x = audio_pos + text_embed;
 
-        // Stream through 26 layers
-        for i in 0..dec_cfg.n_layers {
-            let cache = caches.get_mut(i).unwrap();
-            x = load_and_forward_decoder_layer(st, i, &dec_cfg, device, x, t_embed.clone(), &rope, cache)?;
-        }
-        let hidden = norm.forward(x);
+        let hidden = forward_decoder(x, &mut caches)?;
         let logits = lm_head(hidden);
         let next_token: i32 = logits.argmax(2).into_data().as_slice::<i32>().unwrap()[0];
         generated.push(next_token);
 
         if (step + 1) % 10 == 0 || step == decode_steps - 1 {
-            eprintln!("[BF16 Phase 2] Decode step {}/{}, token={}", step + 1, decode_steps, next_token);
+            eprintln!("[BF16] step {}/{} token={}", step + 1, decode_steps, next_token);
         }
     }
 
