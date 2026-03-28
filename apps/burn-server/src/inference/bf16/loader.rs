@@ -30,6 +30,7 @@ pub fn load_model<B: Backend>(
     let st_path = model_dir.join("consolidated.safetensors");
     eprintln!("[BF16] Loading SafeTensors from {}", st_path.display());
 
+
     let owned = OwnedSafeTensors::from_file(&st_path)?;
     let st = &*owned;
 
@@ -183,4 +184,108 @@ fn load_adapter<B: Backend>(st: &safetensors::SafeTensors, device: &B::Device) -
         linear1: load_linear(st, &n.linear1_weight, None, device)?,
         linear2: load_linear(st, &n.linear2_weight, None, device)?,
     })
+}
+
+/// Phased transcription: encoder → audio_embeds → free encoder → decoder → tokens.
+/// Fits within ~10 GB WDDM budget on WSL2/DZN.
+pub fn phased_transcribe<B: Backend>(
+    model_dir: &std::path::Path,
+    device: &B::Device,
+    mel: Tensor<B, 3>,
+    t_embed: Tensor<B, 3>,
+) -> Result<Vec<i32>> {
+    let st_path = model_dir.join("consolidated.safetensors");
+    let owned = OwnedSafeTensors::from_file(&st_path)?;
+    let st = &*owned;
+
+    // Phase 1: Encoder + Adapter (~5.3 GB)
+    eprintln!("[BF16 Phase 1] Loading encoder + adapter...");
+    let encoder = load_encoder(st, device)?;
+    let adapter = load_adapter(st, device)?;
+    eprintln!("[BF16 Phase 1] Encoding audio...");
+
+    let encoder_out = encoder.forward(mel, 0);
+    let reshaped = reshape_encoder_output(encoder_out, 4);
+    let audio_embeds = adapter.forward(reshaped);
+
+    let [_, seq_len, _] = audio_embeds.dims();
+    eprintln!("[BF16 Phase 1] Audio encoded: seq_len={}", seq_len);
+
+    // Free encoder + adapter GPU memory
+    drop(encoder);
+    drop(adapter);
+    gpu_sync();
+    eprintln!("[BF16 Phase 1] Encoder freed");
+
+    // Phase 2: Decoder (~10 GB)
+    eprintln!("[BF16 Phase 2] Loading decoder...");
+    let decoder = load_decoder(st, device)?;
+    eprintln!("[BF16 Phase 2] Decoding...");
+
+    // Run the streaming transcription using audio_embeds + decoder
+    let tokens = decode_streaming(&decoder, audio_embeds, t_embed, device);
+
+    drop(decoder);
+    gpu_sync();
+    eprintln!("[BF16 Phase 2] Decoder freed");
+
+    Ok(tokens)
+}
+
+/// Autoregressive decode using audio embeddings and decoder.
+fn decode_streaming<B: Backend>(
+    decoder: &LanguageModel<B>,
+    audio_embeds: Tensor<B, 3>,
+    t_embed: Tensor<B, 3>,
+    device: &B::Device,
+) -> Vec<i32> {
+    let [_, seq_len, d_model] = audio_embeds.dims();
+
+    const PREFIX_LEN: usize = 38;
+    const BOS_TOKEN: i32 = 1;
+    const STREAMING_PAD: i32 = 32;
+
+    if seq_len < PREFIX_LEN {
+        return Vec::new();
+    }
+
+    let mut prefix: Vec<i32> = vec![BOS_TOKEN];
+    prefix.extend(std::iter::repeat_n(STREAMING_PAD, PREFIX_LEN - 1));
+
+    let prefix_text_embeds = decoder.embed_tokens_from_ids(&prefix, 1, PREFIX_LEN, device);
+    let prefix_audio = audio_embeds.clone().slice([0..1, 0..PREFIX_LEN, 0..d_model]);
+    let prefix_inputs = prefix_audio + prefix_text_embeds;
+
+    let mut decoder_cache = decoder.create_cache_preallocated(seq_len, device);
+
+    let hidden = decoder.forward_hidden_with_cache(prefix_inputs, t_embed.clone(), &mut decoder_cache);
+    let logits = decoder.lm_head(hidden, device);
+
+    let vocab_size = logits.dims()[2];
+    let last_logits = logits.slice([0..1, (PREFIX_LEN - 1)..PREFIX_LEN, 0..vocab_size]);
+    let first_pred = last_logits.argmax(2);
+    let first_token: i32 = first_pred.into_data().as_slice::<i32>().unwrap()[0];
+
+    let mut generated = prefix;
+    generated.push(first_token);
+
+    let audio_slices: Vec<Tensor<B, 3>> = (PREFIX_LEN..seq_len)
+        .map(|pos| audio_embeds.clone().slice([0..1, pos..pos + 1, 0..d_model]))
+        .collect();
+    drop(audio_embeds);
+
+    for pos in (PREFIX_LEN + 1)..seq_len {
+        let new_token = generated[pos - 1];
+        let text_embed = decoder.embed_tokens_from_ids(&[new_token], 1, 1, device);
+        let audio_pos = audio_slices[pos - 1 - PREFIX_LEN].clone();
+        let input = audio_pos + text_embed;
+
+        let hidden = decoder.forward_hidden_with_cache(input, t_embed.clone(), &mut decoder_cache);
+        let logits = decoder.lm_head(hidden, device);
+        let pred = logits.argmax(2);
+        let next_token: i32 = pred.into_data().as_slice::<i32>().unwrap()[0];
+        generated.push(next_token);
+    }
+
+    generated.into_iter().skip(PREFIX_LEN).collect()
 }

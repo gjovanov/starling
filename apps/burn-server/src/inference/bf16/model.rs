@@ -150,7 +150,7 @@ impl<B: Backend> LanguageModel<B> {
     /// hidden [B, seq, d_model] → logits [B, seq, vocab]
     pub fn lm_head(&self, hidden: Tensor<B, 3>, device: &B::Device) -> Tensor<B, 3> {
         let [batch, seq, _] = hidden.dims();
-        let max_rows_per_chunk = 128 * 1024 * 1024 / (self.d_model * 4); // 128MB / (d_model * sizeof(f32))
+        let max_rows_per_chunk = 128 * 1024 * 1024 / (self.d_model * 4);
 
         let mut logit_parts = Vec::new();
         let mut offset = 0;
@@ -160,7 +160,6 @@ impl<B: Backend> LanguageModel<B> {
             let chunk_end = (offset + chunk_rows) * self.d_model;
             let chunk_data = &self.tok_embed_data[chunk_start..chunk_end];
 
-            // Upload chunk to GPU, transpose, matmul
             let chunk_tensor: Tensor<B, 2> = Tensor::from_data(
                 burn::tensor::TensorData::new(chunk_data.to_vec(), [chunk_rows, self.d_model]),
                 device,

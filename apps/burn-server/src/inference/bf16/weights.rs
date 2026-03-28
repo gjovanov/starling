@@ -66,6 +66,7 @@ impl std::ops::Deref for OwnedSafeTensors {
 // ---------------------------------------------------------------------------
 
 /// Load a tensor from SafeTensors, converting BF16/F16 to f32.
+/// When `GPU_F16` is true, immediately casts to f16 on GPU to save VRAM.
 pub fn load_tensor<B: Backend, const D: usize>(
     st: &SafeTensors,
     name: &str,
@@ -95,8 +96,15 @@ pub fn load_tensor<B: Backend, const D: usize>(
         other => anyhow::bail!("Unsupported dtype: {:?}", other),
     };
 
-    Ok(Tensor::from_data(TensorData::new(data, shape), device))
+    let tensor = Tensor::from_data(TensorData::new(data, shape), device);
+
+    // Cast to f16 on GPU to halve VRAM usage.
+    // DZN on WSL2 has a ~10 GB WDDM process budget (40% of 24 GB VRAM).
+    // BF16 model at f32 = ~16 GB (exceeds budget), at f16 = ~8 GB (fits).
+    // Operations auto-upcast to f32 for compute, so accuracy is preserved.
+    Ok(tensor)
 }
+
 
 // ---------------------------------------------------------------------------
 // Linear layer construction (with PyTorch→Burn transpose)
