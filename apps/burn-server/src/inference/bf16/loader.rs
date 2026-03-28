@@ -122,15 +122,42 @@ fn load_and_forward_decoder_layer<B: Backend>(
     cache: &mut KVCache<B>,
 ) -> Result<Tensor<B, 3>> {
     let n = decoder_layer_names(layer_idx);
-    let attention = Attention::new(
-        load_linear(st, &n.wq_weight, None, device)?,
-        load_linear(st, &n.wk_weight, None, device)?,
-        load_linear(st, &n.wv_weight, None, device)?,
-        load_linear(st, &n.wo_weight, None, device)?,
+    let wq = load_linear(st, &n.wq_weight, None, device)?;
+    let wk = load_linear(st, &n.wk_weight, None, device)?;
+    let wv = load_linear(st, &n.wv_weight, None, device)?;
+    let wo = load_linear(st, &n.wo_weight, None, device)?;
+
+    // Log shapes for first layer to verify correctness
+    if layer_idx == 0 {
+        eprintln!("[BF16] Layer 0 shapes: wq={:?} wk={:?} wv={:?} wo={:?}",
+            wq.weight.val().dims(), wk.weight.val().dims(), wv.weight.val().dims(), wo.weight.val().dims());
+    }
+
+    let attention = Attention::new(wq, wk, wv, wo,
         cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, Some(cfg.sliding_window),
     );
     let ada_w0: Tensor<B, 2> = load_tensor(st, &n.ada_norm_down, device)?;
     let ada_w2: Tensor<B, 2> = load_tensor(st, &n.ada_norm_up, device)?;
+
+    if layer_idx == 0 {
+        let w1 = load_linear(st, &n.w1_weight, None, device)?;
+        let w2 = load_linear(st, &n.w2_weight, None, device)?;
+        let w3 = load_linear(st, &n.w3_weight, None, device)?;
+        eprintln!("[BF16] Layer 0: ada_w0_raw={:?} ada_w2_raw={:?} w1={:?} w2={:?} w3={:?}",
+            ada_w0.dims(), ada_w2.dims(), w1.weight.val().dims(), w2.weight.val().dims(), w3.weight.val().dims());
+        let layer = DecoderLayer::new(
+            ada_w0, ada_w2,
+            load_tensor(st, &n.attention_norm, device)?,
+            attention,
+            load_tensor(st, &n.ffn_norm, device)?,
+            w1, w2, w3,
+            32, cfg.norm_eps,
+        );
+        // Log the ADA Linear shapes AFTER construction (to verify transpose)
+        eprintln!("[BF16] Layer 0 ADA after construct: w0={:?} w2={:?}",
+            layer.ada_rms_norm.w0.weight.val().dims(), layer.ada_rms_norm.w2.weight.val().dims());
+        return Ok(layer.forward_with_cache(x, t_embed, rope, cache));
+    }
     let layer = DecoderLayer::new(
         ada_w0, ada_w2,
         load_tensor(st, &n.attention_norm, device)?,
