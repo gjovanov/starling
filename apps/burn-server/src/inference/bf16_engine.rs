@@ -155,7 +155,7 @@ impl InferenceSession for Bf16Session {
             self.commit_count,
             token_ids.len(),
             &token_ids[..token_ids.len().min(20)],
-            &full_text[..full_text.len().min(80)]
+            &full_text[..full_text.char_indices().take(80).last().map_or(0, |(i, c)| i + c.len_utf8())]
         );
 
         let delta = if full_text.len() > self.prev_text.len()
