@@ -500,7 +500,9 @@ impl Q4AudioEncoder {
 enum TokEmbedStore {
     F32(Tensor<WgpuBackend, 2>),
     Q4 {
-        lm_head: Q4Linear,
+        /// Split lm_head: two Q4Linear halves to stay under 128 MB buffer limit.
+        /// lm_head_parts[0] covers vocab rows 0..split, lm_head_parts[1] covers split..total.
+        lm_head_parts: Vec<Q4Linear>,
         cpu_bytes: Vec<u8>,
     },
 }
@@ -541,7 +543,7 @@ impl Q4LanguageModel {
     /// and a Q4Linear on GPU for the lm_head (full vocab matmul).
     #[allow(clippy::too_many_arguments)]
     pub fn new_q4_embeddings(
-        tok_embed_q4: super::tensor::Q4Tensor,
+        tok_embed_parts: Vec<super::tensor::Q4Tensor>,
         tok_embed_bytes: Vec<u8>,
         d_model: usize,
         device: WgpuDevice,
@@ -549,9 +551,13 @@ impl Q4LanguageModel {
         layers: Vec<Q4DecoderLayer>,
         norm: RmsNorm<WgpuBackend>,
     ) -> Self {
+        let lm_head_parts = tok_embed_parts
+            .into_iter()
+            .map(|q4| Q4Linear::new(q4, None))
+            .collect();
         Self {
             tok_embeddings: TokEmbedStore::Q4 {
-                lm_head: Q4Linear::new(tok_embed_q4, None),
+                lm_head_parts,
                 cpu_bytes: tok_embed_bytes,
             },
             rope,
@@ -715,7 +721,18 @@ impl Q4LanguageModel {
                 let logits = hidden_states.matmul(embed_t);
                 logits.reshape([batch, seq, vocab_size])
             }
-            TokEmbedStore::Q4 { lm_head, .. } => lm_head.forward(hidden_states),
+            TokEmbedStore::Q4 { lm_head_parts, .. } => {
+                if lm_head_parts.len() == 1 {
+                    lm_head_parts[0].forward(hidden_states)
+                } else {
+                    // Concatenate logits from split embedding parts along vocab dimension
+                    let parts: Vec<Tensor<WgpuBackend, 3>> = lm_head_parts
+                        .iter()
+                        .map(|part| part.forward(hidden_states.clone()))
+                        .collect();
+                    Tensor::cat(parts, 2)
+                }
+            }
         }
     }
 

@@ -57,12 +57,30 @@ impl Q4ModelParts {
     pub fn finalize(self, device: &WgpuDevice) -> Result<Q4VoxtralModel> {
         let [vocab, d_model] = self.tok_embed_shape;
 
-        // Create Q4Tensor on GPU for the lm_head matmul
-        let tok_embed_q4 =
-            Q4Tensor::from_q4_bytes(&self.tok_embed_q4_bytes, [vocab, d_model], device)?;
+        // Split embedding into chunks that fit in 128 MB GPU buffers
+        let block_size = 18usize; // Q4_0: 18 bytes per 32-element block
+        let blocks_per_row = d_model / 32;
+        let bytes_per_row = blocks_per_row * block_size;
+        let max_buffer_bytes: usize = 128 * 1024 * 1024;
+        let max_rows_per_buffer = max_buffer_bytes / bytes_per_row;
+
+        let mut parts = Vec::new();
+        let mut offset = 0;
+        while offset < vocab {
+            let chunk_rows = (vocab - offset).min(max_rows_per_buffer);
+            let start = offset * bytes_per_row;
+            let end = (offset + chunk_rows) * bytes_per_row;
+            let q4 = Q4Tensor::from_q4_bytes(
+                &self.tok_embed_q4_bytes[start..end],
+                [chunk_rows, d_model],
+                device,
+            )?;
+            parts.push(q4);
+            offset += chunk_rows;
+        }
 
         let decoder = Q4LanguageModel::new_q4_embeddings(
-            tok_embed_q4,
+            parts,
             self.tok_embed_q4_bytes,
             d_model,
             device.clone(),
@@ -322,7 +340,7 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
     fn load_tok_embeddings_q4(
         &mut self,
         device: &WgpuDevice,
-    ) -> Result<(super::tensor::Q4Tensor, Vec<u8>)> {
+    ) -> Result<(Vec<super::tensor::Q4Tensor>, Vec<u8>)> {
         let name = prefixes::TOK_EMBEDDINGS;
         let info = self
             .reader
@@ -335,30 +353,54 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
 
         match info.dtype() {
             GgmlDtype::Q4_0 => {
-                // The full embedding (131k × 3072) as Q4 is ~226 MB, which may
-                // exceed Vulkan's maxStorageBufferRange (128 MB on mesa).
-                // Truncate to 32k vocab for the GPU tensor (used for lm_head).
-                // Full CPU bytes are kept for embed_tokens row lookups.
-                let max_gpu_vocab = 32768; // 32k rows → ~55 MB as Q4
-                let gpu_rows = shape[0].min(max_gpu_vocab);
                 let block_size = 18; // Q4_0: 18 bytes per 32-element block
                 let blocks_per_row = shape[1] / 32;
                 let bytes_per_row = blocks_per_row * block_size;
-                let gpu_bytes = &bytes[..gpu_rows * bytes_per_row];
+                let total_rows = shape[0];
 
-                let q4_tensor =
-                    super::tensor::Q4Tensor::from_q4_bytes(gpu_bytes, [gpu_rows, shape[1]], device)
-                        .context("Failed to upload Q4 tok_embeddings to GPU")?;
+                // Compute max rows per GPU buffer (must fit in maxStorageBufferRange).
+                // Use 128 MB as conservative limit (DZN and llvmpipe both report this).
+                let max_buffer_bytes: usize = 128 * 1024 * 1024;
+                let max_rows_per_buffer = max_buffer_bytes / bytes_per_row;
 
-                if gpu_rows < shape[0] {
+                // Split into chunks that each fit in one GPU buffer
+                let mut parts = Vec::new();
+                let mut offset = 0;
+                while offset < total_rows {
+                    let chunk_rows = (total_rows - offset).min(max_rows_per_buffer);
+                    let start = offset * bytes_per_row;
+                    let end = (offset + chunk_rows) * bytes_per_row;
+                    let chunk_bytes = &bytes[start..end];
+
+                    let q4_tensor = super::tensor::Q4Tensor::from_q4_bytes(
+                        chunk_bytes,
+                        [chunk_rows, shape[1]],
+                        device,
+                    )
+                    .context(format!(
+                        "Failed to upload Q4 tok_embeddings part (rows {}..{}) to GPU",
+                        offset,
+                        offset + chunk_rows
+                    ))?;
+
+                    parts.push(q4_tensor);
+                    offset += chunk_rows;
+                }
+
+                if parts.len() > 1 {
+                    let sizes: Vec<String> = parts.iter().enumerate().map(|(i, p)| {
+                        let [r, _] = p.shape();
+                        format!("part{}: {} rows", i, r)
+                    }).collect();
                     eprintln!(
-                        "[Q4Loader] Truncated GPU embedding from {} to {} rows (CPU has full {})",
-                        shape[0], gpu_rows, shape[0]
+                        "[Q4Loader] Split GPU embedding into {} parts ({}) to fit 128 MB buffer limit",
+                        parts.len(),
+                        sizes.join(", ")
                     );
                 }
 
                 // Keep full CPU copy for embed_tokens row lookups
-                Ok((q4_tensor, bytes.to_vec()))
+                Ok((parts, bytes.to_vec()))
             }
             other => bail!(
                 "Expected Q4_0 for tok_embeddings, got {:?}. Use load_tok_embeddings for f32.",
