@@ -168,7 +168,13 @@ fn load_and_forward_decoder_layer<B: Backend>(
         load_linear(st, &n.w3_weight, None, device)?,
         32, cfg.norm_eps,
     );
-    Ok(layer.forward_with_cache(x, t_embed, rope, cache))
+    let out = layer.forward_with_cache(x, t_embed, rope, cache);
+    // CRITICAL: Force computation to complete before dropping layer weights.
+    // burn/wgpu uses lazy evaluation — matmul results may reference GPU buffers
+    // that get freed when the layer is dropped. into_data() on a small slice
+    // forces the full compute pipeline to flush.
+    let _ = out.clone().slice([0..1, 0..1, 0..1]).into_data();
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -187,9 +193,31 @@ pub fn transcribe<B: Backend>(
     // Encode audio (encoder stays resident)
     eprintln!("[BF16] Encoding audio...");
     let encoder_out = encoder.forward(mel, 0);
+    let encoder_out_diag = encoder_out.clone();
     let reshaped = reshape_encoder_output(encoder_out, 4);
+    let reshaped_diag = reshaped.clone();
     let audio_embeds = adapter.forward(reshaped);
     let [_, seq_len, d_model] = audio_embeds.dims();
+    // Diagnose scale at each stage
+    {
+        let e_len = encoder_out_diag.dims()[1] * 1280;
+        let ed = encoder_out_diag.reshape([e_len]).into_data();
+        let ev = ed.as_slice::<f32>().unwrap();
+        let e_rms = (ev.iter().map(|x| x*x).sum::<f32>() / ev.len() as f32).sqrt();
+
+        let r_len = reshaped_diag.dims()[1] * 5120;
+        let rd = reshaped_diag.reshape([r_len]).into_data();
+        let rv = rd.as_slice::<f32>().unwrap();
+        let r_rms = (rv.iter().map(|x| x*x).sum::<f32>() / rv.len() as f32).sqrt();
+
+        let ao = audio_embeds.clone().reshape([seq_len * d_model]);
+        let ad = ao.into_data();
+        let av = ad.as_slice::<f32>().unwrap();
+        let a_rms = (av.iter().map(|x| x*x).sum::<f32>() / av.len() as f32).sqrt();
+
+        eprintln!("[BF16] Scale: encoder_out RMS={:.4} reshaped RMS={:.4} adapter_out RMS={:.4}",
+            e_rms, r_rms, a_rms);
+    }
     eprintln!("[BF16] Audio encoded: seq_len={}, d_model={}", seq_len, d_model);
 
     // Decoder config
@@ -267,6 +295,18 @@ pub fn transcribe<B: Backend>(
 
     let prefix_text = embed_tokens(&prefix);
     let prefix_audio = audio_embeds.clone().slice([0..1, 0..PREFIX_LEN, 0..d_model]);
+
+    // Diagnostic: compare magnitudes
+    {
+        let a_flat = prefix_audio.clone().reshape([PREFIX_LEN * d_model]).into_data();
+        let t_flat = prefix_text.clone().reshape([PREFIX_LEN * d_model]).into_data();
+        let av = a_flat.as_slice::<f32>().unwrap();
+        let tv = t_flat.as_slice::<f32>().unwrap();
+        let a_norm: f32 = (av.iter().map(|x| x*x).sum::<f32>() / av.len() as f32).sqrt();
+        let t_norm: f32 = (tv.iter().map(|x| x*x).sum::<f32>() / tv.len() as f32).sqrt();
+        eprintln!("[BF16] audio RMS={:.4} text_embed RMS={:.4} ratio={:.2}", a_norm, t_norm, a_norm/t_norm);
+    }
+
     let x = prefix_audio + prefix_text;
 
     eprintln!("[BF16] Prefill ({} positions through {} layers)...", PREFIX_LEN, dec_cfg.n_layers);
