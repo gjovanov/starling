@@ -9,6 +9,20 @@ use super::model::*;
 use super::weights::*;
 use crate::inference::config;
 
+/// Force GPU command flush to prevent DZN D3D12 device crash.
+/// DZN becomes unstable after many large buffer allocations without flushing
+/// the command queue. This submits pending commands and briefly sleeps to let
+/// the D3D12 driver process them.
+fn gpu_sync() {
+    use burn::backend::wgpu::WgpuDevice;
+    use cubecl::Runtime;
+    let device = WgpuDevice::default();
+    let client = burn::backend::wgpu::WgpuRuntime::client(&device);
+    client.flush();
+    // Brief sleep to let DZN/D3D12 process the flushed commands
+    std::thread::sleep(std::time::Duration::from_millis(50));
+}
+
 pub fn load_model<B: Backend>(
     model_dir: &std::path::Path,
     device: &B::Device,
@@ -45,7 +59,10 @@ fn load_encoder<B: Backend>(st: &safetensors::SafeTensors, device: &B::Device) -
     let mut layers = Vec::with_capacity(cfg.n_layers);
     for i in 0..cfg.n_layers {
         layers.push(load_encoder_layer(st, i, &cfg, device).with_context(|| format!("encoder layer {i}"))?);
-        if (i + 1) % 8 == 0 { eprintln!("[BF16]   encoder layer {}/{}", i + 1, cfg.n_layers); }
+        if (i + 1) % 4 == 0 {
+            gpu_sync();
+            if (i + 1) % 8 == 0 { eprintln!("[BF16]   encoder layer {}/{} (synced)", i + 1, cfg.n_layers); }
+        }
     }
 
     let norm_w: Tensor<B, 1> = load_tensor(st, &format!("{}.transformer.norm.weight", prefixes::ENCODER), device)?;
@@ -90,7 +107,6 @@ fn load_decoder<B: Backend>(st: &safetensors::SafeTensors, device: &B::Device) -
     let cfg = config::LanguageModelConfig::default();
 
     // Load tok_embeddings as raw f32 on CPU (avoids 1.6 GB GPU buffer limit).
-    // Sparse lookups (embed_tokens) use CPU data; lm_head chunks on-the-fly.
     let tok_view = st.tensor(prefixes::TOK_EMBEDDINGS)
         .context("tok_embeddings not found")?;
     let tok_shape: Vec<usize> = tok_view.shape().to_vec();
@@ -112,7 +128,15 @@ fn load_decoder<B: Backend>(st: &safetensors::SafeTensors, device: &B::Device) -
     let mut layers = Vec::with_capacity(cfg.n_layers);
     for i in 0..cfg.n_layers {
         layers.push(load_decoder_layer(st, i, &cfg, device).with_context(|| format!("decoder layer {i}"))?);
-        if (i + 1) % 5 == 0 { eprintln!("[BF16]   decoder layer {}/{}", i + 1, cfg.n_layers); }
+
+        // Explicit GPU sync every 4 layers to prevent DZN D3D12 device crash.
+        // DZN becomes unstable after many large buffer allocations without sync.
+        if (i + 1) % 4 == 0 {
+            gpu_sync();
+            eprintln!("[BF16]   decoder layer {}/{} (synced)", i + 1, cfg.n_layers);
+        } else if (i + 1) % 5 == 0 {
+            eprintln!("[BF16]   decoder layer {}/{}", i + 1, cfg.n_layers);
+        }
     }
 
     let norm_w: Tensor<B, 1> = load_tensor(st, prefixes::FINAL_NORM, device)?;
