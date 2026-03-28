@@ -170,7 +170,19 @@ pub fn phased_transcribe<B: Backend>(
     let audio_embeds = adapter.forward(reshaped);
 
     let [_, seq_len, d_model] = audio_embeds.dims();
-    eprintln!("[BF16 Phase 1] Audio encoded: seq_len={}", seq_len);
+    // Diagnostic: check audio embeddings
+    {
+        let flat = audio_embeds.clone().reshape([seq_len * d_model]);
+        let data = flat.into_data();
+        let vals = data.as_slice::<f32>().unwrap_or(&[]);
+        let nonzero = vals.iter().filter(|&&v| v.abs() > 1e-10).count();
+        let min_v = vals.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_v = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        eprintln!(
+            "[BF16 Phase 1] Audio encoded: seq_len={} nonzero={}/{} min={:.4} max={:.4}",
+            seq_len, nonzero, vals.len(), min_v, max_v
+        );
+    }
 
     // Free encoder + adapter
     drop(encoder);
@@ -275,6 +287,24 @@ pub fn phased_transcribe<B: Backend>(
 
     let vocab = logits.dims()[2];
     let last_logits = logits.slice([0..1, (PREFIX_LEN - 1)..PREFIX_LEN, 0..vocab]);
+    // Diagnostic: check logit distribution
+    {
+        let flat = last_logits.clone().reshape([vocab]);
+        let data = flat.into_data();
+        let vals = data.as_slice::<f32>().unwrap_or(&[]);
+        if !vals.is_empty() {
+            let mut indexed: Vec<(usize, f32)> = vals.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top5: Vec<String> = indexed.iter().take(5).map(|(i, v)| format!("{}:{:.3}", i, v)).collect();
+            let min_v = vals.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max_v = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let nonzero = vals.iter().filter(|&&v| v.abs() > 1e-10).count();
+            eprintln!(
+                "[BF16] prefill logits: vocab={} nonzero={} min={:.4} max={:.4} top5=[{}]",
+                vocab, nonzero, min_v, max_v, top5.join(", ")
+            );
+        }
+    }
     let first_token: i32 = last_logits.argmax(2).into_data().as_slice::<i32>().unwrap()[0];
     eprintln!("[BF16 Phase 2] Prefill done, first_token={}", first_token);
 
