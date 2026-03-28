@@ -87,13 +87,17 @@ impl TekkenDecoder {
 
     /// Decode token IDs to text.
     ///
-    /// Skips control tokens (0-9: null, BOS, EOS, etc.) and out-of-range IDs.
-    /// Tekken tokens 10+ are valid text (10=newline, 32=space, 33='!', 256+=subwords).
+    /// Voxtral token IDs 0-999 are control tokens (32=STREAMING_PAD, 33=STREAMING_WORD).
+    /// Text token IDs start at 1000 and are offset by 1000 from tekken.json vocab indices:
+    ///   token_id 1000 → vocab[0], token_id 1362 → vocab[362] (" I"), etc.
     pub fn decode(&self, token_ids: &[i32]) -> String {
         let mut result = String::new();
         for &id in token_ids {
-            if id >= 10 && (id as usize) < self.vocab.len() {
-                result.push_str(&self.vocab[id as usize]);
+            if id >= 1000 {
+                let vocab_idx = (id - 1000) as usize;
+                if vocab_idx < self.vocab.len() {
+                    result.push_str(&self.vocab[vocab_idx]);
+                }
             }
         }
         result

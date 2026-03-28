@@ -17,7 +17,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # - Allow non-conformant adapter (DZN reports conformance 0.0.0.0)
 # - Restrict autotune to avoid plane/subgroup ops unsupported by DZN
 export WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER="${WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER:-1}"
-export CUBECL_AUTOTUNE_LEVEL="${CUBECL_AUTOTUNE_LEVEL:-0}"
+export CUBECL_AUTOTUNE_LEVEL="${CUBECL_AUTOTUNE_LEVEL:-1}"
 # Prefer DZN over llvmpipe if both are installed
 if [ -f /usr/share/vulkan/icd.d/dzn_icd.json ]; then
     export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/usr/share/vulkan/icd.d/dzn_icd.json}"
