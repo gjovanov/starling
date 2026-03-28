@@ -910,6 +910,21 @@ impl Q4VoxtralModel {
         let audio_embeds = self.encode_audio(mel);
         let [_, seq_len, d_model] = audio_embeds.dims();
 
+        // Diagnostic: check audio encoder output
+        {
+            let flat = audio_embeds.clone().reshape([seq_len * d_model]);
+            let data = flat.into_data();
+            let vals = data.as_slice::<f32>().unwrap_or(&[]);
+            let nonzero = vals.iter().filter(|&&v| v.abs() > 1e-10).count();
+            let min_v = vals.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max_v = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mean_v: f32 = if vals.is_empty() { 0.0 } else { vals.iter().sum::<f32>() / vals.len() as f32 };
+            eprintln!(
+                "[Q4Model] audio_embeds: [{}, {}, {}] nonzero={}/{} min={:.4} max={:.4} mean={:.6}",
+                1, seq_len, d_model, nonzero, vals.len(), min_v, max_v, mean_v
+            );
+        }
+
         const PREFIX_LEN: usize = 38;
         const BOS_TOKEN: i32 = 1;
         const STREAMING_PAD: i32 = 32;
@@ -945,12 +960,34 @@ impl Q4VoxtralModel {
         };
         let logits = self.decoder.lm_head(hidden);
 
+        let vocab_size = logits.dims()[2];
         let last_logits =
             logits
                 .clone()
-                .slice([0..1, (PREFIX_LEN - 1)..PREFIX_LEN, 0..logits.dims()[2]]);
-        let first_pred = last_logits.argmax(2);
+                .slice([0..1, (PREFIX_LEN - 1)..PREFIX_LEN, 0..vocab_size]);
+        let first_pred = last_logits.clone().argmax(2);
         let first_token: i32 = first_pred.into_scalar().elem();
+
+        // Diagnostic: check logit distribution after prefill
+        {
+            let logit_flat = last_logits.clone().reshape([vocab_size]);
+            let logit_data = logit_flat.into_data();
+            let vals = logit_data.as_slice::<f32>().unwrap_or(&[]);
+            if !vals.is_empty() {
+                let mut indexed: Vec<(usize, f32)> = vals.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let top5: Vec<String> = indexed.iter().take(5).map(|(i, v)| format!("{}:{:.3}", i, v)).collect();
+                let bot5: Vec<String> = indexed.iter().rev().take(5).map(|(i, v)| format!("{}:{:.3}", i, v)).collect();
+                let min_v = vals.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max_v = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mean_v: f32 = vals.iter().sum::<f32>() / vals.len() as f32;
+                let nonzero = vals.iter().filter(|&&v| v.abs() > 1e-10).count();
+                eprintln!(
+                    "[Q4Model] prefill logits: vocab={} nonzero={} min={:.4} max={:.4} mean={:.4} top5=[{}] bot5=[{}] first_token={}",
+                    vocab_size, nonzero, min_v, max_v, mean_v, top5.join(", "), bot5.join(", "), first_token
+                );
+            }
+        }
 
         let mut generated = prefix;
         generated.push(first_token);
@@ -989,6 +1026,13 @@ impl Q4VoxtralModel {
             generated.push(next_token);
         }
 
+        eprintln!(
+            "[Q4Model] all_generated({})={:?} returning_after_skip({})={:?}",
+            generated.len(),
+            &generated[..generated.len().min(60)],
+            generated.len().saturating_sub(PREFIX_LEN),
+            &generated[PREFIX_LEN.min(generated.len())..generated.len().min(PREFIX_LEN + 20)]
+        );
         generated.into_iter().skip(PREFIX_LEN).collect()
     }
 

@@ -87,11 +87,12 @@ impl TekkenDecoder {
 
     /// Decode token IDs to text.
     ///
-    /// Filters out special tokens (ID < 1000) and concatenates the rest.
+    /// Skips control tokens (0-9: null, BOS, EOS, etc.) and out-of-range IDs.
+    /// Tekken tokens 10+ are valid text (10=newline, 32=space, 33='!', 256+=subwords).
     pub fn decode(&self, token_ids: &[i32]) -> String {
         let mut result = String::new();
         for &id in token_ids {
-            if id >= 1000 && (id as usize) < self.vocab.len() {
+            if id >= 10 && (id as usize) < self.vocab.len() {
                 result.push_str(&self.vocab[id as usize]);
             }
         }

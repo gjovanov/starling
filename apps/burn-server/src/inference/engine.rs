@@ -149,9 +149,10 @@ impl InferenceSession for Q4Session {
         let full_text = self.decode_tokens(&token_ids);
 
         eprintln!(
-            "[Q4Commit] #{} tokens={} full_text={:?}",
+            "[Q4Commit] #{} tokens={} ids={:?} full_text={:?}",
             self.commit_count,
             token_ids.len(),
+            &token_ids[..token_ids.len().min(20)],
             &full_text[..full_text.len().min(80)]
         );
 
