@@ -25,9 +25,19 @@ pub struct AudioEncoder<B: Backend> {
 impl<B: Backend> AudioEncoder<B> {
     /// mel [1, 128, T] → encoder output [1, T/4, 1280]
     pub fn forward(&self, mel: Tensor<B, 3>, offset: usize) -> Tensor<B, 3> {
-        // Conv downsample: [1, 128, T] ��� [1, 1280, T/4] → transpose → [1, T/4, 1280]
+        let [_, _mels, mel_frames] = mel.dims();
         let x = self.conv.forward(mel);
-        let x = x.swap_dims(1, 2); // [B, channels, T] → [B, T, channels]
+        let x = x.swap_dims(1, 2);
+
+        // Log conv output scale
+        {
+            let n = x.dims()[1] * x.dims()[2];
+            let flat = x.clone().reshape([n]).into_data();
+            let v = flat.as_slice::<f32>().unwrap();
+            let rms = (v.iter().map(|x| x*x).sum::<f32>() / v.len() as f32).sqrt();
+            eprintln!("[BF16 Encoder] mel_frames={} conv_out={:?} RMS={:.4} first5={:.4?}",
+                mel_frames, x.dims(), rms, &v[..5.min(v.len())]);
+        }
 
         let mut x = x;
         for layer in &self.layers {
