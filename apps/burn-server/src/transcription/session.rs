@@ -19,10 +19,13 @@ use webrtc::track::track_local::TrackLocalWriter;
 
 use super::streaming::split_sentences;
 
-/// Audio batch interval in seconds (matches vllm-server's BATCH_INTERVAL_SECS = 0.5)
-const BATCH_INTERVAL_SECS: f32 = 0.5;
+/// Audio batch interval in seconds.
+/// Voxtral streaming needs enough audio context to distinguish speech from silence.
+/// With Q4 padding (76 tokens = 38 prefix positions), 0.5s gives only 12 decode
+/// positions which is too few. 5s gives ~62 decode positions — enough for text output.
+const BATCH_INTERVAL_SECS: f32 = 5.0;
 /// Samples per batch at 16kHz
-const BATCH_SAMPLES: usize = (16000.0 * BATCH_INTERVAL_SECS) as usize; // 8000
+const BATCH_SAMPLES: usize = (16000.0 * BATCH_INTERVAL_SECS) as usize; // 80000
 
 /// Configuration for a transcription session.
 #[derive(Debug, Clone)]

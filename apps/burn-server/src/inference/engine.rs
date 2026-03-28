@@ -17,6 +17,27 @@ use super::{InferenceEngine, InferenceSession};
 use burn::backend::wgpu::WgpuDevice;
 use burn::tensor::{Tensor, TensorData};
 
+/// Compute sinusoidal time embedding for the transcription delay.
+/// Matches voxtral-mini-realtime-rs TimeEmbedding::embed().
+fn compute_time_embedding(t: f32, dim: usize, device: &WgpuDevice) -> Tensor<WgpuBackend, 3> {
+    let half_dim = dim / 2;
+    let log_theta = 10000.0f32.ln();
+    let mut embedding = Vec::with_capacity(dim);
+
+    // cos part
+    for i in 0..half_dim {
+        let freq = (-log_theta * (i as f32) / (half_dim as f32)).exp();
+        embedding.push((t * freq).cos());
+    }
+    // sin part
+    for i in 0..half_dim {
+        let freq = (-log_theta * (i as f32) / (half_dim as f32)).exp();
+        embedding.push((t * freq).sin());
+    }
+
+    Tensor::from_data(TensorData::new(embedding, [1, 1, dim]), device)
+}
+
 /// Q4 inference engine — holds the loaded model weights.
 pub struct Q4Engine {
     model: Arc<Mutex<Q4VoxtralModel>>,
@@ -135,9 +156,9 @@ impl InferenceSession for Q4Session {
         let mel_tensor: Tensor<WgpuBackend, 3> =
             Tensor::from_data(TensorData::new(flat, [1, n_mels, n_frames]), &self.device);
 
-        // t-embedding (zeros — t-conditioning value is 0.0 for streaming)
-        // The TimeEmbedding produces a d_model-dimensional vector (3072)
-        let t_embed: Tensor<WgpuBackend, 3> = Tensor::zeros([1, 1, 3072], &self.device);
+        // t-embedding: sinusoidal encoding of the transcription delay (default: 6 tokens = 480ms)
+        // This conditions the ADA RMSNorm in each decoder layer.
+        let t_embed = compute_time_embedding(6.0, 3072, &self.device);
 
         // Run inference (lock the model)
         let token_ids = {

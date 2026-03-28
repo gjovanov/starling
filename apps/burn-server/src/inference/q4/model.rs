@@ -927,21 +927,6 @@ impl Q4VoxtralModel {
         let audio_embeds = self.encode_audio(mel);
         let [_, seq_len, d_model] = audio_embeds.dims();
 
-        // Diagnostic: check audio encoder output
-        {
-            let flat = audio_embeds.clone().reshape([seq_len * d_model]);
-            let data = flat.into_data();
-            let vals = data.as_slice::<f32>().unwrap_or(&[]);
-            let nonzero = vals.iter().filter(|&&v| v.abs() > 1e-10).count();
-            let min_v = vals.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max_v = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mean_v: f32 = if vals.is_empty() { 0.0 } else { vals.iter().sum::<f32>() / vals.len() as f32 };
-            eprintln!(
-                "[Q4Model] audio_embeds: [{}, {}, {}] nonzero={}/{} min={:.4} max={:.4} mean={:.6}",
-                1, seq_len, d_model, nonzero, vals.len(), min_v, max_v, mean_v
-            );
-        }
-
         const PREFIX_LEN: usize = 38;
         const BOS_TOKEN: i32 = 1;
         const STREAMING_PAD: i32 = 32;
@@ -957,6 +942,37 @@ impl Q4VoxtralModel {
         // GPU round-trip (the prefix tokens are known CPU-side).
         let prefix_text_embeds = self.decoder.embed_tokens_from_ids(&prefix, 1, PREFIX_LEN);
 
+        // Diagnostic: check embedding norms for key tokens
+        {
+            let test_ids: Vec<i32> = vec![1, 32, 33, 416, 673, 728, 1044, 1261, 5000, 10000];
+            let test_embeds = self.decoder.embed_tokens_from_ids(&test_ids, 1, test_ids.len());
+            let data = test_embeds.into_data();
+            let vals = data.as_slice::<f32>().unwrap_or(&[]);
+            for (i, &id) in test_ids.iter().enumerate() {
+                let row = &vals[i * d_model..(i + 1) * d_model];
+                let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let nonzero = row.iter().filter(|&&v| v.abs() > 1e-10).count();
+                eprintln!("[Q4Model] embed_norm: token {} → L2={:.4} nonzero={}/{}", id, norm, nonzero, d_model);
+            }
+        }
+
+        // Diagnostic: check prefix text embedding
+        {
+            let flat = prefix_text_embeds.clone().reshape([PREFIX_LEN * d_model]);
+            let data = flat.into_data();
+            let vals = data.as_slice::<f32>().unwrap_or(&[]);
+            let nonzero = vals.iter().filter(|&&v| v.abs() > 1e-10).count();
+            let min_v = vals.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max_v = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mean = vals.iter().sum::<f32>() / vals.len().max(1) as f32;
+            // Check first few values of token 32 embedding
+            let first10: Vec<String> = vals[d_model..d_model+10.min(vals.len())].iter().map(|v| format!("{:.4}", v)).collect();
+            eprintln!(
+                "[Q4Model] prefix_text_embeds: [{}, {}, {}] nonzero={}/{} min={:.4} max={:.4} mean={:.6} tok32_first10=[{}]",
+                1, PREFIX_LEN, d_model, nonzero, vals.len(), min_v, max_v, mean, first10.join(", ")
+            );
+        }
+
         let prefix_audio = audio_embeds
             .clone()
             .slice([0..1, 0..PREFIX_LEN, 0..d_model]);
@@ -967,6 +983,17 @@ impl Q4VoxtralModel {
         // 52 growing Tensor::cat allocations per decode step (26 layers x K + V).
         let mut decoder_cache = self.decoder.create_cache_preallocated(seq_len);
 
+        // Diagnostic: check prefix_inputs (audio + text)
+        {
+            let flat = prefix_inputs.clone().reshape([PREFIX_LEN * d_model]);
+            let data = flat.into_data();
+            let vals = data.as_slice::<f32>().unwrap_or(&[]);
+            let nonzero = vals.iter().filter(|&&v| v.abs() > 1e-10).count();
+            let min_v = vals.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max_v = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            eprintln!("[Q4Model] prefix_inputs (audio+text): nonzero={}/{} min={:.4} max={:.4}", nonzero, vals.len(), min_v, max_v);
+        }
+
         let hidden = {
             let _prefill = tracing::info_span!("prefill").entered();
             self.decoder.forward_hidden_with_cache(
@@ -975,6 +1002,24 @@ impl Q4VoxtralModel {
                 &mut decoder_cache,
             )
         };
+
+        // Diagnostic: check hidden states after decoder
+        {
+            let [_, hseq, hdim] = hidden.dims();
+            let last_hidden = hidden.clone().slice([0..1, (hseq-1)..hseq, 0..hdim]).reshape([hdim]);
+            let data = last_hidden.into_data();
+            let vals = data.as_slice::<f32>().unwrap_or(&[]);
+            let nonzero = vals.iter().filter(|&&v| v.abs() > 1e-10).count();
+            let min_v = vals.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max_v = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mean = vals.iter().sum::<f32>() / vals.len().max(1) as f32;
+            let first10: Vec<String> = vals[..10.min(vals.len())].iter().map(|v| format!("{:.4}", v)).collect();
+            eprintln!(
+                "[Q4Model] hidden_last_pos: nonzero={}/{} min={:.4} max={:.4} mean={:.6} first10=[{}]",
+                nonzero, vals.len(), min_v, max_v, mean, first10.join(", ")
+            );
+        }
+
         let logits = self.decoder.lm_head(hidden);
 
         let vocab_size = logits.dims()[2];
