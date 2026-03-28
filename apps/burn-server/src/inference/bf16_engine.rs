@@ -1,11 +1,10 @@
 //! BF16 inference engine — loads SafeTensors, runs full-precision inference.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::audio::mel::{MelConfig, MelSpectrogram};
 use crate::audio::pad::{pad_audio, PadConfig};
 use crate::audio::AudioBuffer;
-use crate::inference::bf16::model::VoxtralModel;
 use crate::inference::tokenizer::TekkenDecoder;
 use crate::inference::{InferenceEngine, InferenceSession};
 

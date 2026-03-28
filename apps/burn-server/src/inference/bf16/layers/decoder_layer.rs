@@ -111,19 +111,13 @@ fn linear_from_weights<B: Backend>(
     weight: Tensor<B, 2>,
     bias: Option<Tensor<B, 1>>,
 ) -> Linear<B> {
-    let [out_features, in_features] = weight.dims();
-    let device = weight.device();
-
-    let mut linear = LinearConfig::new(in_features, out_features)
-        .with_bias(bias.is_some())
-        .init::<B>(&device);
-
-    linear.weight = Param::initialized(ParamId::new(), weight);
-    if let Some(b) = bias {
-        linear.bias = Some(Param::initialized(ParamId::new(), b));
+    // PyTorch/SafeTensors stores [out_features, in_features]
+    // Burn's linear() expects weight as [in_features, out_features]
+    let weight = weight.transpose();
+    Linear {
+        weight: Param::initialized(ParamId::new(), weight),
+        bias: bias.map(|b| Param::initialized(ParamId::new(), b)),
     }
-
-    linear
 }
 
 impl<B: Backend> DecoderLayer<B> {
