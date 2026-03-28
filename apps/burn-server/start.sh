@@ -13,6 +13,16 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 [ -f "$PROJECT_DIR/.env" ] && set -a && source "$PROJECT_DIR/.env" && set +a
 [ -f "$SCRIPT_DIR/.env" ] && set -a && source "$SCRIPT_DIR/.env" && set +a
 
+# DZN (Vulkan-over-DX12 on WSL2) support
+# - Allow non-conformant adapter (DZN reports conformance 0.0.0.0)
+# - Restrict autotune to avoid plane/subgroup ops unsupported by DZN
+export WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER="${WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER:-1}"
+export CUBECL_AUTOTUNE_LEVEL="${CUBECL_AUTOTUNE_LEVEL:-0}"
+# Prefer DZN over llvmpipe if both are installed
+if [ -f /usr/share/vulkan/icd.d/dzn_icd.json ]; then
+    export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/usr/share/vulkan/icd.d/dzn_icd.json}"
+fi
+
 BINARY="$SCRIPT_DIR/target/release/burn-server"
 
 if [ ! -f "$BINARY" ]; then
