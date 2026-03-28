@@ -32,11 +32,11 @@ pub struct SwiGLUConfig {
 #[derive(Module, Debug)]
 pub struct SwiGLU<B: Backend> {
     /// Gate projection: d_model -> hidden_dim
-    w1: Linear<B>,
+    pub(crate) w1: Linear<B>,
     /// Down projection: hidden_dim -> d_model
-    w2: Linear<B>,
+    pub(crate) w2: Linear<B>,
     /// Up projection: d_model -> hidden_dim
-    w3: Linear<B>,
+    pub(crate) w3: Linear<B>,
 }
 
 impl SwiGLUConfig {

@@ -68,11 +68,11 @@ pub struct AdaRmsNormConfig {
 #[derive(Module, Debug)]
 pub struct AdaRmsNorm<B: Backend> {
     /// First projection: d_model -> t_cond_dim
-    w0: Linear<B>,
+    pub(crate) w0: Linear<B>,
     /// Second projection: t_cond_dim -> d_model
-    w2: Linear<B>,
+    pub(crate) w2: Linear<B>,
     /// Epsilon for numerical stability.
-    eps: f64,
+    pub(crate) eps: f64,
 }
 
 impl AdaRmsNormConfig {

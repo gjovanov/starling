@@ -37,8 +37,8 @@ pub struct ConvDownsamplerConfig {
 /// Total temporal downsampling: 4x (stride 2 x stride 2)
 #[derive(Module, Debug)]
 pub struct ConvDownsampler<B: Backend> {
-    conv1: Conv1d<B>,
-    conv2: Conv1d<B>,
+    pub(crate) conv1: Conv1d<B>,
+    pub(crate) conv2: Conv1d<B>,
 }
 
 impl ConvDownsamplerConfig {

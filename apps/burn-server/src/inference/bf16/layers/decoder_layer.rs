@@ -55,15 +55,15 @@ pub struct DecoderLayerConfig {
 #[derive(Module, Debug)]
 pub struct DecoderLayer<B: Backend> {
     /// Pre-attention ADA normalization.
-    ada_rms_norm: AdaRmsNorm<B>,
+    pub(crate) ada_rms_norm: AdaRmsNorm<B>,
     /// Pre-attention standard normalization.
-    attention_norm: RmsNorm<B>,
+    pub(crate) attention_norm: RmsNorm<B>,
     /// Self-attention with GQA.
-    attention: Attention<B>,
+    pub(crate) attention: Attention<B>,
     /// Pre-MLP normalization.
-    ffn_norm: RmsNorm<B>,
+    pub(crate) ffn_norm: RmsNorm<B>,
     /// SwiGLU MLP.
-    ffn: SwiGLU<B>,
+    pub(crate) ffn: SwiGLU<B>,
 }
 
 impl DecoderLayerConfig {

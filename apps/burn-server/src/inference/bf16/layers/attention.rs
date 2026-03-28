@@ -42,15 +42,15 @@ pub struct AttentionConfig {
 /// Multi-head attention layer.
 #[derive(Module, Debug)]
 pub struct Attention<B: Backend> {
-    wq: Linear<B>,
-    wk: Linear<B>,
-    wv: Linear<B>,
-    wo: Linear<B>,
-    n_heads: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-    scale: f32,
-    sliding_window: Option<usize>,
+    pub(crate) wq: Linear<B>,
+    pub(crate) wk: Linear<B>,
+    pub(crate) wv: Linear<B>,
+    pub(crate) wo: Linear<B>,
+    pub(crate) n_heads: usize,
+    pub(crate) n_kv_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) scale: f32,
+    pub(crate) sliding_window: Option<usize>,
 }
 
 impl AttentionConfig {

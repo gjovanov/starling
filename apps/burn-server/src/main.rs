@@ -102,8 +102,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(q4_engine)
         }
         config::Quantization::Bf16 => {
-            eprintln!("BF16 engine not yet implemented — use Q4 for now");
-            std::process::exit(1);
+            let bf16_engine =
+                inference::bf16_engine::Bf16Engine::load(&model_path, &tokenizer_path)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            Arc::new(bf16_engine)
         }
     };
     eprintln!("Inference engine ready.");

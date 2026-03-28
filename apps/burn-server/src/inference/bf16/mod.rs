@@ -8,3 +8,6 @@
 //! Left-padding: 32 silence tokens (standard, upstream default)
 
 pub mod layers;
+pub mod loader;
+pub mod model;
+pub mod weights;
