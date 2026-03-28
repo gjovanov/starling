@@ -4,10 +4,10 @@
 //! the complete Voxtral architecture. Matches the reference implementation
 //! (voxtral-mini-realtime-rs) exactly.
 
-use burn::nn::{Embedding, Linear};
+use burn::nn::Linear;
 use burn::tensor::activation::gelu;
 use burn::tensor::backend::Backend;
-use burn::tensor::{Int, Tensor};
+use burn::tensor::Tensor;
 
 use super::layers::*;
 
@@ -89,7 +89,10 @@ pub fn reshape_encoder_output<B: Backend>(
 // ---------------------------------------------------------------------------
 
 pub struct LanguageModel<B: Backend> {
-    pub tok_embeddings: Embedding<B>,
+    /// Token embeddings — kept as raw f32 data on CPU for sparse lookups.
+    /// Avoids the 128MB GPU buffer limit for the full 131K×3072 table.
+    pub tok_embed_data: Vec<f32>,
+    pub vocab_size: usize,
     pub rope: RoPE<B>,
     pub layers: Vec<DecoderLayer<B>>,
     pub norm: RmsNorm<B>,
@@ -97,8 +100,21 @@ pub struct LanguageModel<B: Backend> {
 }
 
 impl<B: Backend> LanguageModel<B> {
-    pub fn embed_tokens(&self, token_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        self.tok_embeddings.forward(token_ids)
+    /// Embed token IDs from CPU data (avoids GPU buffer limit).
+    pub fn embed_tokens_from_ids(&self, ids: &[i32], batch: usize, seq: usize, device: &B::Device) -> Tensor<B, 3> {
+        let mut output = vec![0.0f32; ids.len() * self.d_model];
+        for (i, &id) in ids.iter().enumerate() {
+            let row_start = (id as usize) * self.d_model;
+            let row_end = row_start + self.d_model;
+            if row_end <= self.tok_embed_data.len() {
+                output[i * self.d_model..(i + 1) * self.d_model]
+                    .copy_from_slice(&self.tok_embed_data[row_start..row_end]);
+            }
+        }
+        Tensor::from_data(
+            burn::tensor::TensorData::new(output, [batch, seq, self.d_model]),
+            device,
+        )
     }
 
     /// Forward through decoder layers + final norm.
@@ -130,14 +146,36 @@ impl<B: Backend> LanguageModel<B> {
     }
 
     /// LM head: hidden → logits via tied embeddings.
+    /// Splits the embedding matrix into chunks that fit in 128MB GPU buffers.
     /// hidden [B, seq, d_model] → logits [B, seq, vocab]
-    pub fn lm_head(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn lm_head(&self, hidden: Tensor<B, 3>, device: &B::Device) -> Tensor<B, 3> {
         let [batch, seq, _] = hidden.dims();
-        let embed_weights = self.tok_embeddings.weight.val();
-        let vocab_size = embed_weights.dims()[0];
-        let embed_t = embed_weights.transpose().unsqueeze::<3>();
-        let logits = hidden.matmul(embed_t);
-        logits.reshape([batch, seq, vocab_size])
+        let max_rows_per_chunk = 128 * 1024 * 1024 / (self.d_model * 4); // 128MB / (d_model * sizeof(f32))
+
+        let mut logit_parts = Vec::new();
+        let mut offset = 0;
+        while offset < self.vocab_size {
+            let chunk_rows = (self.vocab_size - offset).min(max_rows_per_chunk);
+            let chunk_start = offset * self.d_model;
+            let chunk_end = (offset + chunk_rows) * self.d_model;
+            let chunk_data = &self.tok_embed_data[chunk_start..chunk_end];
+
+            // Upload chunk to GPU, transpose, matmul
+            let chunk_tensor: Tensor<B, 2> = Tensor::from_data(
+                burn::tensor::TensorData::new(chunk_data.to_vec(), [chunk_rows, self.d_model]),
+                device,
+            );
+            let chunk_t = chunk_tensor.transpose().unsqueeze::<3>();
+            let part_logits = hidden.clone().matmul(chunk_t);
+            logit_parts.push(part_logits);
+            offset += chunk_rows;
+        }
+
+        if logit_parts.len() == 1 {
+            logit_parts.pop().unwrap().reshape([batch, seq, self.vocab_size])
+        } else {
+            Tensor::cat(logit_parts, 2).reshape([batch, seq, self.vocab_size])
+        }
     }
 
     /// Create pre-allocated KV cache for all layers.
@@ -188,12 +226,10 @@ impl<B: Backend> VoxtralModel<B> {
         let mut prefix: Vec<i32> = vec![BOS_TOKEN];
         prefix.extend(std::iter::repeat_n(STREAMING_PAD, PREFIX_LEN - 1));
 
-        // Embed prefix tokens
-        let prefix_ids = Tensor::<B, 2, Int>::from_data(
-            burn::tensor::TensorData::new(prefix.clone(), [1, PREFIX_LEN]),
-            &audio_embeds.device(),
-        );
-        let prefix_text_embeds = self.decoder.embed_tokens(prefix_ids);
+        let device = audio_embeds.device();
+
+        // Embed prefix tokens (CPU lookup)
+        let prefix_text_embeds = self.decoder.embed_tokens_from_ids(&prefix, 1, PREFIX_LEN, &device);
 
         // Combine audio + text for prefix positions
         let prefix_audio = audio_embeds
@@ -202,14 +238,14 @@ impl<B: Backend> VoxtralModel<B> {
         let prefix_inputs = prefix_audio + prefix_text_embeds;
 
         // Prefill: process all prefix positions at once
-        let mut decoder_cache = self.decoder.create_cache_preallocated(seq_len, &audio_embeds.device());
+        let mut decoder_cache = self.decoder.create_cache_preallocated(seq_len, &device);
 
         let hidden = self.decoder.forward_hidden_with_cache(
             prefix_inputs,
             t_embed.clone(),
             &mut decoder_cache,
         );
-        let logits = self.decoder.lm_head(hidden);
+        let logits = self.decoder.lm_head(hidden, &device);
 
         // Get prediction from last prefix position
         let vocab_size = logits.dims()[2];
@@ -229,11 +265,7 @@ impl<B: Backend> VoxtralModel<B> {
         // Autoregressive decode
         for pos in (PREFIX_LEN + 1)..seq_len {
             let new_token = generated[pos - 1];
-            let token_ids = Tensor::<B, 2, Int>::from_data(
-                burn::tensor::TensorData::new(vec![new_token], [1, 1]),
-                &audio_slices[0].device(),
-            );
-            let text_embed = self.decoder.embed_tokens(token_ids);
+            let text_embed = self.decoder.embed_tokens_from_ids(&[new_token], 1, 1, &device);
             let audio_pos = audio_slices[pos - 1 - PREFIX_LEN].clone();
             let input = audio_pos + text_embed;
 
@@ -242,7 +274,7 @@ impl<B: Backend> VoxtralModel<B> {
                 t_embed.clone(),
                 &mut decoder_cache,
             );
-            let logits = self.decoder.lm_head(hidden);
+            let logits = self.decoder.lm_head(hidden, &device);
             let pred = logits.argmax(2);
             let next_token: i32 = pred.into_data().as_slice::<i32>().unwrap()[0];
             generated.push(next_token);

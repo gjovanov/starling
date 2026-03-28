@@ -89,9 +89,23 @@ fn load_encoder_layer<B: Backend>(
 fn load_decoder<B: Backend>(st: &safetensors::SafeTensors, device: &B::Device) -> Result<LanguageModel<B>> {
     let cfg = config::LanguageModelConfig::default();
 
-    let tok_weight: Tensor<B, 2> = load_tensor(st, prefixes::TOK_EMBEDDINGS, device)?;
-    let tok_embeddings = embedding_from_weights(tok_weight);
-    eprintln!("[BF16]   tok_embeddings loaded (131072 × 3072)");
+    // Load tok_embeddings as raw f32 on CPU (avoids 1.6 GB GPU buffer limit).
+    // Sparse lookups (embed_tokens) use CPU data; lm_head chunks on-the-fly.
+    let tok_view = st.tensor(prefixes::TOK_EMBEDDINGS)
+        .context("tok_embeddings not found")?;
+    let tok_shape: Vec<usize> = tok_view.shape().to_vec();
+    let tok_embed_data: Vec<f32> = match tok_view.dtype() {
+        safetensors::Dtype::BF16 => tok_view.data().chunks_exact(2)
+            .map(|b| half::bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
+            .collect(),
+        safetensors::Dtype::F32 => tok_view.data().chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+        other => anyhow::bail!("Unsupported tok_embeddings dtype: {:?}", other),
+    };
+    let vocab_size = tok_shape[0];
+    let d_model = tok_shape[1];
+    eprintln!("[BF16]   tok_embeddings loaded on CPU ({} × {})", vocab_size, d_model);
 
     let rope = RoPEConfig::new(cfg.head_dim, 16384).with_theta(cfg.rope_theta).init(device);
 
@@ -104,7 +118,7 @@ fn load_decoder<B: Backend>(st: &safetensors::SafeTensors, device: &B::Device) -
     let norm_w: Tensor<B, 1> = load_tensor(st, prefixes::FINAL_NORM, device)?;
     let norm = create_rms_norm(norm_w, cfg.norm_eps);
 
-    Ok(LanguageModel { tok_embeddings, rope, layers, norm, d_model: cfg.dim })
+    Ok(LanguageModel { tok_embed_data, vocab_size, rope, layers, norm, d_model: cfg.dim })
 }
 
 fn load_decoder_layer<B: Backend>(
