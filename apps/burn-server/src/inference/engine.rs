@@ -149,8 +149,11 @@ impl InferenceSession for Q4Session {
         let full_text = self.decode_tokens(&token_ids);
 
         eprintln!(
-            "[Q4Commit] #{} tokens={} ids={:?} full_text={:?}",
+            "[Q4Commit] #{} audio={}samples padded={}samples mel={}frames tokens={} ids={:?} text={:?}",
             self.commit_count,
+            audio_buf.samples.len(),
+            padded.samples.len(),
+            n_frames,
             token_ids.len(),
             &token_ids[..token_ids.len().min(20)],
             &full_text[..full_text.len().min(80)]
