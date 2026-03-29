@@ -223,7 +223,7 @@ impl<B: Backend> VoxtralModel<B> {
         let audio_embeds = self.encode_audio(mel);
         let [_, seq_len, d_model] = audio_embeds.dims();
 
-        const PREFIX_LEN: usize = 38;
+        const PREFIX_LEN: usize = 39;
         const BOS_TOKEN: i32 = 1;
         const STREAMING_PAD: i32 = 32;
 

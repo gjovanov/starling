@@ -34,8 +34,11 @@ pub fn load_encoder_and_adapter<B: Backend>(
 
     let cn = conv_names();
     let conv = ConvDownsampler {
-        conv1: conv1d_from_weights(load_tensor(st, &cn.conv1_weight, device)?, load_tensor(st, &cn.conv1_bias, device)?),
-        conv2: conv1d_from_weights(load_tensor(st, &cn.conv2_weight, device)?, load_tensor(st, &cn.conv2_bias, device)?),
+        // Conv0: stride=1 (no downsample), Conv1: stride=2 (2× downsample)
+        // Total: 2× downsample. Confirmed from voxtral.c source code.
+        // The voxtral-mini-realtime-rs reference incorrectly uses stride=2,2 (4× total).
+        conv1: conv1d_from_weights(load_tensor(st, &cn.conv1_weight, device)?, load_tensor(st, &cn.conv1_bias, device)?, 1),
+        conv2: conv1d_from_weights(load_tensor(st, &cn.conv2_weight, device)?, load_tensor(st, &cn.conv2_bias, device)?, 2),
     };
     let rope = RoPEConfig::new(cfg.head_dim, 4096).with_theta(cfg.rope_theta).init(device);
 
@@ -244,10 +247,12 @@ pub fn transcribe<B: Backend>(
         let seq = ids.len();
         let mut out = vec![0.0f32; seq * d_model];
         for (i, &id) in ids.iter().enumerate() {
-            let start = (id as usize) * d_model;
-            let end = start + d_model;
-            if end <= tok_embed_data.len() {
-                out[i * d_model..(i + 1) * d_model].copy_from_slice(&tok_embed_data[start..end]);
+            if id >= 0 && (id as usize) < vocab_size {
+                let start = (id as usize) * d_model;
+                let end = start + d_model;
+                if end <= tok_embed_data.len() {
+                    out[i * d_model..(i + 1) * d_model].copy_from_slice(&tok_embed_data[start..end]);
+                }
             }
         }
         Tensor::from_data(burn::tensor::TensorData::new(out, [1, seq, d_model]), device)
@@ -282,7 +287,7 @@ pub fn transcribe<B: Backend>(
     };
 
     // ── Prefill ──
-    const PREFIX_LEN: usize = 38;
+    const PREFIX_LEN: usize = 39;
     const BOS_TOKEN: i32 = 1;
     const STREAMING_PAD: i32 = 32;
 
@@ -329,7 +334,11 @@ pub fn transcribe<B: Backend>(
         }
     }
 
-    let first_token: i32 = last_logits.argmax(2).into_data().as_slice::<i32>().unwrap()[0];
+    let argmax_data = last_logits.argmax(2).into_data();
+    let first_token: i32 = argmax_data.as_slice::<i32>()
+        .map(|v| v[0])
+        .or_else(|_| argmax_data.as_slice::<i64>().map(|v| v[0] as i32))
+        .unwrap_or(0);
     eprintln!("[BF16] Prefill done, first_token={}", first_token);
 
     let mut generated = prefix;
@@ -354,7 +363,11 @@ pub fn transcribe<B: Backend>(
 
         let hidden = forward_decoder(x, &mut caches)?;
         let logits = lm_head(hidden);
-        let next_token: i32 = logits.argmax(2).into_data().as_slice::<i32>().unwrap()[0];
+        let argmax_data = logits.argmax(2).into_data();
+        let next_token: i32 = argmax_data.as_slice::<i32>()
+            .map(|v| v[0])
+            .or_else(|_| argmax_data.as_slice::<i64>().map(|v| v[0] as i32))
+            .unwrap_or(0);
         generated.push(next_token);
 
         if (step + 1) % 10 == 0 || step == decode_steps - 1 {
