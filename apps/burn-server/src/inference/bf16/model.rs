@@ -40,10 +40,27 @@ impl<B: Backend> AudioEncoder<B> {
         }
 
         let mut x = x;
-        for layer in &self.layers {
+        for (i, layer) in self.layers.iter().enumerate() {
             x = layer.forward(x, &self.rope, offset);
+            if i == 0 || i == 15 || i == 31 {
+                let d = x.dims()[2];
+                let v = x.clone().slice([0..1, 0..1, 0..d]).reshape([d]).into_data();
+                let vals = v.as_slice::<f32>().unwrap();
+                let rms = (vals.iter().map(|x| x*x).sum::<f32>() / vals.len() as f32).sqrt();
+                eprintln!("[BF16 Encoder] layer {} x[0] first5=[{:.6}, {:.6}, {:.6}, {:.6}, {:.6}] RMS={:.4}",
+                    i, vals[0], vals[1], vals[2], vals[3], vals[4], rms);
+            }
         }
-        self.norm.forward(x)
+        let out = self.norm.forward(x);
+        {
+            let d = out.dims()[2];
+            let v = out.clone().slice([0..1, 0..1, 0..d]).reshape([d]).into_data();
+            let vals = v.as_slice::<f32>().unwrap();
+            let rms = (vals.iter().map(|x| x*x).sum::<f32>() / vals.len() as f32).sqrt();
+            eprintln!("[BF16 Encoder] final x[0] first5=[{:.6}, {:.6}, {:.6}, {:.6}, {:.6}] RMS={:.4}",
+                vals[0], vals[1], vals[2], vals[3], vals[4], rms);
+        }
+        out
     }
 
     pub fn forward_with_cache(
