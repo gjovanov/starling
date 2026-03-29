@@ -41,7 +41,57 @@ impl<B: Backend> AudioEncoder<B> {
 
         let mut x = x;
         for (i, layer) in self.layers.iter().enumerate() {
-            x = layer.forward(x, &self.rope, offset);
+            // For layer 0: manually run components to compare with voxtral.c
+            if i == 0 {
+                let residual = x.clone();
+                // Compute RMS manually for comparison
+                {
+                    let d = x.dims()[2]; // 1280
+                    let pos0 = x.clone().slice([0..1, 0..1, 0..d]).reshape([d]).into_data();
+                    let vals = pos0.as_slice::<f32>().unwrap();
+                    let mean_sq: f32 = vals.iter().map(|v| v * v).sum::<f32>() / vals.len() as f32;
+                    let rms = (mean_sq + 1e-5f32).sqrt();
+                    eprintln!("[BF16 Encoder] L0 manual_rms={:.6} mean_sq={:.6} d_model={}", rms, mean_sq, vals.len());
+                }
+                let x_normed = layer.attention_norm.forward(x);
+                {
+                    let v = x_normed.clone().slice([0..1, 0..1, 0..5]).reshape([5]).into_data();
+                    let vals = v.as_slice::<f32>().unwrap();
+                    eprintln!("[BF16 Encoder] L0 attn_norm[0] first5=[{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
+                        vals[0], vals[1], vals[2], vals[3], vals[4]);
+                    // Back-compute RMS from burn output
+                    // normed = x / rms * gamma, so rms = x * gamma / normed
+                    let x_val = 0.0360f32; // conv output pos0 dim0
+                    let gamma = 0.8945f32; // norm weight dim0
+                    let burn_rms = x_val * gamma / vals[0];
+                    eprintln!("[BF16 Encoder] L0 burn_rms_inferred={:.6} (expected 0.217460)", burn_rms);
+                }
+                let attn_out = layer.attention.forward(x_normed.clone(), &self.rope, offset, true);
+                // Log attention output
+                {
+                    let d = attn_out.dims()[2];
+                    let v = attn_out.clone().slice([0..1, 0..1, 0..d]).reshape([d]).into_data();
+                    let vals = v.as_slice::<f32>().unwrap();
+                    let rms = (vals.iter().map(|x| x*x).sum::<f32>() / vals.len() as f32).sqrt();
+                    eprintln!("[BF16 Encoder] L0 attn_out[0] first5=[{:.6}, {:.6}, {:.6}, {:.6}, {:.6}] RMS={:.4}",
+                        vals[0], vals[1], vals[2], vals[3], vals[4], rms);
+                }
+                let x_res = attn_out + residual;
+                let residual2 = x_res.clone();
+                let x_ffn_normed = layer.ffn_norm.forward(x_res);
+                let ffn_out = layer.ffn.forward(x_ffn_normed);
+                {
+                    let d = ffn_out.dims()[2];
+                    let v = ffn_out.clone().slice([0..1, 0..1, 0..d]).reshape([d]).into_data();
+                    let vals = v.as_slice::<f32>().unwrap();
+                    let rms = (vals.iter().map(|x| x*x).sum::<f32>() / vals.len() as f32).sqrt();
+                    eprintln!("[BF16 Encoder] L0 ffn_out[0] first5=[{:.6}, {:.6}, {:.6}, {:.6}, {:.6}] RMS={:.4}",
+                        vals[0], vals[1], vals[2], vals[3], vals[4], rms);
+                }
+                x = ffn_out + residual2;
+            } else {
+                x = layer.forward(x, &self.rope, offset);
+            }
             if i == 0 || i == 15 || i == 31 {
                 let d = x.dims()[2];
                 let v = x.clone().slice([0..1, 0..1, 0..d]).reshape([d]).into_data();
