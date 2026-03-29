@@ -223,6 +223,12 @@ pub fn transcribe<B: Backend>(
         let rv = rd.as_slice::<f32>().unwrap();
         let r_rms = (rv.iter().map(|x| x*x).sum::<f32>() / rv.len() as f32).sqrt();
 
+        // Adapter position 0 first 5 values (compare with voxtral.c)
+        let a0 = audio_embeds.clone().slice([0..1, 0..1, 0..5]).reshape([5]).into_data();
+        let a0v = a0.as_slice::<f32>().unwrap();
+        eprintln!("[BF16] adapter[0] first5=[{:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
+            a0v[0], a0v[1], a0v[2], a0v[3], a0v[4]);
+
         let ao = audio_embeds.clone().reshape([seq_len * d_model]);
         let ad = ao.into_data();
         let av = ad.as_slice::<f32>().unwrap();
