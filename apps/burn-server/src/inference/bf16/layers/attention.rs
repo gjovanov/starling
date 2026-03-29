@@ -5,9 +5,37 @@
 use burn::config::Config;
 use burn::module::Module;
 use burn::nn::{Linear, LinearConfig};
-use burn::tensor::activation::softmax;
 use burn::tensor::backend::Backend;
 use burn::tensor::{Float, Tensor};
+
+/// CPU-based stable softmax — avoids burn's max_dim/sum_dim reduction kernels
+/// which are buggy on DZN (Vulkan-over-DX12).
+/// For single-token decode, scores are [B,H,1,KV] ≈ 3000 elements — fast on CPU.
+fn cpu_softmax<B: Backend>(scores: Tensor<B, 4>) -> Tensor<B, 4> {
+    let [b, h, s, kv] = scores.dims();
+    let device = scores.device();
+    let data = scores.reshape([b * h * s, kv]).into_data();
+    let vals = data.as_slice::<f32>().unwrap();
+    let n_rows = b * h * s;
+    let mut out = vec![0.0f32; n_rows * kv];
+    for row in 0..n_rows {
+        let src = &vals[row * kv..(row + 1) * kv];
+        let dst = &mut out[row * kv..(row + 1) * kv];
+        let max_val = src.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for j in 0..kv {
+            let e = (src[j] - max_val).exp();
+            dst[j] = e;
+            sum += e;
+        }
+        if sum > 0.0 {
+            for j in 0..kv { dst[j] /= sum; }
+        }
+    }
+    Tensor::<B, 2>::from_data(
+        burn::tensor::TensorData::new(out, [n_rows, kv]), &device,
+    ).reshape([b, h, s, kv])
+}
 
 use super::kv_cache::KVCache;
 use super::rope::RoPE;
@@ -170,7 +198,7 @@ impl<B: Backend> Attention<B> {
         };
 
         // Softmax
-        let attn = softmax(scores, 3);
+        let attn = cpu_softmax(scores);
 
         // Apply attention: attn @ V
         let out = attn.matmul(v);
@@ -260,7 +288,7 @@ impl<B: Backend> Attention<B> {
         };
 
         // Softmax
-        let attn = softmax(scores, 3);
+        let attn = cpu_softmax(scores);
 
         // Apply attention: attn @ V
         let out = attn.matmul(v);

@@ -173,16 +173,16 @@ fn load_and_forward_decoder_layer<B: Backend>(
     let out = layer.forward_with_cache(x, t_embed, rope, cache);
     let _ = out.clone().slice([0..1, 0..1, 0..1]).into_data();
 
-    // Track hidden state (last layer only)
-    if layer_idx == 25 {
+    // Track hidden state — find first layer with NaN
+    {
         let n = out.dims()[2];
         let v = out.clone().slice([0..1, 0..1, 0..n]).reshape([n]).into_data();
         let vals = v.as_slice::<f32>().unwrap_or(&[]);
-        let rms = (vals.iter().map(|x| x*x).sum::<f32>() / vals.len().max(1) as f32).sqrt();
         let has_nan = vals.iter().any(|x| x.is_nan());
         let has_inf = vals.iter().any(|x| x.is_infinite());
+        let max_abs = vals.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
         if has_nan || has_inf {
-            eprintln!("[BF16] LAYER 25 NaN/Inf! RMS={:.4}", rms);
+            eprintln!("[BF16] LAYER {} NaN/Inf! max_abs={:.1}", layer_idx, max_abs);
         }
     }
 
@@ -376,7 +376,35 @@ pub fn transcribe<B: Backend>(
         let audio_pos = audio_slices[pos - 1 - PREFIX_LEN].clone();
         let x = audio_pos + text_embed;
 
+        // NaN trace: scan full vectors
+        let check_nan = |t: &Tensor<B, 3>, label: &str, step: usize| {
+            let d = t.dims()[2];
+            let v = t.clone().slice([0..1, 0..1, 0..d]).reshape([d]).into_data();
+            let vals = v.as_slice::<f32>().unwrap();
+            let nan_count = vals.iter().filter(|x| x.is_nan()).count();
+            let inf_count = vals.iter().filter(|x| x.is_infinite()).count();
+            let max_abs = vals.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            if nan_count > 0 || inf_count > 0 || max_abs > 1e6 {
+                eprintln!("[BF16] {} step {}: nan={} inf={} max_abs={:.1} prev_token={}",
+                    label, step, nan_count, inf_count, max_abs, prev_token);
+                return true;
+            }
+            false
+        };
+
+        if step >= 48 && step <= 60 {
+            check_nan(&x, "INPUT", step);
+        }
+
         let hidden = forward_decoder(x, &mut caches)?;
+
+        if step >= 48 && step <= 60 {
+            if check_nan(&hidden, "HIDDEN", step) {
+                // Try to find which decoder layer introduced the NaN
+                // by checking the Layer 25 diagnostic (already logged)
+            }
+        }
+
         let logits = lm_head(hidden);
 
         let argmax_data = logits.argmax(2).into_data();
