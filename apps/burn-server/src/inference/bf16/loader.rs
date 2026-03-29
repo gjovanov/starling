@@ -63,11 +63,10 @@ pub fn load_encoder_and_adapter<B: Backend>(
 }
 
 fn create_rms_norm<B: Backend>(weight: Tensor<B, 1>, eps: f64) -> RmsNorm<B> {
-    let d = weight.dims()[0];
-    let device = weight.device();
-    let mut norm = RmsNormConfig::new(d).with_eps(eps).init(&device);
-    norm.weight.gamma = burn::module::Param::initialized(burn::module::ParamId::new(), weight);
-    norm
+    RmsNorm {
+        gamma: burn::module::Param::initialized(burn::module::ParamId::new(), weight),
+        epsilon: eps,
+    }
 }
 
 fn load_encoder_layer<B: Backend>(

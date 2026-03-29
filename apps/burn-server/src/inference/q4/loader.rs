@@ -622,10 +622,8 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
     ) -> Result<RmsNorm<WgpuBackend>> {
         let weight: Tensor<WgpuBackend, 1> = self.load_f32_tensor(name, device)?;
         Ok(RmsNorm {
-            weight: burn::nn::RmsNorm {
-                gamma: Param::initialized(ParamId::new(), weight),
-                epsilon: eps,
-            },
+            gamma: Param::initialized(ParamId::new(), weight),
+            epsilon: eps,
         })
     }
 }

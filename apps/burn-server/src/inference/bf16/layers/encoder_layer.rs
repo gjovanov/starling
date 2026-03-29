@@ -101,16 +101,12 @@ impl<B: Backend> EncoderLayer<B> {
         eps: f64,
     ) -> Self {
         let attention_norm = RmsNorm {
-            weight: burn::nn::RmsNorm {
-                gamma: Param::initialized(ParamId::new(), attention_norm_weight),
-                epsilon: eps,
-            },
+            gamma: Param::initialized(ParamId::new(), attention_norm_weight),
+            epsilon: eps,
         };
         let ffn_norm = RmsNorm {
-            weight: burn::nn::RmsNorm {
-                gamma: Param::initialized(ParamId::new(), ffn_norm_weight),
-                epsilon: eps,
-            },
+            gamma: Param::initialized(ParamId::new(), ffn_norm_weight),
+            epsilon: eps,
         };
         let ffn = SwiGLU::new(w1, w2, w3);
 

@@ -4,11 +4,11 @@
 //! both encoder and LLM layers in Voxtral.
 
 use burn::config::Config;
-use burn::module::Module;
+use burn::module::{Module, Param, ParamId};
 use burn::nn::{Linear, LinearConfig};
 use burn::tensor::activation::gelu;
 use burn::tensor::backend::Backend;
-use burn::tensor::Tensor;
+use burn::tensor::{Tensor, TensorData};
 
 /// Standard RMSNorm configuration.
 #[derive(Config, Debug)]
@@ -20,29 +20,56 @@ pub struct RmsNormConfig {
     pub eps: f64,
 }
 
-/// Standard RMSNorm layer.
+/// Standard RMSNorm layer using matmul-based mean computation.
 ///
-/// Applies: `x * weight / sqrt(mean(x^2) + eps)`
+/// Applies: `x * gamma / sqrt(mean(x^2) + eps)`
+///
+/// Uses `x² @ ones / d_model` instead of `mean_dim` to compute
+/// the mean of squares. This avoids a burn/CubeCL reduction kernel
+/// bug on DZN (Vulkan-over-DX12) where `mean_dim` produces incorrect
+/// results (1.68× scale error).
 #[derive(Module, Debug)]
 pub struct RmsNorm<B: Backend> {
-    /// Learnable scale parameter.
-    pub weight: burn::nn::RmsNorm<B>,
+    /// Learnable scale parameter (gamma).
+    pub gamma: Param<Tensor<B, 1>>,
+    /// Epsilon for numerical stability.
+    pub epsilon: f64,
 }
 
 impl RmsNormConfig {
     /// Initialize the RmsNorm layer.
     pub fn init<B: Backend>(&self, device: &B::Device) -> RmsNorm<B> {
-        let weight = burn::nn::RmsNormConfig::new(self.d_model)
-            .with_epsilon(self.eps)
-            .init(device);
-        RmsNorm { weight }
+        let gamma = Tensor::ones([self.d_model], device);
+        RmsNorm {
+            gamma: Param::initialized(ParamId::new(), gamma),
+            epsilon: self.eps,
+        }
     }
 }
 
 impl<B: Backend> RmsNorm<B> {
-    /// Forward pass.
-    pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
-        self.weight.forward(x)
+    /// Forward pass using matmul-based mean(x²) computation.
+    ///
+    /// For input [B, S, D]: computes `x² @ ones_col / D` to get mean(x²)
+    /// per position, avoiding the buggy `mean_dim` reduction kernel.
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [batch, seq, d_model] = x.dims();
+        let device = x.device();
+
+        // x² [B, S, D]
+        let x_sq = x.clone() * x.clone();
+
+        // mean(x²) via matmul: [B, S, D] @ [D, 1] / D → [B, S, 1]
+        let ones = Tensor::<B, 2>::ones([d_model, 1], &device);
+        let ones_3d = ones.unsqueeze::<3>(); // [1, D, 1]
+        let sum_sq = x_sq.matmul(ones_3d); // [B, S, 1]
+        let mean_sq = sum_sq / (d_model as f32);
+
+        // rms = sqrt(mean(x²) + eps)
+        let rms = (mean_sq + self.epsilon).sqrt();
+
+        // normalize and scale
+        (x / rms) * self.gamma.val().unsqueeze::<3>()
     }
 }
 

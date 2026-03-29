@@ -147,17 +147,13 @@ impl<B: Backend> DecoderLayer<B> {
         let ada_rms_norm = AdaRmsNorm::new(w0, ada_w2, eps);
 
         let attention_norm = RmsNorm {
-            weight: burn::nn::RmsNorm {
-                gamma: Param::initialized(ParamId::new(), attention_norm_weight),
-                epsilon: eps,
-            },
+            gamma: Param::initialized(ParamId::new(), attention_norm_weight),
+            epsilon: eps,
         };
 
         let ffn_norm = RmsNorm {
-            weight: burn::nn::RmsNorm {
-                gamma: Param::initialized(ParamId::new(), ffn_norm_weight),
-                epsilon: eps,
-            },
+            gamma: Param::initialized(ParamId::new(), ffn_norm_weight),
+            epsilon: eps,
         };
 
         let ffn = SwiGLU::new(w1, w2, w3);
