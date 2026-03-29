@@ -363,6 +363,16 @@ pub fn transcribe<B: Backend>(
 
         let hidden = forward_decoder(x, &mut caches)?;
         let logits = lm_head(hidden);
+        // Check for NaN in hidden/logits
+        {
+            let h_data = hidden.clone().slice([0..1, 0..1, 0..1]).into_data();
+            let h_val = h_data.as_slice::<f32>().map(|v| v[0]).unwrap_or(0.0);
+            if h_val.is_nan() || h_val.is_infinite() {
+                eprintln!("[BF16] NaN/Inf in hidden at step {} — aborting decode", step);
+                break;
+            }
+        }
+
         let argmax_data = logits.argmax(2).into_data();
         let next_token: i32 = argmax_data.as_slice::<i32>()
             .map(|v| v[0])
