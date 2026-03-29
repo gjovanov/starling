@@ -157,18 +157,17 @@ pub fn embedding_from_weights<B: Backend>(weight: Tensor<B, 2>) -> Embedding<B> 
 // ---------------------------------------------------------------------------
 
 /// Create Conv1d from weight [out, in, k] + bias [out].
-/// voxtral.c uses causal conv: padding = kernel_size - stride (left-pad only).
-/// burn's Conv1d uses symmetric padding, which is close enough for offline inference.
+/// Padding is set to 0 — causal left-padding is applied manually in
+/// ConvDownsampler::forward() before calling conv.forward().
 pub fn conv1d_from_weights<B: Backend>(
     weight: Tensor<B, 3>,
     bias: Tensor<B, 1>,
     stride: usize,
 ) -> Conv1d<B> {
     let [out_ch, in_ch, kernel] = weight.dims();
-    let padding = kernel - stride; // causal padding: kernel_size - stride
     let config = Conv1dConfig::new(in_ch, out_ch, kernel)
         .with_stride(stride)
-        .with_padding(PaddingConfig1d::Explicit(padding));
+        .with_padding(PaddingConfig1d::Explicit(0));
     let mut conv = config.init::<B>(&weight.device());
     conv.weight = Param::initialized(ParamId::new(), weight);
     conv.bias = Some(Param::initialized(ParamId::new(), bias));

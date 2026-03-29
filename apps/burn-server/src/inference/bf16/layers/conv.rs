@@ -68,19 +68,37 @@ impl<B: Backend> ConvDownsampler<B> {
         Self { conv1, conv2 }
     }
 
-    /// Forward pass.
+    /// Forward pass with causal (left-only) padding.
     ///
-    /// # Arguments
-    /// * `x` - Mel spectrogram [batch, mel_bins, time]
+    /// Voxtral uses causal convolutions: pad = kernel_size - stride, left side only.
+    /// burn's Conv1d uses symmetric padding, so we manually left-pad and set Conv1d
+    /// padding to 0.
     ///
-    /// # Returns
-    /// Downsampled features [batch, out_channels, time / 4]
+    /// Conv0: stride=1, kernel=3 → causal pad=2 (left)
+    /// Conv1: stride=2, kernel=3 → causal pad=1 (left)
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        // Conv0: causal left-pad by (kernel - stride) = 3 - 1 = 2
+        let x = causal_pad(x, 2);
         let x = self.conv1.forward(x);
         let x = gelu(x);
+
+        // Conv1: causal left-pad by (kernel - stride) = 3 - 2 = 1
+        let x = causal_pad(x, 1);
         let x = self.conv2.forward(x);
         gelu(x)
     }
+}
+
+/// Causal (left-only) padding for Conv1d.
+/// Pads `pad` zeros on the left of the time dimension (dim 2).
+/// Input: [batch, channels, time] → Output: [batch, channels, time + pad]
+fn causal_pad<B: Backend>(x: Tensor<B, 3>, pad: usize) -> Tensor<B, 3> {
+    if pad == 0 {
+        return x;
+    }
+    let [batch, channels, time] = x.dims();
+    let zeros = Tensor::<B, 3>::zeros([batch, channels, pad], &x.device());
+    Tensor::cat(vec![zeros, x], 2) // concat along time dimension
 }
 
 #[cfg(test)]
