@@ -172,11 +172,21 @@ fn load_and_forward_decoder_layer<B: Backend>(
         32, cfg.norm_eps,
     );
     let out = layer.forward_with_cache(x, t_embed, rope, cache);
-    // CRITICAL: Force computation to complete before dropping layer weights.
-    // burn/wgpu uses lazy evaluation — matmul results may reference GPU buffers
-    // that get freed when the layer is dropped. into_data() on a small slice
-    // forces the full compute pipeline to flush.
     let _ = out.clone().slice([0..1, 0..1, 0..1]).into_data();
+
+    // Track hidden state (last layer only)
+    if layer_idx == 25 {
+        let n = out.dims()[2];
+        let v = out.clone().slice([0..1, 0..1, 0..n]).reshape([n]).into_data();
+        let vals = v.as_slice::<f32>().unwrap_or(&[]);
+        let rms = (vals.iter().map(|x| x*x).sum::<f32>() / vals.len().max(1) as f32).sqrt();
+        let has_nan = vals.iter().any(|x| x.is_nan());
+        let has_inf = vals.iter().any(|x| x.is_infinite());
+        if has_nan || has_inf {
+            eprintln!("[BF16] LAYER 25 NaN/Inf! RMS={:.4}", rms);
+        }
+    }
+
     Ok(out)
 }
 
@@ -363,15 +373,6 @@ pub fn transcribe<B: Backend>(
 
         let hidden = forward_decoder(x, &mut caches)?;
         let logits = lm_head(hidden);
-        // Check for NaN in hidden/logits
-        {
-            let h_data = hidden.clone().slice([0..1, 0..1, 0..1]).into_data();
-            let h_val = h_data.as_slice::<f32>().map(|v| v[0]).unwrap_or(0.0);
-            if h_val.is_nan() || h_val.is_infinite() {
-                eprintln!("[BF16] NaN/Inf in hidden at step {} — aborting decode", step);
-                break;
-            }
-        }
 
         let argmax_data = logits.argmax(2).into_data();
         let next_token: i32 = argmax_data.as_slice::<i32>()
