@@ -22,7 +22,7 @@ use super::streaming::split_sentences;
 /// Audio batch interval in seconds.
 /// Voxtral streaming needs enough audio context — the reference uses 15s chunks.
 /// With BF16 padding (32 tokens = 16 prefix positions) + 15s audio → ~93 speech positions.
-const BATCH_INTERVAL_SECS: f32 = 15.0;
+const BATCH_INTERVAL_SECS: f32 = 30.0;
 /// Samples per batch at 16kHz
 const BATCH_SAMPLES: usize = (16000.0 * BATCH_INTERVAL_SECS) as usize;
 
