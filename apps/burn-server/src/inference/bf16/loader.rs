@@ -132,7 +132,12 @@ fn load_decoder_layer_impl<B: Backend>(
         load_linear(st, &n.w3_weight, None, device)?,
         32, cfg.norm_eps,
     );
-    Ok(if cuda_mode { layer.with_standard_ops() } else { layer })
+    let mut layer = if cuda_mode { layer.with_standard_ops() } else { layer };
+    if cuda_mode {
+        layer.attention.init_fused_qkv();
+        layer.ffn.init_fused();
+    }
+    Ok(layer)
 }
 
 fn load_and_forward_decoder_layer<B: Backend>(

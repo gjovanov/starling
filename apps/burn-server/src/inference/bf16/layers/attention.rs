@@ -85,6 +85,10 @@ pub struct Attention<B: Backend> {
     pub(crate) wk: Linear<B>,
     pub(crate) wv: Linear<B>,
     pub(crate) wo: Linear<B>,
+    /// Fused QKV weight [d_model, q_dim+k_dim+v_dim] (optional)
+    pub(crate) wqkv_fused: Option<Tensor<B, 2>>,
+    pub(crate) q_dim: usize,
+    pub(crate) kv_dim: usize,
     pub(crate) n_heads: usize,
     pub(crate) n_kv_heads: usize,
     pub(crate) head_dim: usize,
@@ -117,6 +121,9 @@ impl AttentionConfig {
             wk,
             wv,
             wo,
+            wqkv_fused: None,
+            q_dim: self.n_heads * self.head_dim,
+            kv_dim: n_kv_heads * self.head_dim,
             n_heads: self.n_heads,
             n_kv_heads,
             head_dim: self.head_dim,
@@ -145,6 +152,9 @@ impl<B: Backend> Attention<B> {
             wk,
             wv,
             wo,
+            wqkv_fused: None,
+            q_dim: n_heads * head_dim,
+            kv_dim: n_kv_heads * head_dim,
             n_heads,
             n_kv_heads,
             head_dim,
@@ -152,6 +162,14 @@ impl<B: Backend> Attention<B> {
             sliding_window,
             use_standard_softmax: false,
         }
+    }
+
+    /// Fuse Q/K/V into single weight for one matmul instead of three.
+    pub fn init_fused_qkv(&mut self) {
+        let wq_w = self.wq.weight.val(); // [d_model, q_dim]
+        let wk_w = self.wk.weight.val(); // [d_model, kv_dim]
+        let wv_w = self.wv.weight.val(); // [d_model, kv_dim]
+        self.wqkv_fused = Some(Tensor::cat(vec![wq_w, wk_w, wv_w], 1));
     }
 
     /// Enable standard softmax (for CUDA/native Vulkan backends).
@@ -276,15 +294,25 @@ impl<B: Backend> Attention<B> {
         // Position offset: total positions ever appended (correct after eviction)
         let offset = cache.total_appended();
 
-        // Project Q, K, V
-        let q = self.wq.forward(x.clone());
-        let k = self.wk.forward(x.clone());
-        let v = self.wv.forward(x);
-
-        // Reshape to [batch, seq, heads, head_dim]
-        let q = q.reshape([batch, seq_len, self.n_heads, self.head_dim]);
-        let k = k.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
-        let v = v.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
+        // Project Q, K, V — fused single matmul when available
+        let (q, k, v) = if let Some(ref wqkv) = self.wqkv_fused {
+            let combined = x.matmul(wqkv.clone().unsqueeze::<3>()); // [B,S,Q+K+V]
+            let [b, s, _] = combined.dims();
+            let qd = self.q_dim;
+            let kd = self.kv_dim;
+            let q = combined.clone().slice([0..b, 0..s, 0..qd])
+                .reshape([b, s, self.n_heads, self.head_dim]);
+            let k = combined.clone().slice([0..b, 0..s, qd..qd + kd])
+                .reshape([b, s, self.n_kv_heads, self.head_dim]);
+            let v = combined.slice([0..b, 0..s, qd + kd..qd + 2 * kd])
+                .reshape([b, s, self.n_kv_heads, self.head_dim]);
+            (q, k, v)
+        } else {
+            let q = self.wq.forward(x.clone()).reshape([batch, seq_len, self.n_heads, self.head_dim]);
+            let k = self.wk.forward(x.clone()).reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
+            let v = self.wv.forward(x).reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
+            (q, k, v)
+        };
 
         // Apply RoPE to new Q, K (with correct positional offset)
         let (q, k) = rope.apply(q, k, offset);

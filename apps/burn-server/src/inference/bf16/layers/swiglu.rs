@@ -37,6 +37,9 @@ pub struct SwiGLU<B: Backend> {
     pub(crate) w2: Linear<B>,
     /// Up projection: d_model -> hidden_dim
     pub(crate) w3: Linear<B>,
+    /// Fused gate+up projection: d_model -> 2*hidden_dim (optional)
+    pub(crate) w13_fused: Option<Tensor<B, 2>>,
+    pub(crate) hidden_dim: usize,
 }
 
 impl SwiGLUConfig {
@@ -52,28 +55,45 @@ impl SwiGLUConfig {
             .with_bias(self.bias)
             .init(device);
 
-        SwiGLU { w1, w2, w3 }
+        SwiGLU { w1, w2, w3, w13_fused: None, hidden_dim: self.hidden_dim }
     }
 }
 
 impl<B: Backend> SwiGLU<B> {
     /// Create SwiGLU from linear layers (for weight loading).
     pub fn new(w1: Linear<B>, w2: Linear<B>, w3: Linear<B>) -> Self {
-        Self { w1, w2, w3 }
+        Self { w1, w2, w3, w13_fused: None, hidden_dim: 0 }
     }
 
-    /// Forward pass.
-    ///
-    /// # Arguments
-    /// * `x` - Input tensor [batch, seq, d_model]
-    ///
-    /// # Returns
-    /// Output tensor [batch, seq, d_model]
+    /// Fuse w1 (gate) and w3 (up) into a single weight matrix for one matmul.
+    /// Call after loading weights, before inference.
+    pub fn init_fused(&mut self) {
+        // w1.weight: [d_model, hidden_dim] (burn convention after transpose)
+        // w3.weight: [d_model, hidden_dim]
+        // Fused: [d_model, 2*hidden_dim] = cat([w1, w3], dim=1)
+        let w1_weight = self.w1.weight.val();
+        let w3_weight = self.w3.weight.val();
+        let [d_model, hidden] = w1_weight.dims();
+        self.hidden_dim = hidden;
+        self.w13_fused = Some(Tensor::cat(vec![w1_weight, w3_weight], 1));
+    }
+
+    /// Forward pass — uses fused w13 if available.
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let gate = self.w1.forward(x.clone());
-        let gate = silu(gate);
-        let up = self.w3.forward(x);
-        self.w2.forward(gate * up)
+        if let Some(ref w13) = self.w13_fused {
+            // Fused: one matmul → split → silu(gate) * up → w2
+            let combined = x.matmul(w13.clone().unsqueeze::<3>()); // [B,S,2*H]
+            let [b, s, _] = combined.dims();
+            let h = self.hidden_dim;
+            let gate = combined.clone().slice([0..b, 0..s, 0..h]);
+            let up = combined.slice([0..b, 0..s, h..2 * h]);
+            self.w2.forward(silu(gate) * up)
+        } else {
+            let gate = self.w1.forward(x.clone());
+            let gate = silu(gate);
+            let up = self.w3.forward(x);
+            self.w2.forward(gate * up)
+        }
     }
 }
 
