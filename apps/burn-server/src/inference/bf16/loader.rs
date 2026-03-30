@@ -211,6 +211,7 @@ pub fn transcribe_resident<B: Backend>(
 ) -> Result<Vec<i32>> {
     let t0 = Instant::now();
 
+    // Standard encoder (flash attention produces ~7× different magnitudes — burn cubecl bug)
     let audio_embeds = model.encode_audio(mel);
     let [_, seq_len, d_model] = audio_embeds.dims();
     eprintln!("[Resident] Encoded: seq_len={} ({:.1}s)", seq_len, t0.elapsed().as_secs_f32());

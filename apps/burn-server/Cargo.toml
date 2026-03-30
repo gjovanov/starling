@@ -73,6 +73,8 @@ cuda = ["burn/cuda"]
 # and wgpu hides it unless this flag is set on the Instance.
 [patch.crates-io]
 cubecl-wgpu = { path = "patches/cubecl-wgpu-0.9.0" }
+# cubecl-cuda patched for ptx-wmma (disabled: cubecl 0.9 ptx-wmma crashes on bf16/f16 accumulator cast)
+# cubecl-cuda = { path = "patches/cubecl-cuda-0.9.0" }
 
 [profile.release]
 opt-level = 3
