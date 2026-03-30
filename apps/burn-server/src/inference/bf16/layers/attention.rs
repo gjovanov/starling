@@ -11,30 +11,30 @@ use burn::tensor::{Float, Tensor};
 /// CPU-based stable softmax — avoids burn's max_dim/sum_dim reduction kernels
 /// which are buggy on DZN (Vulkan-over-DX12).
 /// For single-token decode, scores are [B,H,1,KV] ≈ 3000 elements — fast on CPU.
-fn cpu_softmax<B: Backend>(scores: Tensor<B, 4>) -> Tensor<B, 4> {
+/// GPU-only softmax using matmul-based sum (avoids broken max_dim/sum_dim on DZN).
+///
+/// Approach: clamp scores to [-100, 80], then compute exp/sum without max-shift.
+/// - Masked positions (-inf → clamped to -100): exp(-100) ≈ 3.7e-44 ≈ 0 ✓
+/// - Valid scores (typically -10 to +10 after 1/√d scaling): exp fine in f32 range
+/// - Upper clamp 80: exp(80) = 5.5e34, safely within f32 max (3.4e38)
+fn gpu_softmax<B: Backend>(scores: Tensor<B, 4>) -> Tensor<B, 4> {
     let [b, h, s, kv] = scores.dims();
     let device = scores.device();
-    let data = scores.reshape([b * h * s, kv]).into_data();
-    let vals = data.as_slice::<f32>().unwrap();
-    let n_rows = b * h * s;
-    let mut out = vec![0.0f32; n_rows * kv];
-    for row in 0..n_rows {
-        let src = &vals[row * kv..(row + 1) * kv];
-        let dst = &mut out[row * kv..(row + 1) * kv];
-        let max_val = src.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0f32;
-        for j in 0..kv {
-            let e = (src[j] - max_val).exp();
-            dst[j] = e;
-            sum += e;
-        }
-        if sum > 0.0 {
-            for j in 0..kv { dst[j] /= sum; }
-        }
-    }
-    Tensor::<B, 2>::from_data(
-        burn::tensor::TensorData::new(out, [n_rows, kv]), &device,
-    ).reshape([b, h, s, kv])
+
+    // Clamp: -inf → -100 (becomes ≈0 after exp), cap at 80 (exp(80) < f32::MAX)
+    let flat = scores.clamp(-100.0, 80.0).reshape([b * h * s, kv]);
+
+    // exp(clamped_scores) — all values safely in f32 range
+    let exp_vals = flat.exp();
+
+    // sum per row via matmul: [N, KV] @ [KV, 1] → [N, 1]
+    let ones = Tensor::<B, 2>::ones([kv, 1], &device);
+    let row_sum = exp_vals.clone().matmul(ones);
+
+    // normalize
+    let result = exp_vals / (row_sum + 1e-10);
+
+    result.reshape([b, h, s, kv])
 }
 
 use super::kv_cache::KVCache;
@@ -198,7 +198,7 @@ impl<B: Backend> Attention<B> {
         };
 
         // Softmax
-        let attn = cpu_softmax(scores);
+        let attn = gpu_softmax(scores);
 
         // Apply attention: attn @ V
         let out = attn.matmul(v);
@@ -288,7 +288,7 @@ impl<B: Backend> Attention<B> {
         };
 
         // Softmax
-        let attn = cpu_softmax(scores);
+        let attn = gpu_softmax(scores);
 
         // Apply attention: attn @ V
         let out = attn.matmul(v);

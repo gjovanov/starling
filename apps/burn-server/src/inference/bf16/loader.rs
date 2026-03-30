@@ -100,7 +100,9 @@ fn load_and_forward_decoder_layer<B: Backend>(
     st: &safetensors::SafeTensors, layer_idx: usize,
     cfg: &config::LanguageModelConfig, device: &B::Device,
     x: Tensor<B, 3>, t_embed: Tensor<B, 3>, rope: &RoPE<B>, cache: &mut KVCache<B>,
+    timing: &mut (f32, f32), // (load_ms, forward_ms)
 ) -> Result<Tensor<B, 3>> {
+    let tl = Instant::now();
     let n = decoder_layer_names(layer_idx);
     let attention = Attention::new(
         load_linear(st, &n.wq_weight, None, device)?,
@@ -121,9 +123,16 @@ fn load_and_forward_decoder_layer<B: Backend>(
         load_linear(st, &n.w3_weight, None, device)?,
         32, cfg.norm_eps,
     );
+    timing.0 += tl.elapsed().as_secs_f32() * 1000.0;
+    let tf = Instant::now();
     let out = layer.forward_with_cache(x, t_embed, rope, cache);
-    // Force GPU pipeline flush before dropping layer weights
-    let _ = out.clone().slice([0..1, 0..1, 0..1]).into_data();
+    // Sync every 4 layers to prevent OOM while allowing GPU pipelining.
+    // Without sync, burn's lazy execution accumulates ~4 layers of weights (~1.8 GB)
+    // in VRAM before they're freed. With ~7 GB headroom, this is safe.
+    if (layer_idx + 1) % 4 == 0 || layer_idx == 25 {
+        let _ = out.clone().slice([0..1, 0..1, 0..1]).into_data();
+    }
+    timing.1 += tf.elapsed().as_secs_f32() * 1000.0;
     Ok(out)
 }
 
@@ -170,7 +179,26 @@ pub fn transcribe<B: Backend>(
         Tensor::from_data(burn::tensor::TensorData::new(out, [1, seq, d_model]), device)
     };
 
-    let lm_head = |hidden: Tensor<B, 3>| -> Tensor<B, 3> {
+    /// CPU argmax over embedding table — avoids uploading 1.8 GB per decode step.
+    /// For hidden [1, 1, d_model], computes dot product with each vocab row on CPU.
+    let cpu_argmax = |hidden: &Tensor<B, 3>| -> i32 {
+        let data = hidden.clone().reshape([d_model]).into_data();
+        let h = data.as_slice::<f32>().unwrap();
+        let mut best_id = 0i32;
+        let mut best_score = f32::NEG_INFINITY;
+        for id in 0..vocab_size {
+            let row = &tok_embed_data[id * d_model..(id + 1) * d_model];
+            let score: f32 = h.iter().zip(row.iter()).map(|(a, b)| a * b).sum();
+            if score > best_score {
+                best_score = score;
+                best_id = id as i32;
+            }
+        }
+        best_id
+    };
+
+    /// GPU lm_head for prefill (larger seq, worth the GPU upload).
+    let lm_head_gpu = |hidden: Tensor<B, 3>| -> Tensor<B, 3> {
         let [batch, seq, _] = hidden.dims();
         let max_rows = 128 * 1024 * 1024 / (d_model * 4);
         let mut parts = Vec::new();
@@ -188,11 +216,12 @@ pub fn transcribe<B: Backend>(
         else { Tensor::cat(parts, 2).reshape([batch, seq, vocab_size]) }
     };
 
-    let forward_decoder = |mut x: Tensor<B, 3>, caches: &mut LayerCaches<B>| -> Result<Tensor<B, 3>> {
+    let mut timing = (0.0f32, 0.0f32); // (load_ms, forward_ms)
+
+    let forward_decoder = |mut x: Tensor<B, 3>, caches: &mut LayerCaches<B>, timing: &mut (f32, f32)| -> Result<Tensor<B, 3>> {
         for i in 0..dec_cfg.n_layers {
             let cache = caches.get_mut(i).unwrap();
-            x = load_and_forward_decoder_layer(st, i, &dec_cfg, device, x, t_embed.clone(), &rope, cache)?;
-            if (i + 1) % 8 == 0 { gpu_sync(); }
+            x = load_and_forward_decoder_layer(st, i, &dec_cfg, device, x, t_embed.clone(), &rope, cache, timing)?;
         }
         Ok(norm.forward(x))
     };
@@ -212,8 +241,8 @@ pub fn transcribe<B: Backend>(
     let x = prefix_audio + prefix_text;
 
     let t1 = Instant::now();
-    let hidden = forward_decoder(x, &mut caches)?;
-    let logits = lm_head(hidden);
+    let hidden = forward_decoder(x, &mut caches, &mut timing)?;
+    let logits = lm_head_gpu(hidden);
     let vocab = logits.dims()[2];
     let last_logits = logits.slice([0..1, (PREFIX_LEN - 1)..PREFIX_LEN, 0..vocab]);
     let argmax_data = last_logits.argmax(2).into_data();
@@ -231,29 +260,39 @@ pub fn transcribe<B: Backend>(
         .collect();
     drop(audio_embeds);
 
+    eprintln!("[BF16] Prefill timing: load={:.0}ms fwd={:.0}ms", timing.0, timing.1);
+    timing = (0.0, 0.0);
+
     // ── Autoregressive decode ──
     let decode_steps = seq_len - PREFIX_LEN - 1;
     let t2 = Instant::now();
+    let mut lm_head_ms = 0.0f32;
     for step in 0..decode_steps {
         let pos = PREFIX_LEN + 1 + step;
         let prev_token = generated[pos - 1];
         let text_embed = embed_tokens(&[prev_token]);
         let audio_pos = audio_slices[pos - 1 - PREFIX_LEN].clone();
         let x = audio_pos + text_embed;
-        let hidden = forward_decoder(x, &mut caches)?;
-        let logits = lm_head(hidden);
-        let argmax_data = logits.argmax(2).into_data();
-        let next_token: i32 = argmax_data.as_slice::<i32>()
-            .map(|v| v[0])
-            .or_else(|_| argmax_data.as_slice::<i64>().map(|v| v[0] as i32))
-            .unwrap_or(0);
+        let hidden = forward_decoder(x, &mut caches, &mut timing)?;
+        let tl = Instant::now();
+        // CPU argmax: download 1×3072 hidden → dot product with 150k vocab rows on CPU
+        // Much faster than uploading 1.8 GB embedding table to GPU each step
+        let last_hidden = hidden.slice([0..1, 0..1, 0..d_model]);
+        let next_token = cpu_argmax(&last_hidden);
+        lm_head_ms += tl.elapsed().as_secs_f32() * 1000.0;
         generated.push(next_token);
-        if (step + 1) % 20 == 0 || step == decode_steps - 1 {
+        if (step + 1) % 50 == 0 || step == decode_steps - 1 {
             let elapsed = t2.elapsed().as_secs_f32();
-            let steps_per_sec = (step + 1) as f32 / elapsed;
-            eprintln!("[BF16] Decode {}/{} ({:.1} steps/s)", step + 1, decode_steps, steps_per_sec);
+            let ms_per_step = elapsed * 1000.0 / (step + 1) as f32;
+            eprintln!("[BF16] Decode {}/{} ({:.0}ms/step) load={:.0}ms fwd={:.0}ms lm={:.0}ms",
+                step + 1, decode_steps, ms_per_step, timing.0, timing.1, lm_head_ms);
         }
     }
-    eprintln!("[BF16] Total: {:.1}s ({} tokens)", t0.elapsed().as_secs_f32(), generated.len() - PREFIX_LEN);
+    let total_s = t0.elapsed().as_secs_f32();
+    let n_tokens = generated.len() - PREFIX_LEN;
+    eprintln!("[BF16] Total: {:.1}s ({} tokens, {:.0}× realtime for 30s audio)",
+        total_s, n_tokens, total_s / 30.0);
+    eprintln!("[BF16] Breakdown: load={:.1}s fwd={:.1}s lm_head={:.1}s",
+        timing.0 / 1000.0, timing.1 / 1000.0, lm_head_ms / 1000.0);
     Ok(generated.into_iter().skip(PREFIX_LEN).collect())
 }
