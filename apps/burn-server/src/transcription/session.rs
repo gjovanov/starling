@@ -20,9 +20,10 @@ use webrtc::track::track_local::TrackLocalWriter;
 use super::streaming::split_sentences;
 
 /// Audio batch interval in seconds.
-/// Voxtral streaming needs enough audio context — the reference uses 15s chunks.
-/// With BF16 padding (32 tokens = 16 prefix positions) + 15s audio → ~93 speech positions.
-const BATCH_INTERVAL_SECS: f32 = 15.0;
+/// CUDA: 5s balances latency vs inference time (each commit re-encodes
+/// a 15s sliding window, taking ~8s on warm GPU at 0.5× realtime).
+/// vllm uses 0.5s but has incremental encoding; we re-encode each commit.
+const BATCH_INTERVAL_SECS: f32 = 5.0;
 /// Samples per batch at 16kHz
 const BATCH_SAMPLES: usize = (16000.0 * BATCH_INTERVAL_SECS) as usize;
 

@@ -121,7 +121,29 @@ mod inner {
             }
             self.commit_count += 1;
 
-            let audio_buf = AudioBuffer::new(self.audio_buffer.clone(), 16000);
+            // Sliding window: keep at most MAX_AUDIO_SECS of audio for each commit.
+            // This bounds encoder cost to O(window²) regardless of total audio length.
+            // Text continuity maintained via prev_text delta tracking.
+            const MAX_AUDIO_SECS: f32 = 15.0;
+            const MAX_AUDIO_SAMPLES: usize = (16000.0 * MAX_AUDIO_SECS) as usize;
+
+            // Minimum audio context: ~3.2s for PREFIX_LEN=39 decoder positions
+            let min_samples = 50000;
+            if self.audio_buffer.len() < min_samples {
+                return Ok(String::new());
+            }
+
+            let t0 = std::time::Instant::now();
+
+            // Use sliding window: take the most recent MAX_AUDIO_SAMPLES
+            let start = if self.audio_buffer.len() > MAX_AUDIO_SAMPLES {
+                self.audio_buffer.len() - MAX_AUDIO_SAMPLES
+            } else {
+                0
+            };
+            let window = &self.audio_buffer[start..];
+
+            let audio_buf = AudioBuffer::new(window.to_vec(), 16000);
             let padded = pad_audio(&audio_buf, &self.pad_config);
             let log_mel = self.mel_spec.compute_log(&padded.samples);
             let n_frames = log_mel.len();
@@ -144,21 +166,28 @@ mod inner {
             ).map_err(|e| format!("CUDA transcribe: {}", e))?;
 
             let full_text = self.tokenizer.decode(&token_ids);
+            let audio_secs = window.len() as f32 / 16000.0;
+            let total_secs = self.audio_buffer.len() as f32 / 16000.0;
+            let infer_ms = t0.elapsed().as_secs_f32() * 1000.0;
             eprintln!(
-                "[CUDA] #{} tokens={} text={:?}",
-                self.commit_count, token_ids.len(),
-                &full_text[..full_text.char_indices().take(80).last().map_or(0, |(i, c)| i + c.len_utf8())]
+                "[CUDA] #{} {:.1}s/{:.1}s audio → {:.0}ms ({} tok)",
+                self.commit_count, audio_secs, total_secs, infer_ms, token_ids.len(),
             );
 
+            // Emit delta (new text since last commit)
             let delta = if full_text.len() > self.prev_text.len()
                 && full_text.starts_with(&self.prev_text)
             {
                 full_text[self.prev_text.len()..].to_string()
-            } else {
+            } else if !full_text.is_empty() {
+                // Window shifted — text may not start with prev_text anymore.
+                // Emit the full text as delta (session runner handles dedup)
                 full_text.clone()
+            } else {
+                String::new()
             };
             self.prev_text = full_text;
-            self.audio_buffer.clear();
+            // Audio buffer NOT cleared — accumulates for sliding window
             Ok(delta)
         }
 
