@@ -53,6 +53,33 @@ impl<B: Backend> AudioEncoder<B> {
         }
         self.norm.forward(x)
     }
+
+    /// Run conv downsampler + transpose (no transformer layers).
+    /// Returns [batch, positions, d_model] ready for chunked transformer processing.
+    pub fn conv_and_transpose(&self, mel: Tensor<B, 3>) -> Tensor<B, 3> {
+        let x = self.conv.forward(mel);
+        x.swap_dims(1, 2)
+    }
+
+    /// Run transformer layers with KV cache (no conv, no final norm).
+    /// For chunked encoding: call conv_and_transpose() once, then this per chunk.
+    pub fn forward_layers_with_cache(
+        &self, mut x: Tensor<B, 3>, caches: &mut LayerCaches<B>,
+    ) -> Tensor<B, 3> {
+        for (i, layer) in self.layers.iter().enumerate() {
+            if let Some(cache) = caches.get_mut(i) {
+                x = layer.forward_with_cache(x, &self.rope, cache);
+            }
+        }
+        x // no norm — caller applies after all chunks
+    }
+
+    /// Create pre-allocated encoder KV caches.
+    pub fn create_cache(&self, max_seq: usize, device: &B::Device) -> LayerCaches<B> {
+        let n_kv_heads = self.layers[0].attention.n_kv_heads; // 32 (MHA)
+        let head_dim = self.layers[0].attention.head_dim; // 64
+        LayerCaches::new_preallocated(self.layers.len(), 1, n_kv_heads, max_seq, head_dim, device)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +257,46 @@ impl<B: Backend> VoxtralModel<B> {
     pub fn encode_audio_flash(&self, mel: Tensor<B, 3>) -> Tensor<B, 3> {
         let encoder_out = self.encoder.forward_flash(mel, 0);
         let reshaped = reshape_encoder_output(encoder_out, self.reshape_factor);
+        self.adapter.forward(reshaped)
+    }
+
+    /// Encode audio in chunks using pre-allocated KV cache.
+    /// Conv runs once on full mel, then transformer layers process chunks.
+    /// Each chunk's attention only computes against cached + current positions.
+    pub fn encode_audio_chunked(
+        &self, mel: Tensor<B, 3>, chunk_positions: usize, device: &B::Device,
+    ) -> Tensor<B, 3> {
+        // 1. Conv once on full mel → [1, total_pos, d_model]
+        let enc_input = self.encoder.conv_and_transpose(mel);
+        let [batch, total_pos, d_model] = enc_input.dims();
+
+        // 2. Pre-allocated encoder caches (no per-chunk allocation)
+        let mut enc_caches = self.encoder.create_cache(total_pos, device);
+
+        // 3. Process in chunks through 32 transformer layers
+        let mut chunk_outputs: Vec<Tensor<B, 3>> = Vec::new();
+        let mut offset = 0;
+        let n_chunks = (total_pos + chunk_positions - 1) / chunk_positions;
+        while offset < total_pos {
+            let end = (offset + chunk_positions).min(total_pos);
+            let chunk = enc_input.clone().slice([0..batch, offset..end, 0..d_model]);
+            let chunk_out = self.encoder.forward_layers_with_cache(chunk, &mut enc_caches);
+            chunk_outputs.push(chunk_out);
+            let chunk_idx = offset / chunk_positions + 1;
+            if chunk_idx % 2 == 0 || offset + chunk_positions >= total_pos {
+                eprintln!("[ChunkedEnc] chunk {}/{} pos={}-{}", chunk_idx, n_chunks, offset, end);
+            }
+            offset = end;
+        }
+
+        // 4. Concatenate + final norm + reshape + adapter
+        let full_enc_out = if chunk_outputs.len() == 1 {
+            chunk_outputs.pop().unwrap()
+        } else {
+            Tensor::cat(chunk_outputs, 1)
+        };
+        let normed = self.encoder.norm.forward(full_enc_out);
+        let reshaped = reshape_encoder_output(normed, self.reshape_factor);
         self.adapter.forward(reshaped)
     }
 }

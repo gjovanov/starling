@@ -26,6 +26,8 @@ pub struct KVCache<B: Backend> {
     len: usize,
     /// Pre-allocated capacity. 0 = dynamic (cat) mode.
     capacity: usize,
+    /// Total positions ever appended (not reset by eviction). Used for RoPE offset.
+    total_appended: usize,
 }
 
 impl<B: Backend> Default for KVCache<B> {
@@ -42,6 +44,7 @@ impl<B: Backend> KVCache<B> {
             v: None,
             len: 0,
             capacity: 0,
+            total_appended: 0,
         }
     }
 
@@ -61,6 +64,7 @@ impl<B: Backend> KVCache<B> {
             v: Some(Tensor::zeros([batch, heads, max_seq, head_dim], device)),
             len: 0,
             capacity: max_seq,
+            total_appended: 0,
         }
     }
 
@@ -110,8 +114,9 @@ impl<B: Backend> KVCache<B> {
 
     /// Update both K and V caches.
     pub fn update(&mut self, k: Tensor<B, 4>, v: Tensor<B, 4>) -> (Tensor<B, 4>, Tensor<B, 4>) {
+        let new_seq = k.dims()[2];
+        self.total_appended += new_seq;
         if self.capacity > 0 {
-            let new_seq = k.dims()[2];
             let pos = self.len;
             let k_buf = self.k.take().unwrap();
             let v_buf = self.v.take().unwrap();
@@ -137,6 +142,11 @@ impl<B: Backend> KVCache<B> {
         }
     }
 
+    /// Total positions ever appended (not reset by eviction). Use for RoPE offset.
+    pub fn total_appended(&self) -> usize {
+        self.total_appended
+    }
+
     /// Get the current sequence length in the cache.
     pub fn seq_len(&self) -> usize {
         if self.capacity > 0 {
@@ -149,7 +159,6 @@ impl<B: Backend> KVCache<B> {
     /// Reset the cache.
     pub fn reset(&mut self) {
         if self.capacity > 0 {
-            // Zero out buffers and reset position.
             if let Some(k) = &self.k {
                 let dims = k.dims();
                 let device = k.device();
@@ -162,6 +171,7 @@ impl<B: Backend> KVCache<B> {
             self.v = None;
             self.len = 0;
         }
+        self.total_appended = 0;
     }
 
     /// Apply sliding window eviction.

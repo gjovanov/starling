@@ -211,10 +211,23 @@ pub fn transcribe_resident<B: Backend>(
 ) -> Result<Vec<i32>> {
     let t0 = Instant::now();
 
-    // Standard encoder (flash attention produces ~7× different magnitudes — burn cubecl bug)
-    let audio_embeds = model.encode_audio(mel);
+    // Use chunked encoding if chunk_positions > 0 (set via BURN_ENCODER_CHUNK_POSITIONS)
+    let chunk_positions = std::env::var("BURN_ENCODER_CHUNK_POSITIONS")
+        .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+
+    let audio_embeds = if chunk_positions > 0 {
+        let embeds = model.encode_audio_chunked(mel, chunk_positions, device);
+        let [_, seq_len, _] = embeds.dims();
+        eprintln!("[Resident] Encoded (chunked, {}pos): seq_len={} ({:.1}s)",
+            chunk_positions, seq_len, t0.elapsed().as_secs_f32());
+        embeds
+    } else {
+        let embeds = model.encode_audio(mel);
+        let [_, seq_len, _] = embeds.dims();
+        eprintln!("[Resident] Encoded: seq_len={} ({:.1}s)", seq_len, t0.elapsed().as_secs_f32());
+        embeds
+    };
     let [_, seq_len, d_model] = audio_embeds.dims();
-    eprintln!("[Resident] Encoded: seq_len={} ({:.1}s)", seq_len, t0.elapsed().as_secs_f32());
 
     let dec = &model.decoder;
     let mut caches = dec.create_cache_preallocated(seq_len, device);

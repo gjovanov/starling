@@ -273,8 +273,8 @@ impl<B: Backend> Attention<B> {
     ) -> Tensor<B, 3> {
         let [batch, seq_len, _d_model] = x.dims();
 
-        // Position offset is the current cache length
-        let offset = cache.seq_len();
+        // Position offset: total positions ever appended (correct after eviction)
+        let offset = cache.total_appended();
 
         // Project Q, K, V
         let q = self.wq.forward(x.clone());
