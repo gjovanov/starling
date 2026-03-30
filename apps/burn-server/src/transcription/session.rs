@@ -20,10 +20,9 @@ use webrtc::track::track_local::TrackLocalWriter;
 use super::streaming::split_sentences;
 
 /// Audio batch interval in seconds.
-/// CUDA: 5s balances latency vs inference time (each commit re-encodes
-/// a 15s sliding window, taking ~8s on warm GPU at 0.5× realtime).
-/// vllm uses 0.5s but has incremental encoding; we re-encode each commit.
-const BATCH_INTERVAL_SECS: f32 = 5.0;
+/// 0.5s matches vllm's streaming cadence. CUDA frame-by-frame processing
+/// handles ~6 frames per commit in ~300ms.
+const BATCH_INTERVAL_SECS: f32 = 0.5;
 /// Samples per batch at 16kHz
 const BATCH_SAMPLES: usize = (16000.0 * BATCH_INTERVAL_SECS) as usize;
 

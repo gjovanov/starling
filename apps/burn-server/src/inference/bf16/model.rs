@@ -3,9 +3,11 @@
 use burn::nn::Linear;
 use burn::tensor::activation::gelu;
 use burn::tensor::backend::Backend;
-use burn::tensor::Tensor;
+use burn::tensor::{Tensor, TensorData};
 
 use super::layers::*;
+use crate::audio::mel::{MelConfig, MelSpectrogram};
+use crate::audio::pad::{pad_audio, PadConfig};
 
 // ---------------------------------------------------------------------------
 // Audio Encoder (32 layers, causal Whisper-style)
@@ -298,5 +300,54 @@ impl<B: Backend> VoxtralModel<B> {
         let normed = self.encoder.norm.forward(full_enc_out);
         let reshaped = reshape_encoder_output(normed, self.reshape_factor);
         self.adapter.forward(reshaped)
+    }
+
+    /// Encode a single audio frame (small window ~135ms) through full encoder.
+    /// Matches vllm's per-frame approach: mel → conv → 32 encoder layers → norm → reshape → adapter.
+    /// Returns decoder-space embeddings [1, num_tokens, 3072].
+    /// Returns None if the frame produces 0 decoder positions (due to reshape alignment).
+    pub fn encode_frame(
+        &self,
+        audio_window: &[f32],
+        mel_spec: &MelSpectrogram,
+        device: &B::Device,
+    ) -> Option<Tensor<B, 3>> {
+        // 1. Mel spectrogram on the small window
+        let log_mel = mel_spec.compute_log(audio_window);
+        let n_frames = log_mel.len();
+        let n_mels = if n_frames > 0 { log_mel[0].len() } else { return None };
+        if n_frames == 0 { return None; }
+
+        let mut flat = vec![0.0f32; n_mels * n_frames];
+        for (t, frame) in log_mel.iter().enumerate() {
+            for (m, &val) in frame.iter().enumerate() {
+                flat[m * n_frames + t] = val;
+            }
+        }
+        let mel: Tensor<B, 3> = Tensor::from_data(
+            TensorData::new(flat, [1, n_mels, n_frames]), device,
+        );
+
+        // 2. Conv + full encoder (one-shot, no KV cache — small window)
+        let encoder_out = self.encoder.forward(mel, 0);
+        let [_, enc_pos, _] = encoder_out.dims();
+
+        // 3. Reshape (4×) — need multiple of 4 encoder positions
+        let usable = (enc_pos / self.reshape_factor) * self.reshape_factor;
+        if usable == 0 { return None; }
+
+        let encoder_out = if usable < enc_pos {
+            let [b, _, d] = encoder_out.dims();
+            encoder_out.slice([0..b, 0..usable, 0..d])
+        } else {
+            encoder_out
+        };
+        let normed = self.encoder.norm.forward(encoder_out);
+        let reshaped = reshape_encoder_output(normed, self.reshape_factor);
+        let adapted = self.adapter.forward(reshaped);
+
+        let [_, dec_pos, _] = adapted.dims();
+        if dec_pos == 0 { return None; }
+        Some(adapted)
     }
 }

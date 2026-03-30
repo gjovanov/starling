@@ -10,4 +10,5 @@
 pub mod layers;
 pub mod loader;
 pub mod model;
+pub mod streaming;
 pub mod weights;
