@@ -306,12 +306,16 @@ impl<B: Backend> VoxtralModel<B> {
     /// Matches vllm's per-frame approach: mel → conv → 32 encoder layers → norm → reshape → adapter.
     /// Returns decoder-space embeddings [1, num_tokens, 3072].
     /// Returns None if the frame produces 0 decoder positions (due to reshape alignment).
+    /// Encode a single audio frame with the correct RoPE position offset.
+    /// `encoder_offset`: absolute position of this frame's first encoder position.
+    /// Returns (adapted_embeds, num_encoder_positions_consumed).
     pub fn encode_frame(
         &self,
         audio_window: &[f32],
         mel_spec: &MelSpectrogram,
+        encoder_offset: usize,
         device: &B::Device,
-    ) -> Option<Tensor<B, 3>> {
+    ) -> Option<(Tensor<B, 3>, usize)> {
         // 1. Mel spectrogram on the small window
         let log_mel = mel_spec.compute_log(audio_window);
         let n_frames = log_mel.len();
@@ -328,8 +332,8 @@ impl<B: Backend> VoxtralModel<B> {
             TensorData::new(flat, [1, n_mels, n_frames]), device,
         );
 
-        // 2. Conv + full encoder (one-shot, no KV cache — small window)
-        let encoder_out = self.encoder.forward(mel, 0);
+        // 2. Conv + full encoder with correct position offset
+        let encoder_out = self.encoder.forward(mel, encoder_offset);
         let [_, enc_pos, _] = encoder_out.dims();
 
         // 3. Reshape (4×) — need multiple of 4 encoder positions
@@ -348,6 +352,6 @@ impl<B: Backend> VoxtralModel<B> {
 
         let [_, dec_pos, _] = adapted.dims();
         if dec_pos == 0 { return None; }
-        Some(adapted)
+        Some((adapted, enc_pos))
     }
 }
