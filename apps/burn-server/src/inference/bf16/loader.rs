@@ -159,7 +159,14 @@ pub fn load_full_model<B: Backend>(
     st: &safetensors::SafeTensors, device: &B::Device,
     sync_fn: impl Fn(),
 ) -> Result<VoxtralModel<B>> {
-    let (encoder, adapter) = load_encoder_and_adapter(st, device)?;
+    let (mut encoder, adapter) = load_encoder_and_adapter(st, device)?;
+    // Enable standard ops on encoder for CUDA (standard softmax + RmsNorm)
+    for layer in &mut encoder.layers {
+        layer.attention.use_standard_softmax = true;
+        layer.attention_norm.use_standard = true;
+        layer.ffn_norm.use_standard = true;
+    }
+    encoder.norm.use_standard = true;
 
     let dec_cfg = config::LanguageModelConfig::default();
     let (tok_embed_data, vocab_size, d_model) = load_decoder_metadata(st)?;

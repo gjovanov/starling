@@ -44,8 +44,7 @@ pub type WgpuBackend = burn::backend::wgpu::CubeBackend<burn::backend::wgpu::Wgp
 /// The device type used by the Q4 backend (same as `WgpuDevice`).
 pub type Q4Device = burn::backend::wgpu::WgpuDevice;
 
-/// CUDA backend — full 24 GB VRAM, no WDDM budget, native dispatch.
-/// Standard reduction kernels (max_dim, sum_dim, mean_dim) work correctly.
-/// Uses fusion wrapper (same as default `burn::backend::Cuda`).
+/// CUDA backend — full 24 GB VRAM, native dispatch, standard reduction kernels.
+/// Uses f32 (bf16 is slower due to immature cubecl bf16 CUDA kernels).
 #[cfg(feature = "cuda")]
 pub type CudaBackend = burn::backend::Cuda<f32, i32>;
