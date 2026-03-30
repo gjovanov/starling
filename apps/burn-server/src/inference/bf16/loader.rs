@@ -258,35 +258,46 @@ pub fn transcribe_resident<B: Backend>(
         .collect();
     drop(audio_embeds);
 
-    // ── Autoregressive decode with GPU-only token pipeline ──
+    // ── Autoregressive decode — GPU-only pipeline, deferred sync ──
+    // Each step: embed_lookup → forward(26 layers) → lm_head → argmax → select(embed)
+    // All on GPU. Only sync every SYNC_INTERVAL steps to download token IDs.
+    const SYNC_INTERVAL: usize = 16;
     let decode_steps = seq_len - PREFIX_LEN - 1;
     let t2 = Instant::now();
+
+    // First step uses the prefill's first_token (already on CPU)
+    let mut prev_embed = dec.embed_token_gpu(first_token, device);
+    let mut pending_argmax: Vec<Tensor<B, 3, burn::tensor::Int>> = Vec::new();
+
     for step in 0..decode_steps {
-        let pos = PREFIX_LEN + 1 + step;
-        let prev_token = generated[pos - 1];
+        let audio_pos = audio_slices[step].clone();
+        let x = audio_pos + prev_embed;
 
-        // GPU token embedding (from persistent GPU table, no CPU→GPU)
-        let text_embed = dec.embed_token_gpu(prev_token, device);
-        let audio_pos = audio_slices[pos - 1 - PREFIX_LEN].clone();
-        let x = audio_pos + text_embed;
-
-        // Forward through all 26 layers with pre-computed ADA scales
         let hidden = dec.forward_hidden_with_cache_fast(x, &ada_scales, &mut caches);
-
-        // GPU lm_head + argmax (single matmul using persistent embedding)
         let last_hidden = hidden.slice([0..1, 0..1, 0..d_model]);
-        let logits = dec.lm_head_gpu(last_hidden);
-        let argmax_data = logits.argmax(2).into_data();
-        let next_token: i32 = argmax_data.as_slice::<i32>()
-            .map(|v| v[0])
-            .or_else(|_| argmax_data.as_slice::<i64>().map(|v| v[0] as i32))
-            .unwrap_or(0);
-        generated.push(next_token);
+
+        // GPU-only: lm_head → argmax → select embedding. No into_data()!
+        let (next_embed, argmax_idx) = dec.lm_head_and_next_embed(last_hidden);
+        pending_argmax.push(argmax_idx);
+        prev_embed = next_embed;
+
+        // Batch-sync every SYNC_INTERVAL steps (or at the end)
+        if pending_argmax.len() >= SYNC_INTERVAL || step == decode_steps - 1 {
+            for idx_tensor in pending_argmax.drain(..) {
+                let data = idx_tensor.into_data();
+                let token: i32 = data.as_slice::<i32>()
+                    .map(|v| v[0])
+                    .or_else(|_| data.as_slice::<i64>().map(|v| v[0] as i32))
+                    .unwrap_or(0);
+                generated.push(token);
+            }
+        }
 
         if (step + 1) % 20 == 0 || step == decode_steps - 1 {
             let elapsed = t2.elapsed().as_secs_f32();
             let ms_per_step = elapsed * 1000.0 / (step + 1) as f32;
-            eprintln!("[Resident] Decode {}/{} ({:.0}ms/step)", step + 1, decode_steps, ms_per_step);
+            eprintln!("[Resident] Decode {}/{} ({:.0}ms/step)",
+                step + 1, decode_steps, ms_per_step);
         }
     }
     let total_s = t0.elapsed().as_secs_f32();

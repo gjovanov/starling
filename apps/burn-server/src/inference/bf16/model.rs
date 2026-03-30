@@ -189,6 +189,23 @@ impl<B: Backend> LanguageModel<B> {
             Tensor::<B, 3>::zeros([1, 1, self.d_model], device)
         }
     }
+
+    /// GPU-only lm_head → argmax → embedding lookup. No CPU roundtrip.
+    /// Returns (next_embedding [1,1,d_model], argmax_idx [1,1,1] on GPU).
+    /// Call into_data() on argmax_idx LATER (batched) to get token IDs.
+    pub fn lm_head_and_next_embed(&self, hidden: Tensor<B, 3>) -> (Tensor<B, 3>, Tensor<B, 3, burn::tensor::Int>) {
+        let embed = self.tok_embed_gpu.as_ref().expect("call init_gpu_embedding first");
+        // hidden [1,1,D] @ embed_T [D,V] → logits [1,1,V]
+        let logits = hidden.matmul(embed.clone().transpose().unsqueeze::<3>());
+        // argmax on GPU → [1,1,1] int tensor (stays on GPU!)
+        let argmax_idx = logits.argmax(2);
+        // select embedding row using GPU argmax index
+        // argmax_idx [1,1,1] → reshape to [1] for select()
+        let idx_1d = argmax_idx.clone().reshape([1]);
+        // embed [V, D] → select(0, [1]) → [1, D]
+        let next_embed = embed.clone().select(0, idx_1d).reshape([1, 1, self.d_model]);
+        (next_embed, argmax_idx)
+    }
 }
 
 // ---------------------------------------------------------------------------
