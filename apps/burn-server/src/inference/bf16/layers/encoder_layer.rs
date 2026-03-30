@@ -103,10 +103,12 @@ impl<B: Backend> EncoderLayer<B> {
         let attention_norm = RmsNorm {
             gamma: Param::initialized(ParamId::new(), attention_norm_weight),
             epsilon: eps,
+            use_standard: false,
         };
         let ffn_norm = RmsNorm {
             gamma: Param::initialized(ParamId::new(), ffn_norm_weight),
             epsilon: eps,
+            use_standard: false,
         };
         let ffn = SwiGLU::new(w1, w2, w3);
 

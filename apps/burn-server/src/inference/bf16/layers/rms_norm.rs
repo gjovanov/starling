@@ -34,6 +34,8 @@ pub struct RmsNorm<B: Backend> {
     pub gamma: Param<Tensor<B, 1>>,
     /// Epsilon for numerical stability.
     pub epsilon: f64,
+    /// Use standard mean_dim (CUDA). If false, use matmul workaround (DZN).
+    pub use_standard: bool,
 }
 
 impl RmsNormConfig {
@@ -43,6 +45,7 @@ impl RmsNormConfig {
         RmsNorm {
             gamma: Param::initialized(ParamId::new(), gamma),
             epsilon: self.eps,
+            use_standard: false,
         }
     }
 }
@@ -53,28 +56,21 @@ impl<B: Backend> RmsNorm<B> {
     /// For input [B, S, D]: computes `x² @ ones_col / D` to get mean(x²)
     /// per position, avoiding the buggy `mean_dim` reduction kernel.
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let [batch, seq, d_model] = x.dims();
+        if self.use_standard {
+            return self.forward_standard(x);
+        }
+        let [_batch, _seq, d_model] = x.dims();
         let device = x.device();
-
-        // x² [B, S, D]
         let x_sq = x.clone() * x.clone();
-
-        // mean(x²) via matmul: [B, S, D] @ [D, 1] / D → [B, S, 1]
         let ones = Tensor::<B, 2>::ones([d_model, 1], &device);
-        let ones_3d = ones.unsqueeze::<3>(); // [1, D, 1]
-        let sum_sq = x_sq.matmul(ones_3d); // [B, S, 1]
+        let ones_3d = ones.unsqueeze::<3>();
+        let sum_sq = x_sq.matmul(ones_3d);
         let mean_sq = sum_sq / (d_model as f32);
-
-        // rms = sqrt(mean(x²) + eps)
         let rms = (mean_sq + self.epsilon).sqrt();
-
-        // normalize and scale
         (x / rms) * self.gamma.val().unsqueeze::<3>()
     }
 
-    /// Standard forward using mean_dim (works on CUDA/native Vulkan, broken on DZN).
-    #[allow(dead_code)]
-    pub fn forward_standard(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+    fn forward_standard(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let x_sq = x.clone() * x.clone();
         let mean_sq = x_sq.mean_dim(2);
         let rms = (mean_sq + self.epsilon).sqrt();

@@ -91,6 +91,8 @@ pub struct LanguageModel<B: Backend> {
     pub layers: Vec<DecoderLayer<B>>,
     pub norm: RmsNorm<B>,
     pub d_model: usize,
+    /// Persistent GPU embedding table [vocab_size, d_model]. Populated for resident model.
+    pub tok_embed_gpu: Option<Tensor<B, 2>>,
 }
 
 impl<B: Backend> LanguageModel<B> {
@@ -148,6 +150,44 @@ impl<B: Backend> LanguageModel<B> {
 
     pub fn create_cache_preallocated(&self, max_seq: usize, device: &B::Device) -> LayerCaches<B> {
         LayerCaches::new_preallocated(self.layers.len(), 1, 8, max_seq, 128, device)
+    }
+
+    /// Initialize persistent GPU embedding table from CPU tok_embed_data.
+    pub fn init_gpu_embedding(&mut self, device: &B::Device) {
+        let data = burn::tensor::TensorData::new(
+            self.tok_embed_data.clone(), [self.vocab_size, self.d_model],
+        );
+        self.tok_embed_gpu = Some(Tensor::from_data(data, device));
+    }
+
+    /// Fast lm_head using persistent GPU embedding. Single matmul, no upload.
+    pub fn lm_head_gpu(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
+        let embed = self.tok_embed_gpu.as_ref().expect("call init_gpu_embedding first");
+        // hidden [B, S, D] @ embed^T [D, V] → [B, S, V]
+        hidden.matmul(embed.clone().transpose().unsqueeze::<3>())
+    }
+
+    /// Forward through all decoder layers with pre-computed ADA scales.
+    pub fn forward_hidden_with_cache_fast(
+        &self, mut x: Tensor<B, 3>, ada_scales: &[Tensor<B, 3>], caches: &mut LayerCaches<B>,
+    ) -> Tensor<B, 3> {
+        for (i, layer) in self.layers.iter().enumerate() {
+            if let Some(cache) = caches.get_mut(i) {
+                x = layer.forward_with_cache_precomputed(x, ada_scales[i].clone(), &self.rope, cache);
+            }
+        }
+        self.norm.forward(x)
+    }
+
+    /// GPU-side token embedding lookup using persistent embedding table.
+    pub fn embed_token_gpu(&self, token_id: i32, device: &B::Device) -> Tensor<B, 3> {
+        let embed = self.tok_embed_gpu.as_ref().expect("call init_gpu_embedding first");
+        if token_id >= 0 && (token_id as usize) < self.vocab_size {
+            embed.clone().slice([token_id as usize..token_id as usize + 1, 0..self.d_model])
+                .unsqueeze::<3>() // [1, 1, d_model]
+        } else {
+            Tensor::<B, 3>::zeros([1, 1, self.d_model], device)
+        }
     }
 }
 

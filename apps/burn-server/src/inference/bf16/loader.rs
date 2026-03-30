@@ -40,7 +40,7 @@ pub fn load_encoder_and_adapter<B: Backend>(
         if (i + 1) % 4 == 0 { gpu_sync(); }
     }
     let norm_w: Tensor<B, 1> = load_tensor(st, &format!("{}.transformer.norm.weight", prefixes::ENCODER), device)?;
-    let norm = create_rms_norm(norm_w, cfg.norm_eps);
+    let norm = create_rms_norm(norm_w, cfg.norm_eps, false);
     let encoder = AudioEncoder { conv, rope, layers, norm };
 
     let an = adapter_names();
@@ -51,10 +51,11 @@ pub fn load_encoder_and_adapter<B: Backend>(
     Ok((encoder, adapter))
 }
 
-fn create_rms_norm<B: Backend>(weight: Tensor<B, 1>, eps: f64) -> RmsNorm<B> {
+fn create_rms_norm<B: Backend>(weight: Tensor<B, 1>, eps: f64, use_standard: bool) -> RmsNorm<B> {
     RmsNorm {
         gamma: burn::module::Param::initialized(burn::module::ParamId::new(), weight),
         epsilon: eps,
+        use_standard,
     }
 }
 
@@ -98,9 +99,18 @@ pub fn load_decoder_metadata(st: &safetensors::SafeTensors) -> Result<(Vec<f32>,
 }
 
 /// Load a single decoder layer (weights only, no forward pass).
+/// If `cuda_mode`, enables standard softmax + standard RmsNorm.
 pub fn load_decoder_layer<B: Backend>(
     st: &safetensors::SafeTensors, i: usize,
     cfg: &config::LanguageModelConfig, device: &B::Device,
+) -> Result<DecoderLayer<B>> {
+    load_decoder_layer_impl(st, i, cfg, device, false)
+}
+
+fn load_decoder_layer_impl<B: Backend>(
+    st: &safetensors::SafeTensors, i: usize,
+    cfg: &config::LanguageModelConfig, device: &B::Device,
+    cuda_mode: bool,
 ) -> Result<DecoderLayer<B>> {
     let n = decoder_layer_names(i);
     let attention = Attention::new(
@@ -112,7 +122,7 @@ pub fn load_decoder_layer<B: Backend>(
     );
     let ada_w0: Tensor<B, 2> = load_tensor(st, &n.ada_norm_down, device)?;
     let ada_w2: Tensor<B, 2> = load_tensor(st, &n.ada_norm_up, device)?;
-    Ok(DecoderLayer::new(
+    let layer = DecoderLayer::new(
         ada_w0, ada_w2,
         load_tensor(st, &n.attention_norm, device)?,
         attention,
@@ -121,7 +131,8 @@ pub fn load_decoder_layer<B: Backend>(
         load_linear(st, &n.w2_weight, None, device)?,
         load_linear(st, &n.w3_weight, None, device)?,
         32, cfg.norm_eps,
-    ))
+    );
+    Ok(if cuda_mode { layer.with_standard_ops() } else { layer })
 }
 
 fn load_and_forward_decoder_layer<B: Backend>(
@@ -153,18 +164,25 @@ pub fn load_full_model<B: Backend>(
     let dec_cfg = config::LanguageModelConfig::default();
     let (tok_embed_data, vocab_size, d_model) = load_decoder_metadata(st)?;
     let norm_w: Tensor<B, 1> = load_tensor(st, prefixes::FINAL_NORM, device)?;
-    let norm = create_rms_norm(norm_w, dec_cfg.norm_eps);
+    let norm = create_rms_norm(norm_w, dec_cfg.norm_eps, true); // CUDA: standard RmsNorm
     let rope = RoPEConfig::new(dec_cfg.head_dim, 16384).with_theta(dec_cfg.rope_theta).init(device);
 
     let mut layers = Vec::with_capacity(dec_cfg.n_layers);
     for i in 0..dec_cfg.n_layers {
-        layers.push(load_decoder_layer(st, i, &dec_cfg, device)
+        layers.push(load_decoder_layer_impl(st, i, &dec_cfg, device, true) // CUDA: standard ops
             .with_context(|| format!("decoder layer {i}"))?);
         if (i + 1) % 4 == 0 { sync_fn(); }
         if (i + 1) % 5 == 0 { eprintln!("[load_full_model] decoder layer {}/{}", i + 1, dec_cfg.n_layers); }
     }
 
-    let decoder = LanguageModel { tok_embed_data, vocab_size, rope, layers, norm, d_model };
+    let mut decoder = LanguageModel {
+        tok_embed_data, vocab_size, rope, layers, norm, d_model,
+        tok_embed_gpu: None,
+    };
+    // Pre-load embedding table on GPU for fast lm_head + token lookup
+    decoder.init_gpu_embedding(device);
+    eprintln!("[load_full_model] GPU embedding table loaded ({} × {} = {:.0} MB)",
+        vocab_size, d_model, vocab_size as f64 * d_model as f64 * 4.0 / 1e6);
     Ok(VoxtralModel { encoder, decoder, adapter, reshape_factor: 4 })
 }
 
@@ -172,8 +190,12 @@ pub fn load_full_model<B: Backend>(
 // Transcription with resident model (all layers on GPU)
 // ---------------------------------------------------------------------------
 
-/// Transcribe using a fully-resident model (no per-layer streaming).
-/// All 26 decoder layers stay on GPU — forward passes run back-to-back.
+/// Transcribe using a fully-resident model with all optimizations:
+/// - GPU embedding table (no 1.6 GB upload per step)
+/// - GPU lm_head + argmax (single matmul, no CPU roundtrip for prefill)
+/// - Pre-computed ADA scales (eliminates 78 kernels/step)
+/// - Standard softmax/RmsNorm on CUDA (no matmul workarounds)
+/// - GPU token embedding lookup (no CPU→GPU per step)
 pub fn transcribe_resident<B: Backend>(
     model: &VoxtralModel<B>,
     device: &B::Device,
@@ -182,17 +204,18 @@ pub fn transcribe_resident<B: Backend>(
 ) -> Result<Vec<i32>> {
     let t0 = Instant::now();
 
-    // Encode audio (standard attention — flash attention produces incorrect output currently)
     let audio_embeds = model.encode_audio(mel);
     let [_, seq_len, d_model] = audio_embeds.dims();
     eprintln!("[Resident] Encoded: seq_len={} ({:.1}s)", seq_len, t0.elapsed().as_secs_f32());
 
-    // Pre-allocate KV caches
     let dec = &model.decoder;
-    let dec_cfg = config::LanguageModelConfig::default();
     let mut caches = dec.create_cache_preallocated(seq_len, device);
 
-    // ── Prefill ──
+    // Pre-compute ADA scales for all 26 layers (constant across decode steps)
+    let ada_scales: Vec<Tensor<B, 3>> = dec.layers.iter()
+        .map(|layer| layer.precompute_ada_scale(t_embed.clone()))
+        .collect();
+
     const PREFIX_LEN: usize = 39;
     const BOS_TOKEN: i32 = 1;
     const STREAMING_PAD: i32 = 32;
@@ -206,9 +229,10 @@ pub fn transcribe_resident<B: Backend>(
     let prefix_audio = audio_embeds.clone().slice([0..1, 0..PREFIX_LEN, 0..d_model]);
     let x = prefix_audio + prefix_text;
 
+    // ── Prefill: use pre-computed ADA scales + GPU lm_head ──
     let t1 = Instant::now();
-    let hidden = dec.forward_hidden_with_cache(x, t_embed.clone(), &mut caches);
-    let logits = dec.lm_head(hidden, device);
+    let hidden = dec.forward_hidden_with_cache_fast(x, &ada_scales, &mut caches);
+    let logits = dec.lm_head_gpu(hidden);
     let vocab = logits.dims()[2];
     let last_logits = logits.slice([0..1, (PREFIX_LEN - 1)..PREFIX_LEN, 0..vocab]);
     let argmax_data = last_logits.argmax(2).into_data();
@@ -221,42 +245,37 @@ pub fn transcribe_resident<B: Backend>(
     let mut generated = prefix;
     generated.push(first_token);
 
+    // Pre-slice audio embeddings as contiguous tensors
     let audio_slices: Vec<Tensor<B, 3>> = (PREFIX_LEN..seq_len)
         .map(|pos| audio_embeds.clone().slice([0..1, pos..pos + 1, 0..d_model]))
         .collect();
     drop(audio_embeds);
 
-    // CPU argmax: download 3072 floats, dot with 150k vocab rows.
-    // ~24ms/step. GPU lm_head is slower (uploads 1.6 GB embedding per step).
-    let cpu_argmax = |hidden: &Tensor<B, 3>| -> i32 {
-        let data = hidden.clone().reshape([d_model]).into_data();
-        let h = data.as_slice::<f32>().unwrap();
-        let mut best_id = 0i32;
-        let mut best_score = f32::NEG_INFINITY;
-        for id in 0..dec.vocab_size {
-            let row = &dec.tok_embed_data[id * d_model..(id + 1) * d_model];
-            let score: f32 = h.iter().zip(row.iter()).map(|(a, b)| a * b).sum();
-            if score > best_score {
-                best_score = score;
-                best_id = id as i32;
-            }
-        }
-        best_id
-    };
-
-    // ── Autoregressive decode ──
+    // ── Autoregressive decode with GPU-only token pipeline ──
     let decode_steps = seq_len - PREFIX_LEN - 1;
     let t2 = Instant::now();
     for step in 0..decode_steps {
         let pos = PREFIX_LEN + 1 + step;
         let prev_token = generated[pos - 1];
-        let text_embed = dec.embed_tokens_from_ids(&[prev_token], 1, 1, device);
+
+        // GPU token embedding (from persistent GPU table, no CPU→GPU)
+        let text_embed = dec.embed_token_gpu(prev_token, device);
         let audio_pos = audio_slices[pos - 1 - PREFIX_LEN].clone();
         let x = audio_pos + text_embed;
-        let hidden = dec.forward_hidden_with_cache(x, t_embed.clone(), &mut caches);
+
+        // Forward through all 26 layers with pre-computed ADA scales
+        let hidden = dec.forward_hidden_with_cache_fast(x, &ada_scales, &mut caches);
+
+        // GPU lm_head + argmax (single matmul using persistent embedding)
         let last_hidden = hidden.slice([0..1, 0..1, 0..d_model]);
-        let next_token = cpu_argmax(&last_hidden);
+        let logits = dec.lm_head_gpu(last_hidden);
+        let argmax_data = logits.argmax(2).into_data();
+        let next_token: i32 = argmax_data.as_slice::<i32>()
+            .map(|v| v[0])
+            .or_else(|_| argmax_data.as_slice::<i64>().map(|v| v[0] as i32))
+            .unwrap_or(0);
         generated.push(next_token);
+
         if (step + 1) % 20 == 0 || step == decode_steps - 1 {
             let elapsed = t2.elapsed().as_secs_f32();
             let ms_per_step = elapsed * 1000.0 / (step + 1) as f32;
@@ -265,7 +284,7 @@ pub fn transcribe_resident<B: Backend>(
     }
     let total_s = t0.elapsed().as_secs_f32();
     let n_tokens = generated.len() - PREFIX_LEN;
-    let audio_secs = seq_len as f32 / 12.5; // 12.5 Hz frame rate
+    let audio_secs = seq_len as f32 / 12.5;
     eprintln!("[Resident] Total: {:.1}s ({} tokens, {:.1}× realtime for {:.0}s audio)",
         total_s, n_tokens, total_s / audio_secs, audio_secs);
     Ok(generated.into_iter().skip(PREFIX_LEN).collect())
@@ -293,7 +312,7 @@ pub fn transcribe<B: Backend>(
     let dec_cfg = config::LanguageModelConfig::default();
     let (tok_embed_data, vocab_size, _) = load_decoder_metadata(st)?;
     let norm_w: Tensor<B, 1> = load_tensor(st, prefixes::FINAL_NORM, device)?;
-    let norm = create_rms_norm(norm_w, dec_cfg.norm_eps);
+    let norm = create_rms_norm(norm_w, dec_cfg.norm_eps, false); // WGPU: matmul RmsNorm
     let rope = RoPEConfig::new(dec_cfg.head_dim, 16384).with_theta(dec_cfg.rope_theta).init(device);
     let mut caches = LayerCaches::new_preallocated(
         dec_cfg.n_layers, 1, dec_cfg.n_kv_heads, seq_len, dec_cfg.head_dim, device,

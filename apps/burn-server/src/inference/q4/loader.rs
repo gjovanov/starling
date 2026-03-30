@@ -624,6 +624,7 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
         Ok(RmsNorm {
             gamma: Param::initialized(ParamId::new(), weight),
             epsilon: eps,
+            use_standard: false,
         })
     }
 }

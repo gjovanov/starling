@@ -149,11 +149,13 @@ impl<B: Backend> DecoderLayer<B> {
         let attention_norm = RmsNorm {
             gamma: Param::initialized(ParamId::new(), attention_norm_weight),
             epsilon: eps,
+            use_standard: false,
         };
 
         let ffn_norm = RmsNorm {
             gamma: Param::initialized(ParamId::new(), ffn_norm_weight),
             epsilon: eps,
+            use_standard: false,
         };
 
         let ffn = SwiGLU::new(w1, w2, w3);
@@ -165,6 +167,43 @@ impl<B: Backend> DecoderLayer<B> {
             ffn_norm,
             ffn,
         }
+    }
+
+    /// Enable standard ops for CUDA (standard softmax + standard RmsNorm).
+    pub fn with_standard_ops(mut self) -> Self {
+        self.attention = self.attention.with_standard_softmax();
+        self.attention_norm.use_standard = true;
+        self.ffn_norm.use_standard = true;
+        self
+    }
+
+    /// Pre-compute ADA scale from constant t_embed. Returns `(1 + ada(t_embed))`.
+    /// Cache this before the decode loop to eliminate 3 kernels/layer/step.
+    pub fn precompute_ada_scale(&self, t_embed: Tensor<B, 3>) -> Tensor<B, 3> {
+        self.ada_rms_norm.forward(
+            Tensor::<B, 3>::ones(t_embed.dims(), &t_embed.device()),
+            t_embed,
+        )
+    }
+
+    /// Forward pass with pre-computed ADA scale (faster for decode).
+    pub fn forward_with_cache_precomputed(
+        &self,
+        x: Tensor<B, 3>,
+        ada_scale: Tensor<B, 3>,
+        rope: &RoPE<B>,
+        cache: &mut KVCache<B>,
+    ) -> Tensor<B, 3> {
+        let residual = x.clone();
+        let x = self.attention_norm.forward(x);
+        let x = self.attention.forward_with_cache(x, rope, cache, true);
+        let x = x + residual;
+
+        let residual = x.clone();
+        let x = self.ffn_norm.forward(x);
+        let x = x * ada_scale.clone(); // pre-computed (1 + ada(t_embed))
+        let x = self.ffn.forward(x);
+        x + residual
     }
 
     /// Forward pass.
