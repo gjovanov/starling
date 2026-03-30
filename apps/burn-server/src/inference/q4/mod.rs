@@ -44,7 +44,10 @@ pub type WgpuBackend = burn::backend::wgpu::CubeBackend<burn::backend::wgpu::Wgp
 /// The device type used by the Q4 backend (same as `WgpuDevice`).
 pub type Q4Device = burn::backend::wgpu::WgpuDevice;
 
-/// CUDA backend — full 24 GB VRAM, native dispatch, standard reduction kernels.
-/// f32: cubecl 0.9 ptx-wmma doesn't support bf16/f16 accumulator casting yet.
+/// CUDA backend (cubecl) — f32 only, no tensor cores.
 #[cfg(feature = "cuda")]
 pub type CudaBackend = burn::backend::Cuda<f32, i32>;
+
+/// Candle CUDA backend — bf16 with cuBLAS tensor cores, eager execution.
+#[cfg(feature = "candle")]
+pub type CandleBackend = burn::backend::Candle<half::bf16, i64>;

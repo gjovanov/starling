@@ -183,6 +183,54 @@ fn run_cuda(args: &Args) {
     println!("{}", text);
 }
 
+#[cfg(feature = "candle")]
+fn run_candle(args: &Args) {
+    use burn_server::inference::q4::CandleBackend;
+
+    let device = burn::backend::candle::CandleDevice::cuda(0);
+    let st_path = args.models_dir.join("bf16").join("consolidated.safetensors");
+    let tokenizer_path = args.models_dir.join("tokenizer").join("tekken.json");
+
+    eprintln!("\n=== Candle CUDA (bf16 + cuBLAS) Benchmark ===");
+
+    let t_load = Instant::now();
+    let owned = OwnedSafeTensors::from_file(&st_path).expect("SafeTensors");
+
+    fn candle_sync() {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    let model = burn_server::inference::bf16::loader::load_full_model::<CandleBackend>(
+        &owned, &device, candle_sync,
+    ).expect("full model");
+    let load_secs = t_load.elapsed().as_secs_f32();
+    eprintln!("Full model loaded: {:.1}s", load_secs);
+
+    let tokenizer = TekkenDecoder::from_file(&tokenizer_path).expect("tokenizer");
+
+    let (flat, n_mels, n_frames) = prepare_mel(&args.audio);
+    let mel: Tensor<CandleBackend, 3> =
+        Tensor::from_data(TensorData::new(flat, [1, n_mels, n_frames]), &device);
+    let t_embed = compute_time_embedding::<CandleBackend>(6.0, 3072, &device);
+
+    let t_infer = Instant::now();
+    let token_ids = burn_server::inference::bf16::loader::transcribe_resident::<CandleBackend>(
+        &model, &device, mel, t_embed,
+    ).expect("transcribe_resident");
+    let infer_secs = t_infer.elapsed().as_secs_f32();
+
+    let text = tokenizer.decode(&token_ids);
+    let audio_secs = n_frames as f32 / 200.0;
+
+    eprintln!("\n=== Candle Results ===");
+    eprintln!("Load:       {:.1}s", load_secs);
+    eprintln!("Inference:  {:.1}s", infer_secs);
+    eprintln!("Tokens:     {}", token_ids.len());
+    eprintln!("Realtime:   {:.1}×", infer_secs / audio_secs);
+    eprintln!("Text (200c): {:?}", &text[..text.char_indices().take(200).last().map_or(0, |(i, c)| i + c.len_utf8())]);
+    println!("{}", text);
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -190,8 +238,10 @@ fn main() {
         "wgpu" => run_wgpu(&args),
         #[cfg(feature = "cuda")]
         "cuda" => run_cuda(&args),
+        #[cfg(feature = "candle")]
+        "candle" => run_candle(&args),
         other => {
-            eprintln!("Unknown backend: {}. Use 'wgpu' or 'cuda'.", other);
+            eprintln!("Unknown backend: {}. Use 'wgpu', 'cuda', or 'candle'.", other);
             std::process::exit(1);
         }
     }

@@ -67,12 +67,14 @@ default = ["native"]
 native = []
 wasm = []
 cuda = ["burn/cuda"]
+candle = ["burn/candle-cuda"]
 
 # Patch cubecl-wgpu to respect WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER env var.
 # Required for Mesa DZN (Vulkan-over-DX12) on WSL2 — DZN reports conformance 0.0.0.0
 # and wgpu hides it unless this flag is set on the Instance.
 [patch.crates-io]
 cubecl-wgpu = { path = "patches/cubecl-wgpu-0.9.0" }
+burn-candle = { path = "patches/burn-candle-0.20.1" }
 # cubecl-cuda patched for ptx-wmma (disabled: cubecl 0.9 ptx-wmma crashes on bf16/f16 accumulator cast)
 # cubecl-cuda = { path = "patches/cubecl-cuda-0.9.0" }
 

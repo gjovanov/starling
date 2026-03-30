@@ -21,6 +21,8 @@ pub enum GpuBackend {
     Wgpu,
     #[cfg(feature = "cuda")]
     Cuda,
+    #[cfg(feature = "candle")]
+    Candle,
 }
 
 impl std::fmt::Display for GpuBackend {
@@ -29,6 +31,8 @@ impl std::fmt::Display for GpuBackend {
             GpuBackend::Wgpu => write!(f, "WGPU"),
             #[cfg(feature = "cuda")]
             GpuBackend::Cuda => write!(f, "CUDA"),
+            #[cfg(feature = "candle")]
+            GpuBackend::Candle => write!(f, "Candle"),
         }
     }
 }
