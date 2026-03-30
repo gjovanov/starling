@@ -141,6 +141,19 @@ impl<B: Backend> EncoderLayer<B> {
         x + residual
     }
 
+    /// Forward pass using fused flash attention (CUDA).
+    pub fn forward_flash(&self, x: Tensor<B, 3>, rope: &RoPE<B>, offset: usize) -> Tensor<B, 3> {
+        let residual = x.clone();
+        let x = self.attention_norm.forward(x);
+        let x = self.attention.forward_flash(x, rope, offset);
+        let x = x + residual;
+
+        let residual = x.clone();
+        let x = self.ffn_norm.forward(x);
+        let x = self.ffn.forward(x);
+        x + residual
+    }
+
     /// Forward pass with KV cache.
     ///
     /// # Arguments

@@ -182,7 +182,7 @@ pub fn transcribe_resident<B: Backend>(
 ) -> Result<Vec<i32>> {
     let t0 = Instant::now();
 
-    // Encode audio
+    // Encode audio (standard attention — flash attention produces incorrect output currently)
     let audio_embeds = model.encode_audio(mel);
     let [_, seq_len, d_model] = audio_embeds.dims();
     eprintln!("[Resident] Encoded: seq_len={} ({:.1}s)", seq_len, t0.elapsed().as_secs_f32());
@@ -226,7 +226,8 @@ pub fn transcribe_resident<B: Backend>(
         .collect();
     drop(audio_embeds);
 
-    // CPU argmax helper (same as streaming — avoids 1.8 GB embedding upload)
+    // CPU argmax: download 3072 floats, dot with 150k vocab rows.
+    // ~24ms/step. GPU lm_head is slower (uploads 1.6 GB embedding per step).
     let cpu_argmax = |hidden: &Tensor<B, 3>| -> i32 {
         let data = hidden.clone().reshape([d_model]).into_data();
         let h = data.as_slice::<f32>().unwrap();

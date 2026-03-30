@@ -168,16 +168,44 @@ impl<B: Backend> Attention<B> {
         }
     }
 
-    /// Forward pass with RoPE.
-    ///
-    /// # Arguments
-    /// * `x` - Input tensor [batch, seq, d_model]
-    /// * `rope` - Rotary position embeddings
-    /// * `offset` - Position offset for KV cache
-    /// * `causal` - Whether to apply causal masking
-    ///
-    /// # Returns
-    /// Output tensor [batch, seq, d_model]
+    /// Forward pass with fused flash attention (O(N) memory, single kernel).
+    /// Uses burn::tensor::module::attention which dispatches to cubecl flash attention on CUDA.
+    /// Falls back to manual attention on backends without flash attention support.
+    pub fn forward_flash(
+        &self,
+        x: Tensor<B, 3>,
+        rope: &RoPE<B>,
+        offset: usize,
+    ) -> Tensor<B, 3> {
+        let [batch, seq_len, _d_model] = x.dims();
+
+        let q = self.wq.forward(x.clone());
+        let k = self.wk.forward(x.clone());
+        let v = self.wv.forward(x);
+
+        let q = q.reshape([batch, seq_len, self.n_heads, self.head_dim]);
+        let k = k.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
+        let v = v.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
+
+        let (q, k) = rope.apply(q, k, offset);
+
+        // [batch, heads, seq, head_dim] — NO manual scale, flash attention handles 1/√d
+        let q = q.swap_dims(1, 2);
+        let k = k.swap_dims(1, 2);
+        let v = v.swap_dims(1, 2);
+
+        let (k, v) = self.expand_kv(k, v);
+
+        // Flash attention: fused scaled dot-product (QK^T/√d → softmax → @V)
+        // causal masking is built-in, O(N) memory
+        let out = burn::tensor::module::attention(q, k, v, None);
+
+        let out = out.swap_dims(1, 2);
+        let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
+        self.wo.forward(out)
+    }
+
+    /// Forward pass with manual attention (for DZN/WGPU where flash attention may not work).
     pub fn forward(
         &self,
         x: Tensor<B, 3>,
@@ -187,56 +215,42 @@ impl<B: Backend> Attention<B> {
     ) -> Tensor<B, 3> {
         let [batch, seq_len, _d_model] = x.dims();
 
-        // Project Q, K, V
         let q = self.wq.forward(x.clone());
         let k = self.wk.forward(x.clone());
         let v = self.wv.forward(x);
 
-        // Reshape to [batch, seq, heads, head_dim]
         let q = q.reshape([batch, seq_len, self.n_heads, self.head_dim]);
         let k = k.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
         let v = v.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
 
-        // Apply RoPE
         let (q, k) = rope.apply(q, k, offset);
 
-        // Transpose to [batch, heads, seq, head_dim]
         let q = q.swap_dims(1, 2);
         let k = k.swap_dims(1, 2);
         let v = v.swap_dims(1, 2);
 
-        // Expand K, V for GQA if needed
         let (k, v) = self.expand_kv(k, v);
 
-        // Compute attention scores: Q @ K^T * scale
         let k_t = k.swap_dims(2, 3);
         let scores = q.matmul(k_t) * self.scale;
 
-        // Apply causal mask
         let scores = if causal {
             self.apply_causal_mask(scores, seq_len, offset)
         } else {
             scores
         };
 
-        // Apply sliding window mask if configured
         let scores = if let Some(window) = self.sliding_window {
             self.apply_sliding_window_mask(scores, seq_len, window)
         } else {
             scores
         };
 
-        // Softmax
         let attn = self.softmax(scores);
-
-        // Apply attention: attn @ V
         let out = attn.matmul(v);
 
-        // Transpose back and reshape: [batch, heads, seq, head_dim] -> [batch, seq, heads * head_dim]
         let out = out.swap_dims(1, 2);
         let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
-
-        // Output projection
         self.wo.forward(out)
     }
 

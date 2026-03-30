@@ -29,6 +29,17 @@ impl<B: Backend> AudioEncoder<B> {
         self.norm.forward(x)
     }
 
+    /// Forward pass using fused flash attention (CUDA). O(N) memory vs O(N²).
+    pub fn forward_flash(&self, mel: Tensor<B, 3>, offset: usize) -> Tensor<B, 3> {
+        let x = self.conv.forward(mel);
+        let x = x.swap_dims(1, 2);
+        let mut x = x;
+        for layer in &self.layers {
+            x = layer.forward_flash(x, &self.rope, offset);
+        }
+        self.norm.forward(x)
+    }
+
     pub fn forward_with_cache(
         &self, mel: Tensor<B, 3>, caches: &mut LayerCaches<B>,
     ) -> Tensor<B, 3> {
@@ -154,6 +165,13 @@ pub struct VoxtralModel<B: Backend> {
 impl<B: Backend> VoxtralModel<B> {
     pub fn encode_audio(&self, mel: Tensor<B, 3>) -> Tensor<B, 3> {
         let encoder_out = self.encoder.forward(mel, 0);
+        let reshaped = reshape_encoder_output(encoder_out, self.reshape_factor);
+        self.adapter.forward(reshaped)
+    }
+
+    /// Encode audio using fused flash attention (CUDA). O(N) memory.
+    pub fn encode_audio_flash(&self, mel: Tensor<B, 3>) -> Tensor<B, 3> {
+        let encoder_out = self.encoder.forward_flash(mel, 0);
         let reshaped = reshape_encoder_output(encoder_out, self.reshape_factor);
         self.adapter.forward(reshaped)
     }
