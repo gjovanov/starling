@@ -29,6 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("===========================================");
     eprintln!("Port:        {}", config.port);
     eprintln!("Quant:       {}", config.quant);
+    eprintln!("Backend:     {}", config.backend);
     eprintln!("Models:      {}", config.models_dir.display());
     eprintln!("Frontend:    {}", config.frontend.display());
     eprintln!("Media:       {}", config.media_dir.display());
@@ -95,17 +96,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_path = config.active_model_path();
 
     eprintln!("Loading inference engine...");
-    let engine: Arc<dyn inference::InferenceEngine> = match config.quant {
-        config::Quantization::Q4 => {
+    let engine: Arc<dyn inference::InferenceEngine> = match (config.quant, config.backend) {
+        (config::Quantization::Q4, _) => {
             let q4_engine = inference::engine::Q4Engine::load(&model_path, &tokenizer_path)
                 .map_err(|e| -> Box<dyn std::error::Error> { e })?;
             Arc::new(q4_engine)
         }
-        config::Quantization::Bf16 => {
+        (config::Quantization::Bf16, config::GpuBackend::Wgpu) => {
             let bf16_engine =
                 inference::bf16_engine::Bf16Engine::load(&model_path, &tokenizer_path)
                     .map_err(|e| -> Box<dyn std::error::Error> { e })?;
             Arc::new(bf16_engine)
+        }
+        #[cfg(feature = "cuda")]
+        (config::Quantization::Bf16, config::GpuBackend::Cuda) => {
+            let cuda_engine =
+                inference::cuda_engine::CudaEngine::load(&model_path, &tokenizer_path)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            Arc::new(cuda_engine)
         }
     };
     eprintln!("Inference engine ready.");

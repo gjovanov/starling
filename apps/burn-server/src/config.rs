@@ -16,6 +16,23 @@ impl std::fmt::Display for Quantization {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum GpuBackend {
+    Wgpu,
+    #[cfg(feature = "cuda")]
+    Cuda,
+}
+
+impl std::fmt::Display for GpuBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GpuBackend::Wgpu => write!(f, "WGPU"),
+            #[cfg(feature = "cuda")]
+            GpuBackend::Cuda => write!(f, "CUDA"),
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "burn-server")]
 #[command(about = "Real-time Voxtral ASR server using Burn ML framework")]
@@ -27,6 +44,10 @@ pub struct Config {
     /// Model quantization to use
     #[arg(long, env = "BURN_QUANT", value_enum, default_value = "q4")]
     pub quant: Quantization,
+
+    /// GPU backend (wgpu for DZN/WebGPU, cuda for native NVIDIA)
+    #[arg(long, env = "BURN_BACKEND", value_enum, default_value = "wgpu")]
+    pub backend: GpuBackend,
 
     /// Path to shared models directory
     #[arg(long, env = "STARLING_MODELS_DIR", default_value = "../../models/cache")]

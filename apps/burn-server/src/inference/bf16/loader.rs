@@ -32,7 +32,8 @@ pub fn load_encoder_and_adapter<B: Backend>(
         conv1: conv1d_from_weights(load_tensor(st, &cn.conv1_weight, device)?, load_tensor(st, &cn.conv1_bias, device)?, 1),
         conv2: conv1d_from_weights(load_tensor(st, &cn.conv2_weight, device)?, load_tensor(st, &cn.conv2_bias, device)?, 2),
     };
-    let rope = RoPEConfig::new(cfg.head_dim, 4096).with_theta(cfg.rope_theta).init(device);
+    // 32768 supports up to ~10 min audio (30s = ~424 positions, 5min = ~15k)
+    let rope = RoPEConfig::new(cfg.head_dim, 32768).with_theta(cfg.rope_theta).init(device);
     let mut layers = Vec::with_capacity(cfg.n_layers);
     for i in 0..cfg.n_layers {
         layers.push(load_encoder_layer(st, i, &cfg, device).with_context(|| format!("encoder layer {i}"))?);
@@ -96,14 +97,12 @@ pub fn load_decoder_metadata(st: &safetensors::SafeTensors) -> Result<(Vec<f32>,
     Ok((tok_embed_data, tok_shape[0], tok_shape[1]))
 }
 
-fn load_and_forward_decoder_layer<B: Backend>(
-    st: &safetensors::SafeTensors, layer_idx: usize,
+/// Load a single decoder layer (weights only, no forward pass).
+pub fn load_decoder_layer<B: Backend>(
+    st: &safetensors::SafeTensors, i: usize,
     cfg: &config::LanguageModelConfig, device: &B::Device,
-    x: Tensor<B, 3>, t_embed: Tensor<B, 3>, rope: &RoPE<B>, cache: &mut KVCache<B>,
-    timing: &mut (f32, f32), // (load_ms, forward_ms)
-) -> Result<Tensor<B, 3>> {
-    let tl = Instant::now();
-    let n = decoder_layer_names(layer_idx);
+) -> Result<DecoderLayer<B>> {
+    let n = decoder_layer_names(i);
     let attention = Attention::new(
         load_linear(st, &n.wq_weight, None, device)?,
         load_linear(st, &n.wk_weight, None, device)?,
@@ -113,7 +112,7 @@ fn load_and_forward_decoder_layer<B: Backend>(
     );
     let ada_w0: Tensor<B, 2> = load_tensor(st, &n.ada_norm_down, device)?;
     let ada_w2: Tensor<B, 2> = load_tensor(st, &n.ada_norm_up, device)?;
-    let layer = DecoderLayer::new(
+    Ok(DecoderLayer::new(
         ada_w0, ada_w2,
         load_tensor(st, &n.attention_norm, device)?,
         attention,
@@ -122,13 +121,20 @@ fn load_and_forward_decoder_layer<B: Backend>(
         load_linear(st, &n.w2_weight, None, device)?,
         load_linear(st, &n.w3_weight, None, device)?,
         32, cfg.norm_eps,
-    );
+    ))
+}
+
+fn load_and_forward_decoder_layer<B: Backend>(
+    st: &safetensors::SafeTensors, layer_idx: usize,
+    cfg: &config::LanguageModelConfig, device: &B::Device,
+    x: Tensor<B, 3>, t_embed: Tensor<B, 3>, rope: &RoPE<B>, cache: &mut KVCache<B>,
+    timing: &mut (f32, f32), // (load_ms, forward_ms)
+) -> Result<Tensor<B, 3>> {
+    let tl = Instant::now();
+    let layer = load_decoder_layer(st, layer_idx, cfg, device)?;
     timing.0 += tl.elapsed().as_secs_f32() * 1000.0;
     let tf = Instant::now();
     let out = layer.forward_with_cache(x, t_embed, rope, cache);
-    // Sync every 4 layers to prevent OOM while allowing GPU pipelining.
-    // Without sync, burn's lazy execution accumulates ~4 layers of weights (~1.8 GB)
-    // in VRAM before they're freed. With ~7 GB headroom, this is safe.
     if (layer_idx + 1) % 4 == 0 || layer_idx == 25 {
         let _ = out.clone().slice([0..1, 0..1, 0..1]).into_data();
     }
@@ -136,8 +142,136 @@ fn load_and_forward_decoder_layer<B: Backend>(
     Ok(out)
 }
 
+/// Load complete model — all layers resident on GPU.
+/// Requires ~16 GB VRAM (f32). Only viable on CUDA with full VRAM access.
+pub fn load_full_model<B: Backend>(
+    st: &safetensors::SafeTensors, device: &B::Device,
+    sync_fn: impl Fn(),
+) -> Result<VoxtralModel<B>> {
+    let (encoder, adapter) = load_encoder_and_adapter(st, device)?;
+
+    let dec_cfg = config::LanguageModelConfig::default();
+    let (tok_embed_data, vocab_size, d_model) = load_decoder_metadata(st)?;
+    let norm_w: Tensor<B, 1> = load_tensor(st, prefixes::FINAL_NORM, device)?;
+    let norm = create_rms_norm(norm_w, dec_cfg.norm_eps);
+    let rope = RoPEConfig::new(dec_cfg.head_dim, 16384).with_theta(dec_cfg.rope_theta).init(device);
+
+    let mut layers = Vec::with_capacity(dec_cfg.n_layers);
+    for i in 0..dec_cfg.n_layers {
+        layers.push(load_decoder_layer(st, i, &dec_cfg, device)
+            .with_context(|| format!("decoder layer {i}"))?);
+        if (i + 1) % 4 == 0 { sync_fn(); }
+        if (i + 1) % 5 == 0 { eprintln!("[load_full_model] decoder layer {}/{}", i + 1, dec_cfg.n_layers); }
+    }
+
+    let decoder = LanguageModel { tok_embed_data, vocab_size, rope, layers, norm, d_model };
+    Ok(VoxtralModel { encoder, decoder, adapter, reshape_factor: 4 })
+}
+
 // ---------------------------------------------------------------------------
-// Transcription with streaming decoder
+// Transcription with resident model (all layers on GPU)
+// ---------------------------------------------------------------------------
+
+/// Transcribe using a fully-resident model (no per-layer streaming).
+/// All 26 decoder layers stay on GPU — forward passes run back-to-back.
+pub fn transcribe_resident<B: Backend>(
+    model: &VoxtralModel<B>,
+    device: &B::Device,
+    mel: Tensor<B, 3>,
+    t_embed: Tensor<B, 3>,
+) -> Result<Vec<i32>> {
+    let t0 = Instant::now();
+
+    // Encode audio
+    let audio_embeds = model.encode_audio(mel);
+    let [_, seq_len, d_model] = audio_embeds.dims();
+    eprintln!("[Resident] Encoded: seq_len={} ({:.1}s)", seq_len, t0.elapsed().as_secs_f32());
+
+    // Pre-allocate KV caches
+    let dec = &model.decoder;
+    let dec_cfg = config::LanguageModelConfig::default();
+    let mut caches = dec.create_cache_preallocated(seq_len, device);
+
+    // ── Prefill ──
+    const PREFIX_LEN: usize = 39;
+    const BOS_TOKEN: i32 = 1;
+    const STREAMING_PAD: i32 = 32;
+
+    if seq_len < PREFIX_LEN { return Ok(Vec::new()); }
+
+    let mut prefix: Vec<i32> = vec![BOS_TOKEN];
+    prefix.extend(std::iter::repeat_n(STREAMING_PAD, PREFIX_LEN - 1));
+
+    let prefix_text = dec.embed_tokens_from_ids(&prefix, 1, PREFIX_LEN, device);
+    let prefix_audio = audio_embeds.clone().slice([0..1, 0..PREFIX_LEN, 0..d_model]);
+    let x = prefix_audio + prefix_text;
+
+    let t1 = Instant::now();
+    let hidden = dec.forward_hidden_with_cache(x, t_embed.clone(), &mut caches);
+    let logits = dec.lm_head(hidden, device);
+    let vocab = logits.dims()[2];
+    let last_logits = logits.slice([0..1, (PREFIX_LEN - 1)..PREFIX_LEN, 0..vocab]);
+    let argmax_data = last_logits.argmax(2).into_data();
+    let first_token: i32 = argmax_data.as_slice::<i32>()
+        .map(|v| v[0])
+        .or_else(|_| argmax_data.as_slice::<i64>().map(|v| v[0] as i32))
+        .unwrap_or(0);
+    eprintln!("[Resident] Prefill: {:.1}s, first_token={}", t1.elapsed().as_secs_f32(), first_token);
+
+    let mut generated = prefix;
+    generated.push(first_token);
+
+    let audio_slices: Vec<Tensor<B, 3>> = (PREFIX_LEN..seq_len)
+        .map(|pos| audio_embeds.clone().slice([0..1, pos..pos + 1, 0..d_model]))
+        .collect();
+    drop(audio_embeds);
+
+    // CPU argmax helper (same as streaming — avoids 1.8 GB embedding upload)
+    let cpu_argmax = |hidden: &Tensor<B, 3>| -> i32 {
+        let data = hidden.clone().reshape([d_model]).into_data();
+        let h = data.as_slice::<f32>().unwrap();
+        let mut best_id = 0i32;
+        let mut best_score = f32::NEG_INFINITY;
+        for id in 0..dec.vocab_size {
+            let row = &dec.tok_embed_data[id * d_model..(id + 1) * d_model];
+            let score: f32 = h.iter().zip(row.iter()).map(|(a, b)| a * b).sum();
+            if score > best_score {
+                best_score = score;
+                best_id = id as i32;
+            }
+        }
+        best_id
+    };
+
+    // ── Autoregressive decode ──
+    let decode_steps = seq_len - PREFIX_LEN - 1;
+    let t2 = Instant::now();
+    for step in 0..decode_steps {
+        let pos = PREFIX_LEN + 1 + step;
+        let prev_token = generated[pos - 1];
+        let text_embed = dec.embed_tokens_from_ids(&[prev_token], 1, 1, device);
+        let audio_pos = audio_slices[pos - 1 - PREFIX_LEN].clone();
+        let x = audio_pos + text_embed;
+        let hidden = dec.forward_hidden_with_cache(x, t_embed.clone(), &mut caches);
+        let last_hidden = hidden.slice([0..1, 0..1, 0..d_model]);
+        let next_token = cpu_argmax(&last_hidden);
+        generated.push(next_token);
+        if (step + 1) % 20 == 0 || step == decode_steps - 1 {
+            let elapsed = t2.elapsed().as_secs_f32();
+            let ms_per_step = elapsed * 1000.0 / (step + 1) as f32;
+            eprintln!("[Resident] Decode {}/{} ({:.0}ms/step)", step + 1, decode_steps, ms_per_step);
+        }
+    }
+    let total_s = t0.elapsed().as_secs_f32();
+    let n_tokens = generated.len() - PREFIX_LEN;
+    let audio_secs = seq_len as f32 / 12.5; // 12.5 Hz frame rate
+    eprintln!("[Resident] Total: {:.1}s ({} tokens, {:.1}× realtime for {:.0}s audio)",
+        total_s, n_tokens, total_s / audio_secs, audio_secs);
+    Ok(generated.into_iter().skip(PREFIX_LEN).collect())
+}
+
+// ---------------------------------------------------------------------------
+// Transcription with streaming decoder (WGPU/DZN path)
 // ---------------------------------------------------------------------------
 
 pub fn transcribe<B: Backend>(

@@ -1,6 +1,8 @@
 pub mod bf16;
 pub mod bf16_engine;
 pub mod config;
+#[cfg(feature = "cuda")]
+pub mod cuda_engine;
 pub mod engine;
 pub mod q4;
 pub mod tokenizer;

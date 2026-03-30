@@ -13,10 +13,14 @@ path = "src/lib.rs"
 name = "burn-server"
 path = "src/main.rs"
 
+[[bin]]
+name = "benchmark"
+path = "src/bin/benchmark.rs"
+
 [dependencies]
 # ML framework
 burn = { version = "0.20", features = ["wgpu", "default", "template"] }
-cubecl = { version = "0.9", features = ["wgpu"] }
+cubecl = { version = "0.9", features = ["wgpu"], default-features = false }
 
 # HTTP server
 axum = { version = "0.7", features = ["ws", "multipart"] }
@@ -62,6 +66,7 @@ tower = { version = "0.5", features = ["util"] }
 default = ["native"]
 native = []
 wasm = []
+cuda = ["burn/cuda"]
 
 # Patch cubecl-wgpu to respect WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER env var.
 # Required for Mesa DZN (Vulkan-over-DX12) on WSL2 — DZN reports conformance 0.0.0.0

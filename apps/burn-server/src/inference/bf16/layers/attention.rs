@@ -17,6 +17,17 @@ use burn::tensor::{Float, Tensor};
 /// - Masked positions (-inf → clamped to -100): exp(-100) ≈ 3.7e-44 ≈ 0 ✓
 /// - Valid scores (typically -10 to +10 after 1/√d scaling): exp fine in f32 range
 /// - Upper clamp 80: exp(80) = 5.5e34, safely within f32 max (3.4e38)
+/// Standard softmax using burn's built-in max_dim/sum_dim.
+/// Works correctly on CUDA and native Vulkan; broken on DZN.
+#[allow(dead_code)]
+fn standard_softmax<B: Backend>(scores: Tensor<B, 4>) -> Tensor<B, 4> {
+    let max_vals = scores.clone().max_dim(3);
+    let shifted = scores - max_vals;
+    let exp_vals = shifted.exp();
+    let sum_vals = exp_vals.clone().sum_dim(3);
+    exp_vals / sum_vals
+}
+
 fn gpu_softmax<B: Backend>(scores: Tensor<B, 4>) -> Tensor<B, 4> {
     let [b, h, s, kv] = scores.dims();
     let device = scores.device();
@@ -79,6 +90,8 @@ pub struct Attention<B: Backend> {
     pub(crate) head_dim: usize,
     pub(crate) scale: f32,
     pub(crate) sliding_window: Option<usize>,
+    /// Use standard softmax (max_dim/sum_dim). Works on CUDA; broken on DZN.
+    pub(crate) use_standard_softmax: bool,
 }
 
 impl AttentionConfig {
@@ -109,6 +122,7 @@ impl AttentionConfig {
             head_dim: self.head_dim,
             scale: (self.head_dim as f32).powf(-0.5),
             sliding_window: self.sliding_window,
+            use_standard_softmax: false,
         }
     }
 }
@@ -136,6 +150,21 @@ impl<B: Backend> Attention<B> {
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
             sliding_window,
+            use_standard_softmax: false,
+        }
+    }
+
+    /// Enable standard softmax (for CUDA/native Vulkan backends).
+    pub fn with_standard_softmax(mut self) -> Self {
+        self.use_standard_softmax = true;
+        self
+    }
+
+    fn softmax(&self, scores: Tensor<B, 4>) -> Tensor<B, 4> {
+        if self.use_standard_softmax {
+            standard_softmax(scores)
+        } else {
+            gpu_softmax(scores)
         }
     }
 
@@ -198,7 +227,7 @@ impl<B: Backend> Attention<B> {
         };
 
         // Softmax
-        let attn = gpu_softmax(scores);
+        let attn = self.softmax(scores);
 
         // Apply attention: attn @ V
         let out = attn.matmul(v);
@@ -288,7 +317,7 @@ impl<B: Backend> Attention<B> {
         };
 
         // Softmax
-        let attn = gpu_softmax(scores);
+        let attn = self.softmax(scores);
 
         // Apply attention: attn @ V
         let out = attn.matmul(v);

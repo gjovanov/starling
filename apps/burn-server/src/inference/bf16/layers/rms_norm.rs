@@ -71,6 +71,15 @@ impl<B: Backend> RmsNorm<B> {
         // normalize and scale
         (x / rms) * self.gamma.val().unsqueeze::<3>()
     }
+
+    /// Standard forward using mean_dim (works on CUDA/native Vulkan, broken on DZN).
+    #[allow(dead_code)]
+    pub fn forward_standard(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let x_sq = x.clone() * x.clone();
+        let mean_sq = x_sq.mean_dim(2);
+        let rms = (mean_sq + self.epsilon).sqrt();
+        (x / rms) * self.gamma.val().unsqueeze::<3>()
+    }
 }
 
 /// ADA RMSNorm configuration (t-conditioned normalization).
