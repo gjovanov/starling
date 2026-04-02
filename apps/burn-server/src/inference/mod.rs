@@ -3,6 +3,8 @@ pub mod bf16_engine;
 pub mod config;
 #[cfg(feature = "candle")]
 pub mod candle_engine;
+#[cfg(feature = "candle-native")]
+pub mod candle_native;
 #[cfg(feature = "cuda")]
 pub mod cuda_engine;
 pub mod engine;

@@ -253,11 +253,26 @@ pub fn transcribe_resident<B: Backend>(
 
     let prefix_text = dec.embed_tokens_from_ids(&prefix, 1, PREFIX_LEN, device);
     let prefix_audio = audio_embeds.clone().slice([0..1, 0..PREFIX_LEN, 0..d_model]);
+    // Debug: check token embedding for token 32
+    let tok32 = dec.embed_tokens_from_ids(&[32], 1, 1, device);
+    let t32_data = tok32.slice([0..1, 0..1, 0..8]).reshape([8]).into_data().convert::<f32>();
+    eprintln!("[Resident-DBG] tok_embed[32][:8]={:?}", t32_data.as_slice::<f32>().unwrap());
+    // Save encoder output for cross-framework testing
+    let ae_flat = audio_embeds.clone().reshape([seq_len * d_model]).into_data().convert::<f32>();
+    let ae_bytes: Vec<u8> = ae_flat.as_slice::<f32>().unwrap().iter()
+        .flat_map(|f| f.to_le_bytes()).collect();
+    std::fs::write("/tmp/burn_audio_embeds.bin", &ae_bytes).ok();
+    eprintln!("[Resident-DBG] Saved audio_embeds [1,{},{}] to /tmp/burn_audio_embeds.bin ({} bytes)",
+        seq_len, d_model, ae_bytes.len());
     let x = prefix_audio + prefix_text;
 
     // ── Prefill: use pre-computed ADA scales + GPU lm_head ──
     let t1 = Instant::now();
     let hidden = dec.forward_hidden_with_cache_fast(x, &ada_scales, &mut caches);
+    // Debug: print hidden mean_abs
+    let h_abs = hidden.clone().abs().mean().into_data();
+    let h_val = h_abs.as_slice::<f32>().unwrap_or(&[0.0])[0];
+    eprintln!("[Resident-DBG] hidden mean_abs={:.6}", h_val);
     let logits = dec.lm_head_gpu(hidden);
     let vocab = logits.dims()[2];
     let last_logits = logits.slice([0..1, (PREFIX_LEN - 1)..PREFIX_LEN, 0..vocab]);

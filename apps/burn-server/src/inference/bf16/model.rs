@@ -25,8 +25,12 @@ impl<B: Backend> AudioEncoder<B> {
         let x = self.conv.forward(mel);
         let x = x.swap_dims(1, 2);
         let mut x = x;
-        for layer in &self.layers {
+        for (i, layer) in self.layers.iter().enumerate() {
             x = layer.forward(x, &self.rope, offset);
+            if i == 0 {
+                let v0 = x.clone().slice([0..1, 0..1, 0..8]).reshape([8]).into_data().convert::<f32>();
+                eprintln!("[BurnEncoder] enc_layer0_out[0,0,:8]={:?}", v0.as_slice::<f32>().unwrap());
+            }
         }
         self.norm.forward(x)
     }

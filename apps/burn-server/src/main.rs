@@ -122,6 +122,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| -> Box<dyn std::error::Error> { e })?;
             Arc::new(candle_engine)
         }
+        #[cfg(feature = "candle-native")]
+        (config::Quantization::Bf16, config::GpuBackend::CandleNative) => {
+            let candle_native_engine =
+                inference::candle_native::engine::CandleNativeEngine::load(&model_path, &tokenizer_path)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            Arc::new(candle_native_engine)
+        }
     };
     eprintln!("Inference engine ready.");
 
