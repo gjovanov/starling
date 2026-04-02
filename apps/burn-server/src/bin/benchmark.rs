@@ -338,7 +338,11 @@ fn run_candle_native(args: &Args) {
     let t_embed = model::compute_time_embedding(6.0, 3072, &device).expect("t_embed");
 
     let t_infer = Instant::now();
-    let token_ids = model::transcribe(&vox_model, &mel, &t_embed).expect("transcribe");
+    let token_ids = if std::env::var("CANDLE_STREAMING").is_ok() {
+        model::transcribe_streaming(&vox_model, &mel, &t_embed).expect("transcribe_streaming")
+    } else {
+        model::transcribe(&vox_model, &mel, &t_embed).expect("transcribe")
+    };
     let infer_secs = t_infer.elapsed().as_secs_f32();
 
     let text = tokenizer.decode(&token_ids.iter().map(|&t| t as i32).collect::<Vec<_>>());

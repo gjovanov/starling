@@ -148,11 +148,29 @@ pub struct KVCache {
     k: Option<Tensor>,
     v: Option<Tensor>,
     seq_len: usize,
+    /// Logical position offset (for when cache is compacted)
+    pos_offset: usize,
 }
 
 impl KVCache {
     pub fn new() -> Self {
-        Self { k: None, v: None, seq_len: 0 }
+        Self { k: None, v: None, seq_len: 0, pos_offset: 0 }
+    }
+
+    /// Current logical position (pos_offset + seq_len)
+    fn logical_len(&self) -> usize { self.pos_offset + self.seq_len }
+
+    /// Compact: keep only the last `keep` positions. Updates pos_offset.
+    fn compact(&mut self, keep: usize) -> Result<()> {
+        if self.seq_len <= keep { return Ok(()); }
+        let drop = self.seq_len - keep;
+        if let (Some(ck), Some(cv)) = (&self.k, &self.v) {
+            self.k = Some(ck.narrow(1, drop, keep)?.contiguous()?);
+            self.v = Some(cv.narrow(1, drop, keep)?.contiguous()?);
+        }
+        self.pos_offset += drop;
+        self.seq_len = keep;
+        Ok(())
     }
 
     /// Append new K, V and return full cached K, V.
@@ -161,7 +179,6 @@ impl KVCache {
         let new_seq = k.dim(1)?;
         let (k, v) = match (&self.k, &self.v) {
             (Some(ck), Some(cv)) => {
-                // Ensure contiguous after cat to avoid strided memory issues
                 let k = Tensor::cat(&[ck, &k], 1)?.contiguous()?;
                 let v = Tensor::cat(&[cv, &v], 1)?.contiguous()?;
                 (k, v)
@@ -205,36 +222,35 @@ impl EncoderAttention {
     }
 
     /// Forward with KV cache support (causal + sliding window).
-    /// For full-sequence: cache=None, offset=0.
-    /// For incremental: cache accumulates K,V from previous chunks.
     fn forward_with_cache(&self, x: &Tensor, rope: &RoPE, cache: &mut KVCache) -> Result<Tensor> {
         let (b, seq, _) = x.dims3()?;
-        let offset = cache.seq_len;
+        let offset = cache.logical_len(); // logical position for RoPE continuity
         let q = self.wq.forward(x)?.reshape((b, seq, self.n_heads, self.head_dim))?;
         let k = self.wk.forward(x)?.reshape((b, seq, self.n_heads, self.head_dim))?;
         let v = self.wv.forward(x)?.reshape((b, seq, self.n_heads, self.head_dim))?;
         let (q, k) = rope.apply(&q, &k, offset)?;
 
+        // Update KV cache BEFORE transpose (cache stores [B, seq, heads, hd])
+        let (full_k, full_v) = cache.update(k, v)?;
+
         // [B, seq, heads, hd] → [B, heads, seq, hd]
         let q = q.transpose(1, 2)?.contiguous()?;
-        let k = k.transpose(1, 2)?.contiguous()?;
-        let v = v.transpose(1, 2)?.contiguous()?;
-
-        // Update KV cache and get full K,V
-        let (full_k, full_v) = cache.update(k, v)?;
-        let full_k = full_k.contiguous()?;
-        let full_v = full_v.contiguous()?;
+        let full_k = full_k.transpose(1, 2)?.contiguous()?;
+        let full_v = full_v.transpose(1, 2)?.contiguous()?;
         let kv_seq = full_k.dim(2)?;
 
         // scores = Q @ K^T * scale
         let scores = (q.matmul(&full_k.transpose(2, 3)?.contiguous()?)? * (self.scale as f64))?;
 
         // Causal + sliding window mask
+        // KV positions in cache: cache.pos_offset + 0..kv_seq
+        let kv_pos_offset = cache.pos_offset;
         let mask: Vec<f32> = (0..seq).flat_map(|i| {
-            let qi_abs = offset + i;
+            let qi_abs = offset + i; // logical position of query
             (0..kv_seq).map(move |j| {
-                if j > qi_abs { f32::NEG_INFINITY }  // causal
-                else if qi_abs - j >= self.sliding_window { f32::NEG_INFINITY } // sliding window
+                let kj_abs = kv_pos_offset + j; // logical position of key
+                if kj_abs > qi_abs { f32::NEG_INFINITY }  // causal
+                else if qi_abs - kj_abs >= self.sliding_window { f32::NEG_INFINITY } // sliding window
                 else { 0.0 }
             })
         }).collect();
@@ -427,7 +443,7 @@ impl DecoderAttention {
 
     fn forward_with_cache(&self, x: &Tensor, rope: &RoPE, cache: &mut KVCache) -> Result<Tensor> {
         let (b, seq, _) = x.dims3()?;
-        let offset = cache.seq_len;
+        let offset = cache.logical_len();
 
         let q = self.wq.forward(x)?.reshape((b, seq, self.n_heads, self.head_dim))?;
         let k = self.wk.forward(x)?.reshape((b, seq, self.n_kv_heads, self.head_dim))?;
@@ -831,6 +847,154 @@ pub fn transcribe(model: &VoxtralModel, mel: &Tensor, t_embed: &Tensor) -> Resul
     eprintln!("[CandleNative] Decode: {} steps, {}ms, {:.1}ms/step, {} text tokens",
         n_steps, decode_ms, ms_per_step, text_tokens.len());
     eprintln!("[CandleNative] Total: {:.1}s ({:.1}× realtime for {:.0}s audio)",
+        total_s, total_s / audio_secs, audio_secs);
+
+    Ok(generated)
+}
+
+/// Streaming transcription: processes audio in chunks matching voxtral.c's approach.
+/// Conv is computed once (fast), then encoder processes in 2s chunks with KV cache.
+/// This enables transcription of unlimited audio without O(n²) encoder blowup.
+pub fn transcribe_streaming(model: &VoxtralModel, mel: &Tensor, t_embed: &Tensor) -> Result<Vec<u32>> {
+    let t0 = Instant::now();
+
+    // Step 1: Conv stem on full mel (fast, no attention)
+    let conv_out = model.encoder.conv.forward(mel)?; // [1, T/2, 1280]
+    let n_conv = conv_out.dim(1)?;
+    let n_aligned = (n_conv / 4) * 4;
+    let conv_out = if n_aligned < n_conv { conv_out.narrow(1, 0, n_aligned)? } else { conv_out };
+    let n_conv = conv_out.dim(1)?;
+    eprintln!("[Streaming] Conv: {} frames ({:.2}s)", n_conv, t0.elapsed().as_secs_f32());
+
+    // Step 2: Encoder in chunks (matching voxtral.c's 2s interval = ~200 mel frames = ~100 conv frames)
+    let enc_chunk_size = 100; // conv frames per chunk (~1s of audio after stride-2 conv)
+    let sliding_window = 750; // encoder attention window
+    let mut enc_caches = VoxtralModel::new_encoder_caches();
+    let mut adapter_tokens: Vec<Tensor> = Vec::new();
+    let mut enc_residual: Option<Tensor> = None; // leftover frames for 4x alignment
+
+    let t_enc = Instant::now();
+    let mut pos = 0;
+    while pos < n_conv {
+        let chunk_end = (pos + enc_chunk_size).min(n_conv);
+        let chunk = conv_out.narrow(1, pos, chunk_end - pos)?;
+
+        // Compact encoder KV caches if approaching sliding window limit
+        if enc_caches[0].seq_len + (chunk_end - pos) > sliding_window {
+            let keep = sliding_window / 2; // keep half, drop old
+            for cache in &mut enc_caches {
+                cache.compact(keep)?;
+            }
+        }
+
+        // Encoder transformer layers with KV cache
+        let mut x = chunk;
+        for (i, layer) in model.encoder.layers.iter().enumerate() {
+            x = layer.forward(&x, &model.encoder.rope, &mut enc_caches[i])?;
+        }
+        let enc_out = model.encoder.norm.forward(&x)?;
+
+        // Handle 4x alignment residual: combine with previous leftover
+        let to_adapt = if let Some(residual) = enc_residual.take() {
+            Tensor::cat(&[&residual, &enc_out], 1)?
+        } else {
+            enc_out
+        };
+
+        let total = to_adapt.dim(1)?;
+        let usable = (total / 4) * 4;
+        let leftover = total - usable;
+
+        if usable > 0 {
+            let adapter_input = to_adapt.narrow(1, 0, usable)?;
+            let reshaped = reshape_encoder_output(&adapter_input, 4)?;
+            let adapted = model.adapter.forward(&reshaped)?;
+            adapter_tokens.push(adapted);
+        }
+
+        if leftover > 0 {
+            enc_residual = Some(to_adapt.narrow(1, usable, leftover)?);
+        }
+
+        pos = chunk_end;
+    }
+
+    // Flush any remaining residual (pad with zeros to align)
+    if let Some(residual) = enc_residual {
+        let left = residual.dim(1)?;
+        let pad_needed = 4 - left;
+        let zeros = Tensor::zeros((1, pad_needed, 1280), residual.dtype(), residual.device())?;
+        let padded = Tensor::cat(&[&residual, &zeros], 1)?;
+        let reshaped = reshape_encoder_output(&padded, 4)?;
+        let adapted = model.adapter.forward(&reshaped)?;
+        adapter_tokens.push(adapted);
+    }
+
+    let audio_embeds = Tensor::cat(&adapter_tokens.iter().collect::<Vec<_>>(), 1)?;
+    let audio_seq = audio_embeds.dim(1)?;
+    let d_model = audio_embeds.dim(2)?;
+    eprintln!("[Streaming] Encoder: {} adapter tokens, {} chunks ({:.2}s)",
+        audio_seq, (n_conv + enc_chunk_size - 1) / enc_chunk_size, t_enc.elapsed().as_secs_f32());
+
+    // Step 3: Decoder (same as non-streaming transcribe)
+    let mut dec_caches: Vec<KVCache> = (0..26).map(|_| KVCache::new()).collect();
+    let ada_scales = model.precompute_ada_scales(t_embed)?;
+
+    // Prompt: BOS(1) + STREAMING_PAD(32)*38 = 39 tokens
+    let prompt_len = 39usize.min(audio_seq);
+    let prompt_ids: Vec<u32> = std::iter::once(1u32)
+        .chain(std::iter::repeat(32u32).take(prompt_len - 1))
+        .collect();
+
+    // Prefill prompt (audio + text)
+    let prefill_count = prompt_len - 1;
+    let prompt_audio = audio_embeds.narrow(1, 0, prompt_len)?;
+    let prompt_text = model.embed_tokens(&prompt_ids)?;
+    let prompt_input = (&prompt_audio + &prompt_text)?;
+
+    let t_dec = Instant::now();
+    let prefill_input = prompt_input.narrow(1, 0, prefill_count)?;
+    let _prefill_hidden = model.decoder_forward(prefill_input, &ada_scales, &mut dec_caches)?;
+    let last_input = prompt_input.narrow(1, prefill_count, 1)?;
+    let last_hidden = model.decoder_forward(last_input, &ada_scales, &mut dec_caches)?;
+    let prompt_logits = model.lm_head(&last_hidden)?;
+
+    let last_logits: Vec<f32> = prompt_logits.to_dtype(DType::F32)?.reshape(131072)?.to_vec1()?;
+    let mut prev_token = last_logits.iter().enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as u32).unwrap_or(0);
+
+    // Autoregressive decode
+    let eos_token = 2u32;
+    let mut generated = Vec::with_capacity(audio_seq);
+    generated.push(prev_token);
+
+    for i in prompt_len..audio_seq {
+        let audio_pos = audio_embeds.narrow(1, i, 1)?;
+        let text_embed = model.embed_token(prev_token)?;
+        let x = (&audio_pos + &text_embed)?;
+
+        let hidden = model.decoder_forward(x, &ada_scales, &mut dec_caches)?;
+        let logits = model.lm_head(&hidden)?;
+        let logits_f32: Vec<f32> = logits.to_dtype(DType::F32)?.reshape(131072)?.to_vec1()?;
+        let token = logits_f32.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32).unwrap_or(0);
+
+        generated.push(token);
+        prev_token = token;
+        if token == eos_token { break; }
+    }
+
+    let decode_ms = t_dec.elapsed().as_millis();
+    let n_steps = generated.len() - 1;
+    let ms_per_step = if n_steps > 0 { decode_ms as f32 / n_steps as f32 } else { 0.0 };
+    let total_s = t0.elapsed().as_secs_f32();
+    let audio_secs = audio_seq as f32 / 12.5;
+    let text_tokens: Vec<u32> = generated.iter().copied().filter(|&t| t >= 1000).collect();
+    eprintln!("[Streaming] Decode: {} steps, {}ms, {:.1}ms/step, {} text tokens",
+        n_steps, decode_ms, ms_per_step, text_tokens.len());
+    eprintln!("[Streaming] Total: {:.1}s ({:.1}× realtime for {:.0}s audio)",
         total_s, total_s / audio_secs, audio_secs);
 
     Ok(generated)
