@@ -39,14 +39,28 @@ export STARLING_MODELS_DIR="${STARLING_MODELS_DIR:-$PROJECT_DIR/models/cache}"
 echo "=== Burn Server ==="
 echo "  Port:     $BURN_PORT"
 echo "  Quant:    ${BURN_QUANT:-q4}"
+echo "  Backend:  ${BURN_BACKEND:-wgpu}"
 echo "  Models:   $STARLING_MODELS_DIR"
 echo "  Media:    $BURN_MEDIA_DIR"
 echo "  Frontend: $BURN_FRONTEND_PATH"
+echo "  TURN:     ${TURN_SERVER:-none}"
+echo "  Relay:    ${FORCE_RELAY:-false}"
 echo ""
 
-"$BINARY" \
-    --port "$BURN_PORT" \
-    --quant "${BURN_QUANT:-q4}" \
-    --models-dir "$STARLING_MODELS_DIR" \
-    --frontend "$BURN_FRONTEND_PATH" \
+ARGS=(
+    --port "$BURN_PORT"
+    --quant "${BURN_QUANT:-q4}"
+    --backend "${BURN_BACKEND:-wgpu}"
+    --models-dir "$STARLING_MODELS_DIR"
+    --frontend "$BURN_FRONTEND_PATH"
     --media-dir "$BURN_MEDIA_DIR"
+)
+
+# TURN/WebRTC configuration
+[ -n "$TURN_SERVER" ] && ARGS+=(--turn-server "$TURN_SERVER")
+[ -n "$TURN_SHARED_SECRET" ] && ARGS+=(--turn-shared-secret "$TURN_SHARED_SECRET")
+[ -n "$TURN_USERNAME" ] && ARGS+=(--turn-username "$TURN_USERNAME")
+[ -n "$TURN_PASSWORD" ] && ARGS+=(--turn-password "$TURN_PASSWORD")
+[ "$FORCE_RELAY" = "true" ] && ARGS+=(--force-relay)
+
+"$BINARY" "${ARGS[@]}"
