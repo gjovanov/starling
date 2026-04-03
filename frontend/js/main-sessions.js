@@ -6,6 +6,7 @@ import { WebRTCClient } from './modules/webrtc.js';
 import { SubtitleRenderer } from './modules/subtitles.js';
 import { formatTime } from './modules/utils.js';
 import { SessionManager, formatDuration, formatFileSize } from './modules/session-manager.js';
+import { initWasmUI } from './wasm/wasm-ui.js';
 
 // Application state
 const state = {
@@ -87,6 +88,14 @@ async function init() {
 
   // Start polling for session updates
   sessionManager.startPolling(3000);
+
+  // Initialize WASM UI (browser-side inference)
+  const wasmContainer = document.getElementById('wasm-mode-container');
+  if (wasmContainer) {
+    wasmContainer.style.display = 'block';
+    await initWasmUI(wasmContainer);
+    console.log('WASM UI initialized');
+  }
 
   console.log('Multi-session application initialized');
 }

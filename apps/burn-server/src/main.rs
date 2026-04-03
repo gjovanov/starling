@@ -133,6 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Inference engine ready.");
 
     let frontend_path = config.frontend.clone();
+    let models_dir = config.models_dir.clone();
     let port = config.port;
     let state = Arc::new(AppState::new(config, webrtc_api).with_engine(engine));
 
@@ -170,7 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         // WebSocket
         .route("/ws/:session_id", get(server::ws::ws_handler))
-        // Static frontend
+        // Static frontend (models served via symlink: frontend/models → ../models/cache)
         .fallback_service(ServeDir::new(&frontend_path))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)) // 2GB upload
         .layer(CorsLayer::permissive())

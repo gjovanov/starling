@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "libs/voxtral-core",
+    "apps/burn-server",
+    "apps/wasm-engine",
+    "apps/wasm-poc",
+]
+resolver = "2"
+
+# Shared patch — all workspace members use the same patched cubecl-wgpu
+[patch.crates-io]
+cubecl-wgpu = { path = "apps/burn-server/patches/cubecl-wgpu-0.9.0" }
+burn-candle = { path = "apps/burn-server/patches/burn-candle-0.20.1" }
