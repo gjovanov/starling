@@ -117,6 +117,25 @@ pub fn pad_audio(audio: &AudioBuffer, config: &PadConfig) -> AudioBuffer {
     AudioBuffer::new(padded, audio.sample_rate)
 }
 
+/// Right-only padding: align to token boundary + extra right tokens.
+/// Assumes audio already contains left-padding (silence prepended by caller).
+pub fn pad_audio_right_only(audio: &AudioBuffer, config: &PadConfig) -> AudioBuffer {
+    let spt = config.samples_per_token();
+
+    // Align to token boundary
+    let remainder = audio.samples.len() % spt;
+    let align_pad = if remainder > 0 { spt - remainder } else { 0 };
+
+    // Extra right padding
+    let right_extra = config.extra_right_pad_tokens * spt;
+    let total_len = audio.samples.len() + align_pad + right_extra;
+
+    let mut padded = vec![0.0f32; total_len];
+    padded[..audio.samples.len()].copy_from_slice(&audio.samples);
+
+    AudioBuffer::new(padded, audio.sample_rate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,20 +1,20 @@
-//! Pure candle CUDA inference engine — streaming with incremental encoding.
+//! Incremental candle CUDA inference engine.
 //!
-//! Each commit() processes only NEW audio through the encoder (with KV cache),
-//! then runs the decoder on new adapter tokens. This enables 0.5s commit intervals.
+//! Each commit() processes ONLY new audio through the encoder (KV cached),
+//! then decodes new adapter tokens. This enables real-time 0.5s commits.
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use candle_core_native::{DType, Device, Tensor};
+use candle_core_native::{DType, Device, Module, Tensor};
 
 use crate::audio::mel::{MelConfig, MelSpectrogram};
-use crate::audio::pad::{PadConfig};
+use crate::audio::pad::PadConfig;
 use crate::audio::AudioBuffer;
 use crate::inference::tokenizer::TekkenDecoder;
 use crate::inference::{InferenceEngine, InferenceSession};
 
-use super::model::{self, KVCache, VoxtralModel};
+use super::model::{self, KVCache, VoxtralModel, reshape_encoder_output};
 
 pub struct CandleNativeEngine {
     model: Arc<Mutex<VoxtralModel>>,
@@ -60,6 +60,7 @@ impl InferenceEngine for CandleNativeEngine {
     }
 }
 
+/// Incremental streaming session — keeps encoder + decoder KV caches across commits.
 pub struct CandleNativeSession {
     model: Arc<Mutex<VoxtralModel>>,
     tokenizer: Arc<TekkenDecoder>,
@@ -68,16 +69,25 @@ pub struct CandleNativeSession {
     mel_spec: MelSpectrogram,
     pad_config: PadConfig,
 
-    // Audio accumulation
-    audio_buffer: Vec<f32>,
+    // Audio state
+    audio_samples: Vec<f32>,
     commit_count: usize,
 
-    // Full-window transcription state (re-transcribe on each commit for simplicity)
-    prev_text: String,
+    // Incremental encoding state
+    processed_conv_frames: usize,  // how many conv frames already encoded
+    enc_caches: Vec<KVCache>,      // 32 encoder layer KV caches
+    enc_residual: Vec<f32>,        // leftover encoder frames for 4x alignment (flat [n, 1280])
+    enc_residual_count: usize,
 
-    // ADA scales (constant across session, precomputed once)
-    ada_scales: Option<Vec<Tensor>>,
-    t_embed: Option<Tensor>,
+    // Decoder state (persistent across commits)
+    dec_caches: Vec<KVCache>,      // 26 decoder layer KV caches
+    ada_scales: Vec<Tensor>,
+    prev_token: u32,
+    decoder_started: bool,
+    total_adapter_tokens: usize,
+
+    // Text accumulation
+    generated_tokens: Vec<u32>,
 }
 
 impl CandleNativeSession {
@@ -96,6 +106,10 @@ impl CandleNativeSession {
                 .map_err(|e| format!("ada_scales: {}", e))?
         };
 
+        // Pre-fill audio with left-pad silence (32 * 1280 = 40960 zeros)
+        let left_pad = 32 * 1280;
+        let audio_samples = vec![0.0f32; left_pad];
+
         Ok(Self {
             model,
             tokenizer,
@@ -103,114 +117,256 @@ impl CandleNativeSession {
             _language: language.to_string(),
             mel_spec: MelSpectrogram::new(MelConfig::default()),
             pad_config: PadConfig::bf16(),
-            audio_buffer: Vec::new(),
+            audio_samples,
             commit_count: 0,
-            prev_text: String::new(),
-            ada_scales: Some(ada_scales),
-            t_embed: Some(t_embed),
+            processed_conv_frames: 0,
+            enc_caches: VoxtralModel::new_encoder_caches(),
+            enc_residual: Vec::new(),
+            enc_residual_count: 0,
+            dec_caches: (0..26).map(|_| KVCache::new()).collect(),
+            ada_scales,
+            prev_token: 0,
+            decoder_started: false,
+            total_adapter_tokens: 0,
+            generated_tokens: Vec::new(),
         })
     }
+}
 
-    /// Transcribe the current audio window and return full text.
-    fn transcribe_window(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        // Use last 30s of audio (enough context, fast enough for streaming)
-        const MAX_WINDOW_SECS: f32 = 30.0;
-        const MAX_WINDOW_SAMPLES: usize = (16000.0 * MAX_WINDOW_SECS) as usize;
+impl InferenceSession for CandleNativeSession {
+    fn send_audio(&mut self, samples: &[f32]) {
+        self.audio_samples.extend_from_slice(samples);
+    }
 
-        let start = if self.audio_buffer.len() > MAX_WINDOW_SAMPLES {
-            self.audio_buffer.len() - MAX_WINDOW_SAMPLES
-        } else {
-            0
-        };
-        let window = &self.audio_buffer[start..];
+    fn commit(&mut self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        self.commit_count += 1;
+        let t0 = Instant::now();
 
-        if window.len() < 8000 { // need at least 0.5s
+        // Need minimum audio for encoder to produce anything useful
+        // 39 prompt tokens * 4 (pool) * 2 (conv stride) * 160 (mel hop) = ~50000 samples
+        if self.audio_samples.len() < 50000 {
             return Ok(String::new());
         }
 
-        // Pad + mel
-        let audio_buf = AudioBuffer::new(window.to_vec(), 16000);
-        let padded = crate::audio::pad::pad_audio(&audio_buf, &self.pad_config);
+        let model = self.model.lock().map_err(|e| format!("lock: {}", e))?;
+
+        // Step 1: Compute mel for ALL accumulated audio (fast, no attention)
+        // Add right padding for the current audio length
+        let audio_buf = AudioBuffer::new(self.audio_samples.clone(), 16000);
+        let padded = crate::audio::pad::pad_audio_right_only(&audio_buf, &self.pad_config);
         let log_mel = self.mel_spec.compute_log(&padded.samples);
         let n_frames = log_mel.len();
         let n_mels = if n_frames > 0 { log_mel[0].len() } else { 128 };
-        if n_frames == 0 {
-            return Ok(String::new());
-        }
+        if n_frames == 0 { return Ok(String::new()); }
 
+        // Build mel tensor
         let mut flat = vec![0.0f32; n_mels * n_frames];
         for (t, frame) in log_mel.iter().enumerate() {
             for (m, &val) in frame.iter().enumerate() {
                 flat[m * n_frames + t] = val;
             }
         }
-        let mel_tensor = Tensor::new(flat, &self.device)
+        let mel = Tensor::new(flat, &self.device)
             .and_then(|t| t.to_dtype(DType::BF16))
             .and_then(|t| t.reshape((1, n_mels, n_frames)))
-            .map_err(|e| format!("Mel tensor: {}", e))?;
+            .map_err(|e| format!("mel: {}", e))?;
 
-        let model = self.model.lock().map_err(|e| format!("lock: {}", e))?;
-        let t_embed = self.t_embed.as_ref().unwrap();
-        let token_ids = model::transcribe_streaming(&model, &mel_tensor, t_embed)
-            .map_err(|e| format!("transcribe: {}", e))?;
+        // Step 2: Conv on full mel (fast, no attention)
+        let conv_out = model.encoder.conv.forward(&mel)
+            .map_err(|e| format!("conv: {}", e))?;
+        let total_conv = conv_out.dim(1).map_err(|e| format!("dim: {}", e))?;
+        let total_aligned = (total_conv / 4) * 4;
 
-        Ok(self.tokenizer.decode(
-            &token_ids.iter().map(|&t| t as i32).collect::<Vec<_>>(),
-        ))
-    }
-}
-
-impl InferenceSession for CandleNativeSession {
-    fn send_audio(&mut self, samples: &[f32]) {
-        self.audio_buffer.extend_from_slice(samples);
-    }
-
-    fn commit(&mut self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        if self.audio_buffer.is_empty() {
-            return Ok(String::new());
+        // How many NEW conv frames since last commit?
+        let new_start = self.processed_conv_frames;
+        if new_start >= total_aligned {
+            return Ok(String::new()); // no new frames
         }
-        self.commit_count += 1;
+        let new_conv = conv_out.narrow(1, new_start, total_aligned - new_start)
+            .map_err(|e| format!("narrow: {}", e))?;
+        let new_len = total_aligned - new_start;
 
-        // Need enough audio for the model (prompt_len=39 tokens needs ~3s)
-        if self.audio_buffer.len() < 48000 { // 3 seconds minimum
-            return Ok(String::new());
-        }
-
-        let t0 = Instant::now();
-        let full_text = self.transcribe_window()?;
-        let infer_ms = t0.elapsed().as_secs_f32() * 1000.0;
-
-        let audio_secs = self.audio_buffer.len() as f32 / 16000.0;
-        eprintln!(
-            "[CandleNative] #{} {:.1}s audio → {:.0}ms ({} chars)",
-            self.commit_count, audio_secs, infer_ms, full_text.len(),
-        );
-
-        // Compute delta (new text since last commit)
-        let delta = if full_text.len() > self.prev_text.len()
-            && full_text.starts_with(&self.prev_text)
-        {
-            full_text[self.prev_text.len()..].to_string()
-        } else if !full_text.is_empty() {
-            // Window shifted — text changed. Return everything after last common point.
-            // Find longest common suffix of prev_text that matches prefix of full_text
-            let overlap = find_overlap(&self.prev_text, &full_text);
-            if overlap > 0 {
-                full_text[overlap..].to_string()
-            } else {
-                full_text.clone()
+        // Step 3: Encoder on NEW conv frames only (with KV cache)
+        let sliding_window = 750;
+        if self.enc_caches[0].seq_len + new_len > sliding_window {
+            let keep = sliding_window / 2;
+            for cache in &mut self.enc_caches {
+                cache.compact(keep).map_err(|e| format!("compact: {}", e))?;
             }
+        }
+
+        let mut x = new_conv;
+        for (i, layer) in model.encoder.layers.iter().enumerate() {
+            x = layer.forward(&x, &model.encoder.rope, &mut self.enc_caches[i])
+                .map_err(|e| format!("enc layer {}: {}", i, e))?;
+        }
+        let enc_out = model.encoder.norm.forward(&x)
+            .map_err(|e| format!("enc norm: {}", e))?;
+        self.processed_conv_frames = total_aligned;
+
+        // Step 4: Adapter (4x reshape) with residual handling
+        let enc_frames = enc_out.dim(1).map_err(|e| format!("dim: {}", e))?;
+        // Combine with leftover from previous commit
+        let to_adapt = if self.enc_residual_count > 0 {
+            let residual = Tensor::new(self.enc_residual[..self.enc_residual_count * 1280].to_vec(), &self.device)
+                .and_then(|t| t.to_dtype(DType::BF16))
+                .and_then(|t| t.reshape((1, self.enc_residual_count, 1280)))
+                .map_err(|e| format!("residual: {}", e))?;
+            Tensor::cat(&[&residual, &enc_out], 1).map_err(|e| format!("cat: {}", e))?
+        } else {
+            enc_out
+        };
+
+        let total_enc = to_adapt.dim(1).map_err(|e| format!("dim: {}", e))?;
+        let usable = (total_enc / 4) * 4;
+        let leftover = total_enc - usable;
+
+        let mut new_adapter_tokens = 0;
+        let mut adapter_embeds: Option<Tensor> = None;
+        if usable > 0 {
+            let adapter_input = to_adapt.narrow(1, 0, usable).map_err(|e| format!("narrow: {}", e))?;
+            let reshaped = reshape_encoder_output(&adapter_input, 4).map_err(|e| format!("reshape: {}", e))?;
+            let adapted = model.adapter.forward(&reshaped).map_err(|e| format!("adapter: {}", e))?;
+            new_adapter_tokens = adapted.dim(1).map_err(|e| format!("dim: {}", e))?;
+            adapter_embeds = Some(adapted);
+        }
+
+        // Save leftover for next commit
+        if leftover > 0 {
+            let leftover_t: Tensor = to_adapt.narrow(1, usable, leftover)
+                .and_then(|t| t.to_dtype(DType::F32))
+                .map_err(|e| format!("leftover: {}", e))?;
+            let flat: Tensor = leftover_t.reshape(leftover * 1280)
+                .map_err(|e| format!("reshape: {}", e))?;
+            self.enc_residual = flat.to_vec1::<f32>()
+                .map_err(|e| format!("vec: {}", e))?;
+            self.enc_residual_count = leftover;
+        } else {
+            self.enc_residual_count = 0;
+        }
+
+        if new_adapter_tokens == 0 {
+            return Ok(String::new());
+        }
+        let adapter_embeds = adapter_embeds.unwrap();
+
+        // Step 5: Decoder — prefill if not started, then decode new tokens
+        let prompt_len = 39usize;
+        let eos_token = 2u32;
+        let mut new_text_tokens = Vec::new();
+
+        if !self.decoder_started && self.total_adapter_tokens + new_adapter_tokens >= prompt_len {
+            // Prefill with streaming prefix (BOS + STREAMING_PAD)
+            let prompt_ids: Vec<u32> = std::iter::once(1u32)
+                .chain(std::iter::repeat(32u32).take(prompt_len - 1))
+                .collect();
+            let prompt_text = model.embed_tokens(&prompt_ids)
+                .map_err(|e| format!("embed: {}", e))?;
+            // Use first prompt_len adapter tokens + text
+            let prompt_audio = adapter_embeds.narrow(1, 0, prompt_len.min(new_adapter_tokens))
+                .map_err(|e| format!("narrow: {}", e))?;
+            let pl = prompt_audio.dim(1).map_err(|e| format!("dim: {}", e))?;
+            let prompt_text_slice = prompt_text.narrow(1, 0, pl)
+                .map_err(|e| format!("narrow: {}", e))?;
+            let prompt_input = prompt_audio.broadcast_add(&prompt_text_slice)
+                .map_err(|e| format!("add: {}", e))?;
+
+            // Prefill (all but last position)
+            if pl > 1 {
+                let prefill = prompt_input.narrow(1, 0, pl - 1)
+                    .map_err(|e| format!("narrow: {}", e))?;
+                let _ = model.decoder_forward(prefill, &self.ada_scales, &mut self.dec_caches)
+                    .map_err(|e| format!("prefill: {}", e))?;
+            }
+            // Last position → first token
+            let last = prompt_input.narrow(1, pl - 1, 1)
+                .map_err(|e| format!("narrow: {}", e))?;
+            let hidden = model.decoder_forward(last, &self.ada_scales, &mut self.dec_caches)
+                .map_err(|e| format!("forward: {}", e))?;
+            let logits = model.lm_head(&hidden).map_err(|e| format!("lm_head: {}", e))?;
+            self.prev_token = argmax_token(&logits)?;
+            self.generated_tokens.push(self.prev_token);
+            if self.prev_token >= 1000 { new_text_tokens.push(self.prev_token); }
+
+            self.decoder_started = true;
+
+            // Decode remaining adapter tokens from this commit
+            let decode_start = pl;
+            for j in decode_start..new_adapter_tokens {
+                let audio_pos = adapter_embeds.narrow(1, j, 1)
+                    .map_err(|e| format!("narrow: {}", e))?;
+                let text_embed = model.embed_token(self.prev_token)
+                    .map_err(|e| format!("embed: {}", e))?;
+                let x = audio_pos.broadcast_add(&text_embed)
+                    .map_err(|e| format!("add: {}", e))?;
+                let hidden = model.decoder_forward(x, &self.ada_scales, &mut self.dec_caches)
+                    .map_err(|e| format!("forward: {}", e))?;
+                let logits = model.lm_head(&hidden).map_err(|e| format!("lm_head: {}", e))?;
+                let token = argmax_token(&logits)?;
+                self.generated_tokens.push(token);
+                self.prev_token = token;
+                if token >= 1000 { new_text_tokens.push(token); }
+                if token == eos_token { break; }
+            }
+        } else if self.decoder_started {
+            // Already running — just decode new adapter tokens
+            for j in 0..new_adapter_tokens {
+                let audio_pos = adapter_embeds.narrow(1, j, 1)
+                    .map_err(|e| format!("narrow: {}", e))?;
+                let text_embed = model.embed_token(self.prev_token)
+                    .map_err(|e| format!("embed: {}", e))?;
+                let x = audio_pos.broadcast_add(&text_embed)
+                    .map_err(|e| format!("add: {}", e))?;
+                let hidden = model.decoder_forward(x, &self.ada_scales, &mut self.dec_caches)
+                    .map_err(|e| format!("forward: {}", e))?;
+                let logits = model.lm_head(&hidden).map_err(|e| format!("lm_head: {}", e))?;
+                let token = argmax_token(&logits)?;
+                self.generated_tokens.push(token);
+                self.prev_token = token;
+                if token >= 1000 { new_text_tokens.push(token); }
+                if token == eos_token { break; }
+            }
+        }
+
+        self.total_adapter_tokens += new_adapter_tokens;
+
+        let infer_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        let audio_secs = self.audio_samples.len() as f32 / 16000.0;
+
+        // Decode only new text tokens to string
+        let delta = if !new_text_tokens.is_empty() {
+            self.tokenizer.decode(
+                &new_text_tokens.iter().map(|&t| t as i32).collect::<Vec<_>>(),
+            )
         } else {
             String::new()
         };
-        self.prev_text = full_text;
+
+        eprintln!(
+            "[CandleNative] #{} {:.1}s audio, {} new adapter, {} new text → {:.0}ms \"{}\"",
+            self.commit_count, audio_secs, new_adapter_tokens,
+            new_text_tokens.len(), infer_ms,
+            if delta.len() > 60 { &delta[..60] } else { &delta }
+        );
+
         Ok(delta)
     }
 
     fn reset(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.audio_buffer.clear();
-        self.prev_text.clear();
+        // Keep audio, reset encoder+decoder state (context rotation)
+        self.processed_conv_frames = 0;
+        self.enc_caches = VoxtralModel::new_encoder_caches();
+        self.enc_residual.clear();
+        self.enc_residual_count = 0;
+        self.dec_caches = (0..26).map(|_| KVCache::new()).collect();
+        self.prev_token = 0;
+        self.decoder_started = false;
+        self.total_adapter_tokens = 0;
+        self.generated_tokens.clear();
         self.commit_count = 0;
+        // Re-start with left-pad silence
+        let left_pad = 32 * 1280;
+        self.audio_samples = vec![0.0f32; left_pad];
         Ok(())
     }
 
@@ -219,13 +375,12 @@ impl InferenceSession for CandleNativeSession {
     }
 }
 
-/// Find the length of the longest suffix of `prev` that is a prefix of `curr`.
-fn find_overlap(prev: &str, curr: &str) -> usize {
-    let max_check = prev.len().min(curr.len());
-    for len in (1..=max_check).rev() {
-        if prev.ends_with(&curr[..len]) {
-            return len;
-        }
-    }
-    0
+fn argmax_token(logits: &Tensor) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+    let logits_f32: Vec<f32> = logits.to_dtype(DType::F32)
+        .and_then(|t| t.reshape(131072))
+        .and_then(|t| t.to_vec1())
+        .map_err(|e| format!("argmax: {}", e))?;
+    Ok(logits_f32.iter().enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as u32).unwrap_or(0))
 }

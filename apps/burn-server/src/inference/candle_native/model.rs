@@ -62,7 +62,7 @@ fn linear_b(in_dim: usize, out_dim: usize, has_bias: bool, vb: VarBuilder) -> Re
 
 // Custom RmsNorm matching burn's formula: x / sqrt(mean(x²) + eps) * weight
 // candle-nn's RmsNorm uses: x / (sqrt(mean(x²)) + eps) * weight (eps OUTSIDE sqrt)
-struct BurnRmsNorm {
+pub struct BurnRmsNorm {
     weight: Tensor,
     eps: f64,
 }
@@ -90,7 +90,7 @@ impl Module for BurnRmsNorm {
 
 // ─── RoPE ───────────────────────────────────────────────────────────────────
 
-struct RoPE {
+pub struct RoPE {
     cos: Tensor,
     sin: Tensor,
 }
@@ -147,9 +147,9 @@ impl RoPE {
 pub struct KVCache {
     k: Option<Tensor>,
     v: Option<Tensor>,
-    seq_len: usize,
+    pub seq_len: usize,
     /// Logical position offset (for when cache is compacted)
-    pos_offset: usize,
+    pub pos_offset: usize,
 }
 
 impl KVCache {
@@ -161,7 +161,7 @@ impl KVCache {
     fn logical_len(&self) -> usize { self.pos_offset + self.seq_len }
 
     /// Compact: keep only the last `keep` positions. Updates pos_offset.
-    fn compact(&mut self, keep: usize) -> Result<()> {
+    pub fn compact(&mut self, keep: usize) -> Result<()> {
         if self.seq_len <= keep { return Ok(()); }
         let drop = self.seq_len - keep;
         if let (Some(ck), Some(cv)) = (&self.k, &self.v) {
@@ -292,7 +292,7 @@ impl EncoderSwiGLU {
     }
 }
 
-struct EncoderLayer {
+pub struct EncoderLayer {
     attention_norm: BurnRmsNorm,
     attention: EncoderAttention,
     ffn_norm: BurnRmsNorm,
@@ -308,7 +308,7 @@ impl EncoderLayer {
         Ok(Self { attention_norm, attention, ffn_norm, ffn })
     }
 
-    fn forward(&self, x: &Tensor, rope: &RoPE, cache: &mut KVCache) -> Result<Tensor> {
+    pub fn forward(&self, x: &Tensor, rope: &RoPE, cache: &mut KVCache) -> Result<Tensor> {
         let residual = x.clone();
         let x = self.attention_norm.forward(x)?;
         let x = (self.attention.forward_with_cache(&x, rope, cache)? + &residual)?;
@@ -321,7 +321,7 @@ impl EncoderLayer {
 
 // ─── Audio Encoder ──────────────────────────────────────────────────────────
 
-struct ConvDownsampler {
+pub struct ConvDownsampler {
     conv1_weight: Tensor,
     conv1_bias: Tensor,
     conv2_weight: Tensor,
@@ -338,7 +338,7 @@ impl ConvDownsampler {
     }
 
     /// mel [B, 128, T] → [B, 1280, T/2] → transposed to [B, T/2, 1280]
-    fn forward(&self, mel: &Tensor) -> Result<Tensor> {
+    pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
         // Conv1: causal left-pad by (kernel - stride) = 3 - 1 = 2
         let x = mel.pad_with_zeros(2, 2, 0)?; // dim=2, left=2, right=0
         let x = x.conv1d(&self.conv1_weight, 0, 1, 1, 1)?;
@@ -354,10 +354,10 @@ impl ConvDownsampler {
 }
 
 pub struct AudioEncoder {
-    conv: ConvDownsampler,
-    rope: RoPE,
-    layers: Vec<EncoderLayer>,
-    norm: BurnRmsNorm,
+    pub conv: ConvDownsampler,
+    pub rope: RoPE,
+    pub layers: Vec<EncoderLayer>,
+    pub norm: BurnRmsNorm,
 }
 
 impl AudioEncoder {
@@ -383,7 +383,7 @@ impl AudioEncoder {
 
 // ─── Adapter ────────────────────────────────────────────────────────────────
 
-struct AudioLanguageAdapter {
+pub struct AudioLanguageAdapter {
     linear1: Linear,
     linear2: Linear,
 }
@@ -397,7 +397,7 @@ impl AudioLanguageAdapter {
         Ok(Self { linear1, linear2 })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = self.linear1.forward(x)?.gelu()?;
         self.linear2.forward(&x)
     }
@@ -612,12 +612,12 @@ impl DecoderLayer {
 // ─── Full Model ─────────────────────────────────────────────────────────────
 
 pub struct VoxtralModel {
-    encoder: AudioEncoder,
-    adapter: AudioLanguageAdapter,
+    pub encoder: AudioEncoder,
+    pub adapter: AudioLanguageAdapter,
     decoder_layers: Vec<DecoderLayer>,
     decoder_norm: BurnRmsNorm,
     decoder_rope: RoPE,
-    tok_embed: Tensor,  // [vocab, d_model] on GPU
+    tok_embed: Tensor,
     device: Device,
 }
 
@@ -740,7 +740,7 @@ impl VoxtralModel {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-fn reshape_encoder_output(x: &Tensor, factor: usize) -> Result<Tensor> {
+pub fn reshape_encoder_output(x: &Tensor, factor: usize) -> Result<Tensor> {
     let (batch, seq, dim) = x.dims3()?;
     let new_seq = seq / factor;
     let truncated = new_seq * factor;
