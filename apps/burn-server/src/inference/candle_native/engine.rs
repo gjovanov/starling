@@ -143,18 +143,19 @@ impl InferenceSession for CandleNativeSession {
         let t0 = Instant::now();
 
         // Need minimum audio for encoder to produce anything useful
-        // 39 prompt tokens * 4 (pool) * 2 (conv stride) * 160 (mel hop) = ~50000 samples
         if self.audio_samples.len() < 50000 {
+            if self.commit_count <= 3 || self.commit_count % 20 == 0 {
+                eprintln!("[CandleNative] #{} waiting ({} samples < 50000)", self.commit_count, self.audio_samples.len());
+            }
             return Ok(String::new());
         }
 
         let model = self.model.lock().map_err(|e| format!("lock: {}", e))?;
 
-        // Step 1: Compute mel for ALL accumulated audio (fast, no attention)
-        // Add right padding for the current audio length
-        let audio_buf = AudioBuffer::new(self.audio_samples.clone(), 16000);
-        let padded = crate::audio::pad::pad_audio_right_only(&audio_buf, &self.pad_config);
-        let log_mel = self.mel_spec.compute_log(&padded.samples);
+        // Step 1: Compute mel for accumulated audio (no right-pad on intermediate commits)
+        // Right-pad would contaminate boundary mel frames. The mel STFT handles edges
+        // with reflect padding. New frames arriving later fix any boundary artifacts.
+        let log_mel = self.mel_spec.compute_log(&self.audio_samples);
         let n_frames = log_mel.len();
         let n_mels = if n_frames > 0 { log_mel[0].len() } else { 128 };
         if n_frames == 0 { return Ok(String::new()); }
@@ -178,13 +179,20 @@ impl InferenceSession for CandleNativeSession {
         let total_aligned = (total_conv / 4) * 4;
 
         // How many NEW conv frames since last commit?
+        // Leave a margin at the edge — boundary frames may change when more audio arrives.
+        // Conv kernel=3 + mel STFT window extends ~4 conv frames. Use margin of 8.
+        let safe_boundary = 8;
+        let safe_end = if total_aligned > safe_boundary { total_aligned - safe_boundary } else { 0 };
+        let safe_aligned = (safe_end / 4) * 4; // re-align to 4
+
         let new_start = self.processed_conv_frames;
-        if new_start >= total_aligned {
-            return Ok(String::new()); // no new frames
+        if new_start >= safe_aligned {
+            return Ok(String::new()); // no stable new frames yet
         }
-        let new_conv = conv_out.narrow(1, new_start, total_aligned - new_start)
+        let new_conv = conv_out.narrow(1, new_start, safe_aligned - new_start)
             .map_err(|e| format!("narrow: {}", e))?;
-        let new_len = total_aligned - new_start;
+        let new_len = safe_aligned - new_start;
+        self.processed_conv_frames = safe_aligned;
 
         // Step 3: Encoder on NEW conv frames only (with KV cache)
         let sliding_window = 750;
@@ -202,7 +210,6 @@ impl InferenceSession for CandleNativeSession {
         }
         let enc_out = model.encoder.norm.forward(&x)
             .map_err(|e| format!("enc norm: {}", e))?;
-        self.processed_conv_frames = total_aligned;
 
         // Step 4: Adapter (4x reshape) with residual handling
         let enc_frames = enc_out.dim(1).map_err(|e| format!("dim: {}", e))?;
@@ -332,6 +339,12 @@ impl InferenceSession for CandleNativeSession {
 
         let infer_ms = t0.elapsed().as_secs_f32() * 1000.0;
         let audio_secs = self.audio_samples.len() as f32 / 16000.0;
+
+        // Debug: show ALL generated tokens, not just text
+        {
+            let recent: Vec<u32> = self.generated_tokens.iter().rev().take(10).copied().collect();
+            eprintln!("[CandleNative] recent tokens (last 10): {:?}", recent);
+        }
 
         // Decode only new text tokens to string
         let delta = if !new_text_tokens.is_empty() {
