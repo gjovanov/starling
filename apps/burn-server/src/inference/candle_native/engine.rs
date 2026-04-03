@@ -110,24 +110,24 @@ impl InferenceSession for CandleNativeSession {
             return Ok(String::new());
         }
 
-        // Build mel tensor [1, n_mels, n_frames] as bf16
+        // Build mel tensor [1, n_mels, n_frames] as BF16
         let mut flat = vec![0.0f32; n_mels * n_frames];
         for (t, frame) in log_mel.iter().enumerate() {
             for (m, &val) in frame.iter().enumerate() {
                 flat[m * n_frames + t] = val;
             }
         }
-        // F32 — matching burn-candle which operates entirely in f32
         let mel_tensor = Tensor::new(flat, &self.device)
+            .and_then(|t| t.to_dtype(DType::BF16))
             .and_then(|t| t.reshape((1, n_mels, n_frames)))
             .map_err(|e| format!("Mel tensor: {}", e))?;
 
         let t_embed = model::compute_time_embedding(6.0, 3072, &self.device)
             .map_err(|e| format!("t_embed: {}", e))?;
 
-        // Run inference
+        // Run streaming inference (chunked encoder + context rotation)
         let model = self.model.lock().map_err(|e| format!("lock: {}", e))?;
-        let token_ids = model::transcribe(&model, &mel_tensor, &t_embed)
+        let token_ids = model::transcribe_streaming(&model, &mel_tensor, &t_embed)
             .map_err(|e| format!("CandleNative transcribe: {}", e))?;
 
         let full_text = self.tokenizer.decode(
