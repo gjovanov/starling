@@ -936,40 +936,62 @@ pub fn transcribe_streaming(model: &VoxtralModel, mel: &Tensor, t_embed: &Tensor
     eprintln!("[Streaming] Encoder: {} adapter tokens, {} chunks ({:.2}s)",
         audio_seq, (n_conv + enc_chunk_size - 1) / enc_chunk_size, t_enc.elapsed().as_secs_f32());
 
-    // Step 3: Decoder (same as non-streaming transcribe)
-    let mut dec_caches: Vec<KVCache> = (0..26).map(|_| KVCache::new()).collect();
+    // Step 3: Decoder with context rotation
     let ada_scales = model.precompute_ada_scales(t_embed)?;
-
-    // Prompt: BOS(1) + STREAMING_PAD(32)*38 = 39 tokens
     let prompt_len = 39usize.min(audio_seq);
     let prompt_ids: Vec<u32> = std::iter::once(1u32)
         .chain(std::iter::repeat(32u32).take(prompt_len - 1))
         .collect();
+    let rotation_interval = 1250; // ~100s of audio (12.5 tokens/s × 100s)
+    let eos_token = 2u32;
 
-    // Prefill prompt (audio + text)
-    let prefill_count = prompt_len - 1;
-    let prompt_audio = audio_embeds.narrow(1, 0, prompt_len)?;
-    let prompt_text = model.embed_tokens(&prompt_ids)?;
-    let prompt_input = (&prompt_audio + &prompt_text)?;
+    // Helper: prefill decoder with streaming prefix at given audio offset
+    let prefill_decoder = |dec_caches: &mut Vec<KVCache>, audio_offset: usize| -> Result<u32> {
+        let pl = prompt_len.min(audio_seq - audio_offset);
+        let prompt_audio = audio_embeds.narrow(1, audio_offset, pl)?;
+        let prompt_text = model.embed_tokens(&prompt_ids[..pl])?;
+        let prompt_input = (&prompt_audio + &prompt_text)?;
+        let prefill_count = pl - 1;
+        let _h = model.decoder_forward(prompt_input.narrow(1, 0, prefill_count)?, &ada_scales, dec_caches)?;
+        let last_h = model.decoder_forward(prompt_input.narrow(1, prefill_count, 1)?, &ada_scales, dec_caches)?;
+        let logits = model.lm_head(&last_h)?;
+        let logits_f32: Vec<f32> = logits.to_dtype(DType::F32)?.reshape(131072)?.to_vec1()?;
+        Ok(logits_f32.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32).unwrap_or(0))
+    };
 
     let t_dec = Instant::now();
-    let prefill_input = prompt_input.narrow(1, 0, prefill_count)?;
-    let _prefill_hidden = model.decoder_forward(prefill_input, &ada_scales, &mut dec_caches)?;
-    let last_input = prompt_input.narrow(1, prefill_count, 1)?;
-    let last_hidden = model.decoder_forward(last_input, &ada_scales, &mut dec_caches)?;
-    let prompt_logits = model.lm_head(&last_hidden)?;
-
-    let last_logits: Vec<f32> = prompt_logits.to_dtype(DType::F32)?.reshape(131072)?.to_vec1()?;
-    let mut prev_token = last_logits.iter().enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i as u32).unwrap_or(0);
-
-    // Autoregressive decode
-    let eos_token = 2u32;
+    let mut dec_caches: Vec<KVCache> = (0..26).map(|_| KVCache::new()).collect();
+    let mut prev_token = prefill_decoder(&mut dec_caches, 0)?;
     let mut generated = Vec::with_capacity(audio_seq);
     generated.push(prev_token);
+    let mut steps_since_rotation = 0usize;
+    let mut n_rotations = 0usize;
 
     for i in prompt_len..audio_seq {
+        // Context rotation: reset decoder caches, re-prefill from current position
+        if steps_since_rotation >= rotation_interval {
+            dec_caches = (0..26).map(|_| KVCache::new()).collect();
+            let re_start = i.saturating_sub(prompt_len); // overlap prompt with recent audio
+            prev_token = prefill_decoder(&mut dec_caches, re_start)?;
+            // Skip the prompt positions (already covered by prefill)
+            let skip_to = re_start + prompt_len;
+            for j in (re_start + prompt_len)..i {
+                if j >= audio_seq { break; }
+                let ap = audio_embeds.narrow(1, j, 1)?;
+                let te = model.embed_token(prev_token)?;
+                let h = model.decoder_forward((&ap + &te)?, &ada_scales, &mut dec_caches)?;
+                let logits = model.lm_head(&h)?;
+                let lf: Vec<f32> = logits.to_dtype(DType::F32)?.reshape(131072)?.to_vec1()?;
+                prev_token = lf.iter().enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(idx, _)| idx as u32).unwrap_or(0);
+            }
+            steps_since_rotation = 0;
+            n_rotations += 1;
+        }
+
         let audio_pos = audio_embeds.narrow(1, i, 1)?;
         let text_embed = model.embed_token(prev_token)?;
         let x = (&audio_pos + &text_embed)?;
@@ -983,6 +1005,7 @@ pub fn transcribe_streaming(model: &VoxtralModel, mel: &Tensor, t_embed: &Tensor
 
         generated.push(token);
         prev_token = token;
+        steps_since_rotation += 1;
         if token == eos_token { break; }
     }
 
@@ -992,8 +1015,8 @@ pub fn transcribe_streaming(model: &VoxtralModel, mel: &Tensor, t_embed: &Tensor
     let total_s = t0.elapsed().as_secs_f32();
     let audio_secs = audio_seq as f32 / 12.5;
     let text_tokens: Vec<u32> = generated.iter().copied().filter(|&t| t >= 1000).collect();
-    eprintln!("[Streaming] Decode: {} steps, {}ms, {:.1}ms/step, {} text tokens",
-        n_steps, decode_ms, ms_per_step, text_tokens.len());
+    eprintln!("[Streaming] Decode: {} steps, {}ms, {:.1}ms/step, {} text tokens, {} rotations",
+        n_steps, decode_ms, ms_per_step, text_tokens.len(), n_rotations);
     eprintln!("[Streaming] Total: {:.1}s ({:.1}× realtime for {:.0}s audio)",
         total_s, total_s / audio_secs, audio_secs);
 
