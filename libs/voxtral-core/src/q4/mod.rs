@@ -24,6 +24,7 @@ pub mod op;
 pub mod model;
 pub mod loader;
 pub mod engine;
+pub mod incremental_engine;
 
 pub use reader::{GgmlDtype, GgufReader, GgufTensorInfo, ShardedCursor};
 pub use tensor::Q4Tensor;

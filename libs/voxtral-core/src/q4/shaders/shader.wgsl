@@ -16,7 +16,9 @@
 @group(0) @binding(0) var<storage, read_write> weights: array<u32>;
 @group(0) @binding(1) var<storage, read_write> input: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
-@group(0) @binding(3) var<storage, read_write> info: array<u32>;
+// info must be `read` (not read_write) so that values derived from it are
+// considered uniform by WebGPU's WGSL validator — required for workgroupBarrier().
+@group(0) @binding(3) var<storage, read> info: array<u32>;
 
 // Tile size for K-dimension shared memory. Must be a multiple of 32 (Q4 block size).
 const TILE_K: u32 = 512u;

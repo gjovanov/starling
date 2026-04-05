@@ -5,14 +5,16 @@
  * Emits events: 'subtitle', 'status', 'error'
  */
 
-/** Default chunk commit interval in milliseconds (3s of audio for better quality) */
-const COMMIT_INTERVAL_MS = 3000;
+/** Default chunk commit interval in milliseconds.
+ *  With incremental encoder KV cache, each commit only processes new frames,
+ *  so 1s chunks are feasible without re-encoding all audio. */
+const COMMIT_INTERVAL_MS = 1000;
 
 /** Sample rate expected by the WASM engine */
 const SAMPLE_RATE = 16000;
 
 /** Samples per commit interval */
-const SAMPLES_PER_COMMIT = (SAMPLE_RATE * COMMIT_INTERVAL_MS) / 1000; // 48000
+const SAMPLES_PER_COMMIT = (SAMPLE_RATE * COMMIT_INTERVAL_MS) / 1000; // 16000
 
 export class WasmSession {
   constructor() {

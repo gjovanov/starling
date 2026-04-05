@@ -482,6 +482,31 @@ impl Q4AudioEncoder {
         self.norm.forward(x)
     }
 
+    /// Run only the conv downsampler (no attention layers or norm).
+    ///
+    /// Returns `[batch, conv_frames, 1280]` (already transposed to seq-major).
+    pub fn conv_forward(&self, mel: Tensor<WgpuBackend, 3>) -> Tensor<WgpuBackend, 3> {
+        let x = self.conv.forward(mel);
+        x.swap_dims(1, 2) // [batch, channels, time] -> [batch, time, channels]
+    }
+
+    /// Run only the attention layers + final norm on pre-convolved frames with KV cache.
+    ///
+    /// Input: `[batch, new_frames, 1280]` — new conv frames not yet seen by encoder.
+    /// The KV caches accumulate state across calls.
+    pub fn layers_forward_with_cache(
+        &self,
+        mut x: Tensor<WgpuBackend, 3>,
+        caches: &mut LayerCaches<WgpuBackend>,
+    ) -> Tensor<WgpuBackend, 3> {
+        for (i, layer) in self.layers.iter().enumerate() {
+            if let Some(cache) = caches.get_mut(i) {
+                x = layer.forward_with_cache(x, &self.rope, cache);
+            }
+        }
+        self.norm.forward(x)
+    }
+
     /// Get the number of layers.
     pub fn n_layers(&self) -> usize {
         self.layers.len()
@@ -1369,6 +1394,32 @@ impl Q4VoxtralModel {
             &generated[PREFIX_LEN.min(generated.len())..generated.len().min(PREFIX_LEN + 20)]
         );
         Ok(generated.into_iter().skip(PREFIX_LEN).collect())
+    }
+
+    /// Run only the encoder conv downsampler.
+    ///
+    /// Returns `[batch, conv_frames, 1280]` (seq-major).
+    pub fn encoder_conv(&self, mel: Tensor<WgpuBackend, 3>) -> Tensor<WgpuBackend, 3> {
+        self.encoder.conv_forward(mel)
+    }
+
+    /// Run encoder attention layers + norm on new conv frames with KV cache.
+    pub fn encoder_layers_with_cache(
+        &self,
+        x: Tensor<WgpuBackend, 3>,
+        encoder_cache: &mut LayerCaches<WgpuBackend>,
+    ) -> Tensor<WgpuBackend, 3> {
+        self.encoder.layers_forward_with_cache(x, encoder_cache)
+    }
+
+    /// Run the adapter on reshaped encoder output.
+    pub fn adapter_forward(&self, x: Tensor<WgpuBackend, 3>) -> Tensor<WgpuBackend, 3> {
+        self.adapter.forward(x)
+    }
+
+    /// Get the reshape factor (encoder frames grouped per adapter token).
+    pub fn reshape_factor(&self) -> usize {
+        self.reshape_factor
     }
 
     /// Get a reference to the encoder.
