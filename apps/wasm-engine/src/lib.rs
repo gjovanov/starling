@@ -124,10 +124,27 @@ impl WasmEngine {
     /// This is async because WebGPU readback requires async on WASM.
     #[wasm_bindgen]
     pub async fn commit(&mut self) -> Result<String, JsValue> {
-        self.session
+        let delta = self.session
             .commit()
             .await
-            .map_err(|e| JsValue::from_str(&format!("Inference failed: {}", e)))
+            .map_err(|e| JsValue::from_str(&format!("Inference failed: {}", e)))?;
+
+        let tokens = self.session.generated_tokens();
+        let last_20: Vec<i32> = tokens.iter().rev().take(20).rev().cloned().collect();
+        web_sys::console::log_1(
+            &format!(
+                "[wasm-engine] commit #{}: adapter={} decoder_started={} total_tokens={} last20={:?} delta={:?}",
+                self.session.commit_count(),
+                self.session.total_adapter_tokens(),
+                self.session.decoder_started(),
+                tokens.len(),
+                last_20,
+                &delta[..delta.len().min(80)]
+            )
+            .into(),
+        );
+
+        Ok(delta)
     }
 
     /// Reset session state (clear audio buffer, KV caches, text history).

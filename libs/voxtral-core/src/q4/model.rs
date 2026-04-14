@@ -955,6 +955,11 @@ impl Q4VoxtralModel {
         t_embed_decoder: Tensor<WgpuBackend, 3>,
     ) -> Vec<i32> {
         let _span = tracing::info_span!("transcribe_streaming").entered();
+        // Note: DIAG_LOGITS env var not available in WASM, diagnostics only in native build
+        #[cfg(not(target_arch = "wasm32"))]
+        let diag = std::env::var("DIAG_LOGITS").is_ok();
+        #[cfg(target_arch = "wasm32")]
+        let diag = false;
 
         let audio_embeds = self.encode_audio(mel);
         let [_, seq_len, d_model] = audio_embeds.dims();
@@ -967,42 +972,29 @@ impl Q4VoxtralModel {
             return Vec::new();
         }
 
+        // Diagnostic: encoder output at key positions
+        if diag {
+            let enc_pos0 = audio_embeds.clone().slice([0..1, 0..1, 0..d_model]).reshape([d_model]);
+            let data0 = enc_pos0.into_data();
+            let v0 = data0.as_slice::<f32>().unwrap_or(&[]);
+            let enc_first8: Vec<String> = v0[..8.min(v0.len())].iter().map(|v| format!("{:.4}", v)).collect();
+            let enc_norm0: f32 = v0.iter().map(|x| x * x).sum::<f32>().sqrt();
+            eprintln!("[DIAG Q4] encoder_out[0,0,:8]=[{}] L2_norm={:.4}", enc_first8.join(", "), enc_norm0);
+        }
+
         let mut prefix: Vec<i32> = vec![BOS_TOKEN];
         prefix.extend(std::iter::repeat_n(STREAMING_PAD, PREFIX_LEN - 1));
 
-        // Use embed_tokens_from_ids for the prefix to skip unnecessary
-        // GPU round-trip (the prefix tokens are known CPU-side).
         let prefix_text_embeds = self.decoder.embed_tokens_from_ids(&prefix, 1, PREFIX_LEN);
 
-        // Diagnostic: check embedding norms for key tokens
-        {
-            let test_ids: Vec<i32> = vec![1, 32, 33, 416, 673, 728, 1044, 1261, 5000, 10000];
-            let test_embeds = self.decoder.embed_tokens_from_ids(&test_ids, 1, test_ids.len());
-            let data = test_embeds.into_data();
+        // Diagnostic: token 32 embedding
+        if diag {
+            let tok32_embed = self.decoder.embed_tokens_from_ids(&[32], 1, 1).reshape([d_model]);
+            let data = tok32_embed.into_data();
             let vals = data.as_slice::<f32>().unwrap_or(&[]);
-            for (i, &id) in test_ids.iter().enumerate() {
-                let row = &vals[i * d_model..(i + 1) * d_model];
-                let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
-                let nonzero = row.iter().filter(|&&v| v.abs() > 1e-10).count();
-                eprintln!("[Q4Model] embed_norm: token {} → L2={:.4} nonzero={}/{}", id, norm, nonzero, d_model);
-            }
-        }
-
-        // Diagnostic: check prefix text embedding
-        {
-            let flat = prefix_text_embeds.clone().reshape([PREFIX_LEN * d_model]);
-            let data = flat.into_data();
-            let vals = data.as_slice::<f32>().unwrap_or(&[]);
-            let nonzero = vals.iter().filter(|&&v| v.abs() > 1e-10).count();
-            let min_v = vals.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max_v = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mean = vals.iter().sum::<f32>() / vals.len().max(1) as f32;
-            // Check first few values of token 32 embedding
-            let first10: Vec<String> = vals[d_model..d_model+10.min(vals.len())].iter().map(|v| format!("{:.4}", v)).collect();
-            eprintln!(
-                "[Q4Model] prefix_text_embeds: [{}, {}, {}] nonzero={}/{} min={:.4} max={:.4} mean={:.6} tok32_first10=[{}]",
-                1, PREFIX_LEN, d_model, nonzero, vals.len(), min_v, max_v, mean, first10.join(", ")
-            );
+            let tok32_first8: Vec<String> = vals[..8.min(vals.len())].iter().map(|v| format!("{:.4}", v)).collect();
+            let tok32_norm: f32 = vals.iter().map(|x| x * x).sum::<f32>().sqrt();
+            eprintln!("[DIAG Q4] tok32_embed[:8]=[{}] L2_norm={:.4}", tok32_first8.join(", "), tok32_norm);
         }
 
         let prefix_audio = audio_embeds
@@ -1011,77 +1003,46 @@ impl Q4VoxtralModel {
 
         let prefix_inputs = prefix_audio + prefix_text_embeds;
 
-        // Pre-allocate KV cache to the known sequence length to avoid
-        // 52 growing Tensor::cat allocations per decode step (26 layers x K + V).
         let mut decoder_cache = self.decoder.create_cache_preallocated(seq_len);
 
-        // Diagnostic: check prefix_inputs (audio + text)
-        {
-            let flat = prefix_inputs.clone().reshape([PREFIX_LEN * d_model]);
-            let data = flat.into_data();
-            let vals = data.as_slice::<f32>().unwrap_or(&[]);
-            let nonzero = vals.iter().filter(|&&v| v.abs() > 1e-10).count();
-            let min_v = vals.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max_v = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            eprintln!("[Q4Model] prefix_inputs (audio+text): nonzero={}/{} min={:.4} max={:.4}", nonzero, vals.len(), min_v, max_v);
-        }
-
+        // Prefill one token at a time (NOT batched).
+        // Q4 attention explodes during multi-token prefill (M>1): quantization
+        // noise in Q/K projections creates correlated errors across positions
+        // that amplify through softmax, destroying hidden states by layer ~6.
+        // Single-token (M=1) decode is numerically stable.
         let hidden = {
             let _prefill = tracing::info_span!("prefill").entered();
-            self.decoder.forward_hidden_with_cache(
-                prefix_inputs,
-                t_embed_decoder.clone(),
-                &mut decoder_cache,
-            )
+            let mut last_hidden = prefix_inputs.clone().slice([0..1, 0..1, 0..d_model]);
+            for pos in 0..PREFIX_LEN {
+                let input = prefix_inputs.clone().slice([0..1, pos..pos + 1, 0..d_model]);
+                last_hidden = self.decoder.forward_hidden_with_cache(
+                    input,
+                    t_embed_decoder.clone(),
+                    &mut decoder_cache,
+                );
+            }
+            last_hidden
         };
 
-        // Diagnostic: check hidden states after decoder
-        {
+        // Diagnostic: hidden state at last prefill position
+        if diag {
             let [_, hseq, hdim] = hidden.dims();
             let last_hidden = hidden.clone().slice([0..1, (hseq-1)..hseq, 0..hdim]).reshape([hdim]);
             let data = last_hidden.into_data();
             let vals = data.as_slice::<f32>().unwrap_or(&[]);
-            let nonzero = vals.iter().filter(|&&v| v.abs() > 1e-10).count();
-            let min_v = vals.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max_v = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mean = vals.iter().sum::<f32>() / vals.len().max(1) as f32;
-            let first10: Vec<String> = vals[..10.min(vals.len())].iter().map(|v| format!("{:.4}", v)).collect();
-            eprintln!(
-                "[Q4Model] hidden_last_pos: nonzero={}/{} min={:.4} max={:.4} mean={:.6} first10=[{}]",
-                nonzero, vals.len(), min_v, max_v, mean, first10.join(", ")
-            );
+            let first8: Vec<String> = vals[..8.min(vals.len())].iter().map(|v| format!("{:.4}", v)).collect();
+            let hidden_norm: f32 = vals.iter().map(|x| x * x).sum::<f32>().sqrt();
+            eprintln!("[DIAG Q4] hidden_last_prefill[:8]=[{}] L2_norm={:.4}", first8.join(", "), hidden_norm);
         }
 
         let logits = self.decoder.lm_head(hidden);
 
         let vocab_size = logits.dims()[2];
-        let last_logits =
-            logits
-                .clone()
-                .slice([0..1, (PREFIX_LEN - 1)..PREFIX_LEN, 0..vocab_size]);
-        let first_pred = last_logits.clone().argmax(2);
+        // hidden is already [1, 1, d_model] from single-token decode
+        let first_pred = logits.clone().argmax(2);
         let first_token: i32 = first_pred.into_scalar().elem();
 
-        // Diagnostic: check logit distribution after prefill
-        {
-            let logit_flat = last_logits.clone().reshape([vocab_size]);
-            let logit_data = logit_flat.into_data();
-            let vals = logit_data.as_slice::<f32>().unwrap_or(&[]);
-            if !vals.is_empty() {
-                let mut indexed: Vec<(usize, f32)> = vals.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let top5: Vec<String> = indexed.iter().take(5).map(|(i, v)| format!("{}:{:.3}", i, v)).collect();
-                let bot5: Vec<String> = indexed.iter().rev().take(5).map(|(i, v)| format!("{}:{:.3}", i, v)).collect();
-                let min_v = vals.iter().cloned().fold(f32::INFINITY, f32::min);
-                let max_v = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mean_v: f32 = vals.iter().sum::<f32>() / vals.len() as f32;
-                let nonzero = vals.iter().filter(|&&v| v.abs() > 1e-10).count();
-                eprintln!(
-                    "[Q4Model] prefill logits: vocab={} nonzero={} min={:.4} max={:.4} mean={:.4} top5=[{}] bot5=[{}] first_token={}",
-                    vocab_size, nonzero, min_v, max_v, mean_v, top5.join(", "), bot5.join(", "), first_token
-                );
-            }
-        }
+        // Diagnostic logits removed (batch prefill replaced with sequential)
 
         let mut generated = prefix;
         generated.push(first_token);
@@ -1246,13 +1207,22 @@ impl Q4VoxtralModel {
             );
         }
 
+        // Prefill one token at a time (NOT batched).
+        // Q4 attention explodes during multi-token prefill (M>1): quantization
+        // noise in Q/K projections creates correlated errors across positions
+        // that amplify through softmax, destroying hidden states by layer ~6.
         let hidden = {
             let _prefill = tracing::info_span!("prefill").entered();
-            self.decoder.forward_hidden_with_cache(
-                prefix_inputs,
-                t_embed_decoder.clone(),
-                &mut decoder_cache,
-            )
+            let mut last_hidden = prefix_inputs.clone().slice([0..1, 0..1, 0..d_model]);
+            for pos in 0..PREFIX_LEN {
+                let input = prefix_inputs.clone().slice([0..1, pos..pos + 1, 0..d_model]);
+                last_hidden = self.decoder.forward_hidden_with_cache(
+                    input,
+                    t_embed_decoder.clone(),
+                    &mut decoder_cache,
+                );
+            }
+            last_hidden
         };
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -1288,12 +1258,8 @@ impl Q4VoxtralModel {
 
         let logits = self.decoder.lm_head(hidden);
 
-        let vocab_size = logits.dims()[2];
-        let last_logits =
-            logits
-                .clone()
-                .slice([0..1, (PREFIX_LEN - 1)..PREFIX_LEN, 0..vocab_size]);
-        let first_pred = last_logits.clone().argmax(2);
+        // hidden is [1, 1, d_model] from single-token prefill — logits are [1, 1, vocab]
+        let first_pred = logits.clone().argmax(2);
         let first_token_data = first_pred
             .into_data_async()
             .await
@@ -1302,40 +1268,7 @@ impl Q4VoxtralModel {
             .to_vec::<i32>()
             .map_err(|e| format!("first token extraction failed: {:?}", e))?[0];
 
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let logit_flat = last_logits.clone().reshape([vocab_size]);
-            let logit_data = logit_flat
-                .into_data_async()
-                .await
-                .map_err(|e| format!("GPU readback failed (logit diag): {:?}", e))?;
-            let vals = logit_data.as_slice::<f32>().unwrap_or(&[]);
-            if !vals.is_empty() {
-                let mut indexed: Vec<(usize, f32)> =
-                    vals.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-                indexed
-                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let top5: Vec<String> = indexed
-                    .iter()
-                    .take(5)
-                    .map(|(i, v)| format!("{}:{:.3}", i, v))
-                    .collect();
-                let bot5: Vec<String> = indexed
-                    .iter()
-                    .rev()
-                    .take(5)
-                    .map(|(i, v)| format!("{}:{:.3}", i, v))
-                    .collect();
-                let min_v = vals.iter().cloned().fold(f32::INFINITY, f32::min);
-                let max_v = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mean_v: f32 = vals.iter().sum::<f32>() / vals.len() as f32;
-                let nonzero = vals.iter().filter(|&&v| v.abs() > 1e-10).count();
-                eprintln!(
-                    "[Q4Model] prefill logits: vocab={} nonzero={} min={:.4} max={:.4} mean={:.4} top5=[{}] bot5=[{}] first_token={}",
-                    vocab_size, nonzero, min_v, max_v, mean_v, top5.join(", "), bot5.join(", "), first_token
-                );
-            }
-        }
+        // Diagnostic logits removed (used stale variable names from batch prefill)
 
         eprintln!(
             "[Q4Model] prefill done, first_token={}, starting decode ({} steps)",

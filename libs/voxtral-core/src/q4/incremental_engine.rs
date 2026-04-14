@@ -316,11 +316,15 @@ impl Q4IncrementalSession {
             let prefix_text_slice = prefix_text.slice([0..1, 0..pl, 0..d_model]);
             let prefix_input = prefix_audio + prefix_text_slice;
 
-            // Prefill (all but last position)
-            if pl > 1 {
-                let prefill = prefix_input.clone().slice([0..1, 0..pl - 1, 0..d_model]);
+            // Prefill one token at a time (NOT batched).
+            // Q4 attention explodes during multi-token prefill (M>1): quantization
+            // noise in Q/K projections creates correlated errors across positions that
+            // amplify through softmax, destroying hidden states by layer ~6.
+            // Single-token (M=1) decode uses the tiled kernel and is numerically stable.
+            for j in 0..pl - 1 {
+                let pos = prefix_input.clone().slice([0..1, j..j + 1, 0..d_model]);
                 let _ = self.model.decoder().forward_hidden_with_cache(
-                    prefill,
+                    pos,
                     self.t_embed.clone(),
                     &mut self.decoder_caches,
                 );
@@ -424,17 +428,44 @@ impl Q4IncrementalSession {
         Ok(delta)
     }
 
-    /// Async argmax: read logits back from GPU and find the maximum.
+    /// Async argmax with Q4 logit correction.
+    ///
+    /// Masks out STREAMING_PAD (32) during autoregressive decoding because
+    /// Q4 quantization noise shifts logits just enough that token 32 wins
+    /// the argmax over the correct text token. After the prefix, the model
+    /// should never output STREAMING_PAD — only STREAMING_WORD (33) or
+    /// text tokens (≥1000).
+    ///
+    /// On BF16 this masking is unnecessary; the correct tokens naturally
+    /// have higher logits. Q4 needs the nudge.
     async fn argmax_async(&self, logits: &Tensor<WgpuBackend, 3>) -> Result<i32, String> {
-        let pred = logits.clone().argmax(2);
-        let data = pred
+        // Read logits back to CPU for masked argmax
+        let data = logits
+            .clone()
+            .reshape([logits.dims()[2]])
             .into_data_async()
             .await
             .map_err(|e| format!("GPU readback failed (argmax): {:?}", e))?;
-        let tokens: Vec<i32> = data
-            .to_vec::<i32>()
-            .map_err(|e| format!("argmax extraction: {:?}", e))?;
-        Ok(tokens.first().copied().unwrap_or(0))
+        let vals: Vec<f32> = data
+            .to_vec::<f32>()
+            .map_err(|e| format!("logit extraction: {:?}", e))?;
+
+        // Find argmax, masking out STREAMING_PAD (32) and BOS (1)
+        let mut best_idx = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for (i, &v) in vals.iter().enumerate() {
+            let token = i as i32;
+            // Skip STREAMING_PAD — Q4 quantization noise makes it a spurious winner
+            if token == STREAMING_PAD || token == BOS_TOKEN {
+                continue;
+            }
+            if v > best_val {
+                best_val = v;
+                best_idx = i;
+            }
+        }
+
+        Ok(best_idx as i32)
     }
 
     /// Reset everything for context rotation.
@@ -472,5 +503,20 @@ impl Q4IncrementalSession {
     /// Full accumulated text.
     pub fn generated_text(&self) -> &str {
         &self.generated_text
+    }
+
+    /// All generated token IDs (for diagnostics).
+    pub fn generated_tokens(&self) -> &[i32] {
+        &self.generated_tokens
+    }
+
+    /// Total adapter tokens processed so far.
+    pub fn total_adapter_tokens(&self) -> usize {
+        self.total_adapter_tokens
+    }
+
+    /// Whether decoder has started.
+    pub fn decoder_started(&self) -> bool {
+        self.decoder_started
     }
 }
