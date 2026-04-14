@@ -141,6 +141,18 @@ async def run_vllm_benchmark(duration):
                     all_text.append(d.get("delta", ""))
         except: pass
 
+    async def init_session(websocket):
+        await websocket.send(json.dumps({
+            "type": "session.update",
+            "model": "mistralai/Voxtral-Mini-4B-Realtime-2602",
+            "input_audio_format": "pcm16", "language": "de", "turn_detection": None,
+        }))
+        for _ in range(5):
+            try:
+                r = await asyncio.wait_for(websocket.recv(), timeout=2.0)
+                if "session.updated" in r: break
+            except: break
+
     rtask = asyncio.create_task(reader())
     t0 = time.monotonic()
     batch = 8000
@@ -152,25 +164,21 @@ async def run_vllm_benchmark(duration):
         await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": base64.b64encode(raw).decode()}))
         await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
         nc += 1
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.1)  # give vllm time to process
+
         if nc >= 200:
+            # Flush deltas before rotation
+            await asyncio.sleep(2.0)
+            # Rotate
             rtask.cancel()
             try: await rtask
             except: pass
             await ws.close()
             ws = await websockets.connect("ws://localhost:8001/v1/realtime", max_size=10*1024*1024)
-            await ws.send(json.dumps({
-                "type": "session.update",
-                "model": "mistralai/Voxtral-Mini-4B-Realtime-2602",
-                "input_audio_format": "pcm16", "language": "de", "turn_detection": None,
-            }))
-            for _ in range(5):
-                try:
-                    r = await asyncio.wait_for(ws.recv(), timeout=2.0)
-                    if "session.updated" in r: break
-                except: break
+            await init_session(ws)
             rtask = asyncio.create_task(reader())
             nc = 0
+            print(f"  vllm rotated at {i/16000:.0f}s, text so far: {len(''.join(all_text))} chars", file=sys.stderr)
 
     await asyncio.sleep(3.0)
     elapsed = time.monotonic() - t0

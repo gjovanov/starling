@@ -1,5 +1,5 @@
 # burn-server (candle 0.10 + flash) — 37 segments
-# Generated: 2026-04-14 23:15:51
+# Generated: 2026-04-14 23:48:19
 
 [seg   1] FINAL: Wort zum Thema Ortszentren lädt der ORF am 19. November nach Bischofshofen.
 [seg   2] FINAL: Eine Anmeldung ist erforderlich.

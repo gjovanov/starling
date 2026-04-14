@@ -1,0 +1,19 @@
+# vllm-server — 16 segments
+# Generated: 2026-04-14 23:49:39
+
+[seg   1] FINAL: Wort zum Thema Ortszentren lädt der ORF am 19. November nach Bischofshofen.
+[seg   2] FINAL: Eine Anmeldung ist erforderlich.
+[seg   3] FINAL: Dann ist das vielleicht die beste Pointe des Abends.
+[seg   4] FINAL: Manuel Rubay und Simon Schwarz spielen ihr Programm Das Restaurant am 17. November im Kulturzentrum Hallwang. 90 Jahre Societa Dante Alighieri werden mit einem Festa Bertutti am 15. Dem Zeitpunkt noch nicht.
+[seg   5] FINAL: Erst vor zwei Stunden wird ein Videostatement veröffentlicht.
+[seg   6] FINAL: Liebe Unternehmerinnen und Unternehmer, Liebe Mitarbeiterinnen und Mitarbeiter.
+[seg   7] FINAL: Mara spricht davon, dass die mediale Debatte der vergangenen Tage von Populismus bestimmt worden sei, ohne Mehrwert für die Wirtschaft und das Land.
+[seg   8] FINAL: Das ist nicht mein Spielfeld.
+[seg   9] FINAL: Ich sehe derzeit keine Möglichkeit, verantwortungsvolle Beiträge für eine positive Zukunftsentwicklung zu leisten.
+[seg  10] FINAL: Ich werde daher meine Funktionen in der Wirtschaftskammer Österreich und im Wirtschaftsbund zurücklegen.
+[seg  11] FINAL: Und ich werde in beiden Salzburgs Seilbahner wollen weniger Verfahren und Auflagen.
+[seg  12] FINAL: Das ist heute bei der Fachtagung der Seilbahner in Ponga eifrig diskutiert worden.
+[seg  13] FINAL: Vor allem bei Umweltverträglichkeitsprüfungen sind die Seilbahnunternehmer sehr kritisch, denn auch da läuft gerade ein EU-Verfahren gegen Österreich.
+[seg  14] FINAL: Die Umweltauflagen bei Seilbahnbaustellen im Gebirge sind vielen Seilbahnunternehmen schon jetzt zu streng.
+[seg  15] FINAL: Doch die Umweltverträglichkeitsprüfungen, kurz UVP in Österreich, sind nicht immer streng genug.
+[seg  16] FINAL: So sieht das die Europäische Union und hat ein Vertragsverletzungsverfahren gestartet.
