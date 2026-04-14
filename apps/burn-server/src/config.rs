@@ -25,6 +25,8 @@ pub enum GpuBackend {
     Candle,
     #[cfg(feature = "candle-native")]
     CandleNative,
+    #[cfg(feature = "candle-native-flash")]
+    CandleNativeFlash,
 }
 
 impl std::fmt::Display for GpuBackend {
@@ -37,6 +39,8 @@ impl std::fmt::Display for GpuBackend {
             GpuBackend::Candle => write!(f, "Candle"),
             #[cfg(feature = "candle-native")]
             GpuBackend::CandleNative => write!(f, "CandleNative"),
+            #[cfg(feature = "candle-native-flash")]
+            GpuBackend::CandleNativeFlash => write!(f, "CandleNativeFlash"),
         }
     }
 }

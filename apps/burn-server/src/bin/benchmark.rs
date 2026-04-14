@@ -1,11 +1,17 @@
-//! Benchmark binary for BF16 inference: WGPU vs CUDA.
+//! Benchmark binary for BF16 and Q4 inference.
 //!
 //! Usage:
-//!   # WGPU (DZN):
+//!   # WGPU BF16:
 //!   cargo run --release --bin benchmark -- --audio ../../media/broadcast_30s.wav
 //!
-//!   # CUDA:
+//!   # CUDA BF16:
 //!   cargo run --release --features cuda --bin benchmark -- --backend cuda --audio ../../media/broadcast_30s.wav
+//!
+//!   # Q4 (GGUF) via WGPU:
+//!   cargo run --release --bin benchmark -- --backend q4 --audio ../../media/broadcast_1.wav --duration 3
+//!
+//!   # Q4 with diagnostic logit dump:
+//!   DIAG_LOGITS=1 cargo run --release --bin benchmark -- --backend q4 --audio ../../media/broadcast_1.wav --duration 3
 
 use burn_server::audio::mel::{MelConfig, MelSpectrogram};
 use burn_server::audio::pad::{pad_audio, PadConfig};
@@ -357,19 +363,162 @@ fn run_candle_native(args: &Args) {
     println!("{}", text);
 }
 
+#[cfg(feature = "candle-native-flash")]
+fn run_candle_native_flash(args: &Args) {
+    use burn_server::inference::candle_native_flash::model;
+
+    let device = candle_core::Device::new_cuda(0).expect("CUDA device");
+    let st_path = args.models_dir.join("bf16").join("consolidated.safetensors");
+    let tokenizer_path = args.models_dir.join("tokenizer").join("tekken.json");
+
+    eprintln!("\n=== CandleNative Flash (candle 0.10 + FlashAttention v2) ===");
+
+    let t_load = Instant::now();
+    let vox_model = model::VoxtralModel::load(&st_path, &device).expect("model load");
+    let load_secs = t_load.elapsed().as_secs_f32();
+    eprintln!("Full model loaded: {:.1}s", load_secs);
+
+    let tokenizer = TekkenDecoder::from_file(&tokenizer_path).expect("tokenizer");
+
+    let (flat, n_mels, n_frames) = prepare_mel(&args.audio, args.duration);
+    let mel = candle_core::Tensor::new(&flat[..n_mels * n_frames], &device)
+        .and_then(|t| t.to_dtype(candle_core::DType::BF16))
+        .and_then(|t| t.reshape((1, n_mels, n_frames)))
+        .expect("mel tensor");
+    let t_embed = model::compute_time_embedding(6.0, 3072, &device).expect("t_embed");
+
+    let t_infer = Instant::now();
+    let token_ids = if std::env::var("CANDLE_STREAMING").is_ok() {
+        model::transcribe_streaming(&vox_model, &mel, &t_embed).expect("transcribe_streaming")
+    } else {
+        model::transcribe(&vox_model, &mel, &t_embed).expect("transcribe")
+    };
+    let infer_secs = t_infer.elapsed().as_secs_f32();
+
+    let text = tokenizer.decode(&token_ids.iter().map(|&t| t as i32).collect::<Vec<_>>());
+    let audio_secs = n_frames as f32 / 200.0;
+
+    eprintln!("\n=== CandleNative Flash Results ===");
+    eprintln!("Load:       {:.1}s", load_secs);
+    eprintln!("Inference:  {:.1}s", infer_secs);
+    eprintln!("Tokens:     {}", token_ids.len());
+    eprintln!("Realtime:   {:.1}×", infer_secs / audio_secs);
+    eprintln!("Text (200c): {:?}", &text[..text.char_indices().take(200).last().map_or(0, |(i, c)| i + c.len_utf8())]);
+    println!("{}", text);
+}
+
+/// Prepare mel with Q4 padding (76 left-pad tokens — extended for Q4 sensitivity).
+fn prepare_mel_q4(audio_path: &std::path::Path, max_duration_secs: usize) -> (Vec<f32>, usize, usize) {
+    let reader = hound::WavReader::open(audio_path).expect("Failed to open WAV");
+    let spec = reader.spec();
+    let mut samples: Vec<f32> = if spec.bits_per_sample == 16 {
+        reader.into_samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect()
+    } else {
+        reader.into_samples::<f32>()
+            .map(|s| s.unwrap())
+            .collect()
+    };
+
+    if max_duration_secs > 0 {
+        let max_samples = max_duration_secs * spec.sample_rate as usize;
+        if samples.len() > max_samples {
+            samples.truncate(max_samples);
+        }
+    }
+
+    let audio_secs = samples.len() as f32 / spec.sample_rate as f32;
+    eprintln!("Audio: {:.1}s ({} samples, {} Hz)", audio_secs, samples.len(), spec.sample_rate);
+
+    let audio_buf = AudioBuffer::new(samples, spec.sample_rate);
+    let pad_config = PadConfig::q4(); // 76 left-pad tokens
+    let padded = pad_audio(&audio_buf, &pad_config);
+
+    let mel_spec = MelSpectrogram::new(MelConfig::default());
+    let log_mel = mel_spec.compute_log(&padded.samples);
+    let n_frames = log_mel.len();
+    let n_mels = if n_frames > 0 { log_mel[0].len() } else { 128 };
+
+    let mut flat = vec![0.0f32; n_mels * n_frames];
+    for (t, frame) in log_mel.iter().enumerate() {
+        for (m, &val) in frame.iter().enumerate() {
+            flat[m * n_frames + t] = val;
+        }
+    }
+    (flat, n_mels, n_frames)
+}
+
+/// Q4 GGUF benchmark — uses the Q4VoxtralModel directly.
+fn run_q4(args: &Args) {
+    use burn_server::inference::q4::WgpuBackend;
+    use burn_server::inference::q4::loader::Q4ModelLoader;
+
+    let device = burn::backend::wgpu::WgpuDevice::default();
+    let gguf_path = args.models_dir.join("q4").join("voxtral-q4.gguf");
+    let tokenizer_path = args.models_dir.join("tokenizer").join("tekken.json");
+
+    eprintln!("\n=== Q4 GGUF Benchmark ===");
+    eprintln!("GGUF: {}", gguf_path.display());
+
+    let t_load = Instant::now();
+    let mut loader = Q4ModelLoader::from_file(&gguf_path).expect("open GGUF");
+    let model = loader.load(&device).expect("load Q4 model");
+    let load_secs = t_load.elapsed().as_secs_f32();
+    eprintln!("Q4 model loaded: {:.1}s", load_secs);
+
+    let tokenizer = TekkenDecoder::from_file(&tokenizer_path).expect("tokenizer");
+
+    // Use Q4 padding (76 left-pad tokens)
+    let (flat, n_mels, n_frames) = prepare_mel_q4(&args.audio, args.duration);
+    let mel: Tensor<WgpuBackend, 3> =
+        Tensor::from_data(TensorData::new(flat, [1, n_mels, n_frames]), &device);
+    let t_embed = compute_time_embedding::<WgpuBackend>(6.0, 3072, &device);
+
+    eprintln!("Mel: [{}, {}, {}]", 1, n_mels, n_frames);
+
+    let t_infer = Instant::now();
+    let token_ids = model.transcribe_streaming(mel, t_embed);
+    let infer_secs = t_infer.elapsed().as_secs_f32();
+
+    let text = tokenizer.decode(&token_ids);
+    let audio_secs = n_frames as f32 / 200.0;
+
+    // Count token types
+    let n_pad = token_ids.iter().filter(|&&t| t == 32).count();
+    let n_text = token_ids.iter().filter(|&&t| t >= 1000).count();
+    let n_special = token_ids.len() - n_pad - n_text;
+
+    eprintln!("\n=== Q4 Results ===");
+    eprintln!("Load:       {:.1}s", load_secs);
+    eprintln!("Inference:  {:.1}s", infer_secs);
+    eprintln!("Tokens:     {} (pad={}, text={}, special={})", token_ids.len(), n_pad, n_text, n_special);
+    eprintln!("Realtime:   {:.1}x", infer_secs / audio_secs);
+    eprintln!("First 30 token IDs: {:?}", &token_ids[..token_ids.len().min(30)]);
+    if text.len() > 0 {
+        eprintln!("Text (200c): {:?}", &text[..text.char_indices().take(200).last().map_or(0, |(i, c)| i + c.len_utf8())]);
+    } else {
+        eprintln!("Text: (empty)");
+    }
+    println!("{}", text);
+}
+
 fn main() {
     let args = Args::parse();
 
     match args.backend.as_str() {
         "wgpu" => run_wgpu(&args),
+        "q4" => run_q4(&args),
         #[cfg(feature = "cuda")]
         "cuda" => run_cuda(&args),
         #[cfg(feature = "candle")]
         "candle" => run_candle(&args),
         #[cfg(feature = "candle-native")]
         "candle-native" => run_candle_native(&args),
+        #[cfg(feature = "candle-native-flash")]
+        "candle-native-flash" => run_candle_native_flash(&args),
         other => {
-            eprintln!("Unknown backend: {}. Use 'wgpu', 'cuda', 'candle', or 'candle-native'.", other);
+            eprintln!("Unknown backend: {}. Use 'wgpu', 'q4', 'cuda', 'candle', 'candle-native', or 'candle-native-flash'.", other);
             std::process::exit(1);
         }
     }

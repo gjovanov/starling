@@ -1,16 +1,13 @@
-//! Voxtral Mini 4B Realtime — pure candle CUDA implementation.
+//! Voxtral Mini 4B Realtime — candle 0.10 + FlashAttention v2.
 //!
-//! Architecture (matching voxtral.c / python_simple_implementation.py):
-//!   Encoder: CausalConv(128→1280, stride 2) → 32 layers (MHA, interleaved RoPE, SW=750)
-//!   Adapter: 4x reshape → Linear(5120→3072) → GELU → Linear(3072→3072)
-//!   Decoder: 26 layers (GQA 32h/8kv, interleaved RoPE, ADA FFN, SW=8192)
-//!
-//! Key: interleaved RoPE (pairs [0,1],[2,3],...) NOT split-half NeoX style.
-//! Silence padding: left=32×1280, right=17×1280 zeros around audio before mel.
+//! Same architecture as candle_native but with:
+//! - candle-core 0.10.2 (lower per-op overhead)
+//! - candle-flash-attn for fused decoder attention (GQA native, BF16)
 
-use candle_core_native::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use candle_nn_native as candle_nn;
+use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use candle_nn;
 use candle_nn::VarBuilder;
+use candle_flash_attn::flash_attn;
 use std::time::Instant;
 
 // Custom Linear that stores pre-transposed contiguous weight.
@@ -489,36 +486,12 @@ impl DecoderAttention {
         let (q, k) = rope.apply(&q, &k, offset)?;
         let (k, v) = cache.update(k.contiguous()?, v.contiguous()?)?;
 
-        // Transpose to [B, heads, seq, hd]
-        let q = q.transpose(1, 2)?.contiguous()?;
-        let k = k.transpose(1, 2)?.contiguous()?;
-        let v = v.transpose(1, 2)?.contiguous()?;
-
-        // GQA expand
-        let repeat = self.n_heads / self.n_kv_heads;
-        let kv_seq = k.dim(2)?;
-        let k = k.unsqueeze(2)?.repeat(&[1, 1, repeat, 1, 1])?
-            .reshape((b, self.n_heads, kv_seq, self.head_dim))?.contiguous()?;
-        let v = v.unsqueeze(2)?.repeat(&[1, 1, repeat, 1, 1])?
-            .reshape((b, self.n_heads, kv_seq, self.head_dim))?.contiguous()?;
-
-        let scores = (q.matmul(&k.t()?)? * (self.scale as f64))?;
-
-        let scores = if seq > 1 {
-            // Causal mask for prefill
-            let mask: Vec<f32> = (0..seq).flat_map(|i| {
-                (0..kv_seq).map(move |j| if j > i + offset { f32::NEG_INFINITY } else { 0.0 })
-            }).collect();
-            let mask = Tensor::new(mask, x.device())?.to_dtype(scores.dtype())?
-                .reshape((1, 1, seq, kv_seq))?;
-            scores.broadcast_add(&mask)?
-        } else {
-            scores // single-token: no mask needed
-        };
-
-        let attn = candle_nn::ops::softmax_last_dim(&scores)?;
-        let out = attn.matmul(&v)?;
-        let out = out.transpose(1, 2)?.contiguous()?.reshape((b, seq, self.q_dim))?;
+        // FlashAttention v2 — single fused kernel, GQA native (32 Q heads, 8 KV heads)
+        // Input shapes: q [B, seq_q, n_heads, hd], k [B, seq_kv, n_kv_heads, hd]
+        let causal = seq > 1; // causal during prefill, non-causal for single-token decode
+        let out = flash_attn(&q.contiguous()?, &k.contiguous()?, &v.contiguous()?, self.scale, causal)?;
+        // out: [B, seq_q, n_heads, hd]
+        let out = out.reshape((b, seq, self.q_dim))?;
         self.wo.forward(&out)
     }
 }
@@ -850,7 +823,7 @@ pub fn transcribe(model: &VoxtralModel, mel: &Tensor, t_embed: &Tensor) -> Resul
     let d_model = audio_embeds.dim(2)?;
     eprintln!("[CandleNative] Encoded: seq_len={} ({:.1}s)", audio_seq, t0.elapsed().as_secs_f32());
 
-    let mut caches = model.new_decoder_caches(audio_seq + 50)?; // capacity = audio + prompt
+    let mut caches = (0..26).map(|_| KVCache::new()).collect(); // capacity = audio + prompt
     let ada_scales = model.precompute_ada_scales(t_embed)?;
 
     // Prompt: BOS(1) + STREAMING_PAD(32)*38 = 39 tokens
@@ -1067,7 +1040,7 @@ pub fn transcribe_streaming(model: &VoxtralModel, mel: &Tensor, t_embed: &Tensor
     };
 
     let t_dec = Instant::now();
-    let mut dec_caches = model.new_decoder_caches(2048)?;
+    let mut dec_caches = (0..26).map(|_| KVCache::new()).collect();
     let mut prev_token = prefill_decoder(&mut dec_caches, 0)?;
     let mut generated = Vec::with_capacity(audio_seq);
     generated.push(prev_token);

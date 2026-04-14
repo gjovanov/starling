@@ -5,6 +5,8 @@ pub mod config;
 pub mod candle_engine;
 #[cfg(feature = "candle-native")]
 pub mod candle_native;
+#[cfg(feature = "candle-native-flash")]
+pub mod candle_native_flash;
 #[cfg(feature = "cuda")]
 pub mod cuda_engine;
 pub mod engine;
