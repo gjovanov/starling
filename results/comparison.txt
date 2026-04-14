@@ -1,0 +1,20 @@
+========================================================================
+BURN-SERVER vs VLLM-SERVER — 300s broadcast_1.wav
+Generated: 2026-04-14 23:15:51
+========================================================================
+
+Metric                         burn-server               vllm-server              
+------------------------------------------------------------------------
+Backend                        candle 0.10+flash BF16    vLLM PyTorch BF16        
+Total time                     101.1s                     N/A
+Decode/step                    23.9ms                     ~5ms                     
+Text tokens                    692                       N/A
+Words                          412                       N/A
+Segments                       37                        N/A
+Rotations                      3                         ~3                       
+WER                            61.9%                     N/A
+CER                            45.7%                     N/A
+
+BURN TEXT (first 500 chars):
+Wort zum Thema Ortszentren lädt der ORF am 19. November nach Bischofshofen. Eine Anmeldung ist erforderlich. Dann ist das vielleicht die beste Pointe des Abends. Manuel Rubay und Simon Schwarz spielen ihr Programm Das Restaurant am 17. November im Kulturzentrum Hallwang. 90 Jahre Societa Dante Alighieri werden mit einem Festa Bertutti am 15. November im Carabinieri-Saal im Domquartier gefeiert. Der Kalender präsentiert von der Salzachblume in Nussdorf. Mara tritt als Wirtschaftskammerpräsident z
+

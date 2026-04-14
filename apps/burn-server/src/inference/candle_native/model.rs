@@ -1075,24 +1075,15 @@ pub fn transcribe_streaming(model: &VoxtralModel, mel: &Tensor, t_embed: &Tensor
     let mut n_rotations = 0usize;
 
     for i in prompt_len..audio_seq {
-        // Context rotation: reset decoder caches, re-prefill from current position
+        // Context rotation: clean restart (like vllm's disconnect/reconnect)
         if steps_since_rotation >= rotation_interval {
             dec_caches = (0..26).map(|_| KVCache::new()).collect();
-            let re_start = i.saturating_sub(prompt_len); // overlap prompt with recent audio
-            prev_token = prefill_decoder(&mut dec_caches, re_start)?;
-            // Skip the prompt positions (already covered by prefill)
-            let skip_to = re_start + prompt_len;
-            for j in (re_start + prompt_len)..i {
-                if j >= audio_seq { break; }
-                let ap = audio_embeds.narrow(1, j, 1)?;
-                let te = model.embed_token(prev_token)?;
-                let h = model.decoder_forward((&ap + &te)?, &ada_scales, &mut dec_caches)?;
-                let logits = model.lm_head(&h)?;
-                let lf: Vec<f32> = logits.to_dtype(DType::F32)?.reshape(131072)?.to_vec1()?;
-                prev_token = lf.iter().enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(idx, _)| idx as u32).unwrap_or(0);
+            prev_token = prefill_decoder(&mut dec_caches, i)?;
+            let skip = prompt_len.min(audio_seq - i);
+            for _ in 0..skip.saturating_sub(1) {
+                generated.push(32); // pad placeholder for skipped positions
             }
+            prev_token = 0; // fresh start
             steps_since_rotation = 0;
             n_rotations += 1;
         }

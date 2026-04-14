@@ -1,0 +1,40 @@
+# burn-server (candle 0.10 + flash) — 37 segments
+# Generated: 2026-04-14 23:15:51
+
+[seg   1] FINAL: Wort zum Thema Ortszentren lädt der ORF am 19. November nach Bischofshofen.
+[seg   2] FINAL: Eine Anmeldung ist erforderlich.
+[seg   3] FINAL: Dann ist das vielleicht die beste Pointe des Abends.
+[seg   4] FINAL: Manuel Rubay und Simon Schwarz spielen ihr Programm Das Restaurant am 17. November im Kulturzentrum Hallwang. 90 Jahre Societa Dante Alighieri werden mit einem Festa Bertutti am 15. November im Carabinieri-Saal im Domquartier gefeiert.
+[seg   5] FINAL: Der Kalender präsentiert von der Salzachblume in Nussdorf.
+[seg   6] FINAL: Mara tritt als Wirtschaftskammerpräsident zurück.
+[seg   7] FINAL: EU-Kommission leitet Kartellverfahren gegen Red Bull ein.
+[seg   8] FINAL: Und Videoüberwachung hilft bei Grenzkontrollen am Waldseberg.
+[seg   9] FINAL: Salzburg heute.
+[seg  10] FINAL: Mit Katharina Schaber.
+[seg  11] FINAL: Guten Abend.
+[seg  12] FINAL: Über Tage hinweg hat es sich abgezeichnet.
+[seg  13] FINAL: Seit zwei Stunden ist es fix.
+[seg  14] FINAL: Wirtschaftskammerpräsident Harald Mahra tritt zurück.
+[seg  15] FINAL: Zeitnah, wie er sagt.
+[seg  16] FINAL: Der Druck auf Mahra dürfte zu groß geworden sein.
+[seg  17] FINAL: Und es gibt auch schon Gerüchte, wer ihm an der Spitze der Wirtschaftskammer nachfolgen könnte.
+[seg  18] FINAL: Mahra will jedenfalls für eine geordnete Übergabe sorgen.
+[seg  19] FINAL: Den ganzen Tag über gab es Gerüchte zu Mittagstiteln.
+[seg  20] FINAL: Bereits die ersten Zeitungen, der Rücktritt von Harald Mahra sei fix.
+[seg  21] FINAL: Nur eine offizielle Bestätigung der Wirtschaftskammer gab es zus Seilbahnern wollen weniger verfahren und auflagen.
+[seg  22] FINAL: Das ist heute bei der Fachtagung der Seilbahnern in Ponga eifrig diskutiert worden.
+[seg  23] FINAL: Vor allem bei Umweltverträglichkeitsprüfungen sind die Seilbahnunternehmer sehr kritisch, denn auch da läuft gerade ein EU-Verfahren gegen Österreich.
+[seg  24] FINAL: Die Umweltauflagen bei Seilbahnbaustellen im Gebirge sind vielen Seilbahnunternehmen schon jetzt zu streng.
+[seg  25] FINAL: Doch die Umweltverträglichkeitsprüfungen, kurz UVP in Österreich, sind nicht immer streng genug.
+[seg  26] FINAL: So sieht das die Europäische Union und hat ein Vertragsverletzungsverfahren gestartet.
+[seg  27] FINAL: In Österreich wird deshalb um eine Neuregelung der UVP-Umweltprüfungen gerungen.
+[seg  28] FINAL: Über den Stand dabei ist heute bei der Tagung der Seilbahnunternehmen in St.
+[seg  29] FINAL: Johann diskutiert worden.
+[seg  30] FINAL: Offenbar ist die Idee von der Kommission, dass man mehr UVP-Verfahren durchführt.
+[seg  31] FINAL: Diese mehr UVP-Verfahren, wenn sie die Dimension haben, so wie es bei den Nachbarn ist, kann man das schon machen.
+[seg  32] FINAL: Aber so wie es jetzt bei uns gehandhabt wird, allein wenn kleine Naturschutzverfahren Jahre dauern, dann denke ich mir, ist ein UVP-Verfahren und davon noch mehr vollkommen kontraproduktiv.
+[seg  33] FINAL: Gleichzeitig steht in Salzburg bei vielen älteren Seilbahnen die Generalüberholung an.
+[seg  34] FINAL: Der Grund dafür sind gesetzliche Vorgaben, die ab 2027 greifen.
+[seg  35] FINAL: Und für dieses Verfahren ist es derzeit bei uns so üblich, dass wir wie eine Neuanlage das durchführen müssen.
+[seg  36] FINAL: Das ist ein bisschen unverständlich für uns, wenn wir die gleiche Seilbahntrasse haben, die gleichen Stationsstandorte, dass hier wie gesagt UVB-Feststellungsverfahren durchgeführt werden müssen für eine Seilbahn, die eigentlich schon besteht und nur erneuert wird.
+[seg  37] FINAL: Ein weiteres
