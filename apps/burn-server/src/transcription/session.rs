@@ -118,9 +118,6 @@ pub async fn run_session(
         let mut total_samples: usize = 0;
         let mut audio_batch: Vec<f32> = Vec::with_capacity(BATCH_SAMPLES);
 
-        // Cache the RTP track reference — avoids acquiring sessions lock every 20ms
-        let mut cached_track: Option<Arc<webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP>> = None;
-
         while let Some(samples_16k) = audio_rx.recv().await {
             total_samples += samples_16k.len();
 
@@ -128,15 +125,14 @@ pub async fn run_session(
             if let Some(ref mut encoder) = opus_encoder {
                 let rtp_packets = encoder.encode(&samples_16k);
 
-                // Lazily resolve track (only lock once, then cache)
-                if cached_track.is_none() {
+                // Always re-read track — client may reconnect mid-session, replacing the track.
+                // Read lock every 20ms is negligible vs stale-track silence on reconnect.
+                let track = {
                     let sessions = playback_state.sessions.read().await;
-                    cached_track = sessions
-                        .get(&playback_sid)
-                        .and_then(|ctx| ctx.rtp_track.clone());
-                }
+                    sessions.get(&playback_sid).and_then(|ctx| ctx.rtp_track.clone())
+                };
 
-                if let Some(ref track) = cached_track {
+                if let Some(ref track) = track {
                     for packet in &rtp_packets {
                         let _ = track.write(packet).await;
                     }
