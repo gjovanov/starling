@@ -7,7 +7,7 @@
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn;
 use candle_nn::VarBuilder;
-use candle_flash_attn::flash_attn;
+use candle_flash_attn::{flash_attn, flash_attn_varlen};
 use std::time::Instant;
 
 // Custom Linear that stores pre-transposed, pre-unsqueezed weight.
@@ -466,26 +466,34 @@ impl DecoderAttention {
         })
     }
 
-    fn forward_with_cache(&self, x: &Tensor, rope: &RoPE, cache: &mut KVCache) -> Result<Tensor> {
+    fn forward_with_cache(&self, x: &Tensor, rope: &RoPE, cache: &mut KVCache,
+                          varlen_ctx: Option<(&Tensor, &Tensor)>) -> Result<Tensor> {
         let (b, seq, _) = x.dims3()?;
         let offset = cache.logical_len();
 
-        // Fused QKV: single matmul (weight pre-unsqueezed to [1, in, out])
         let wqkv = x.matmul(&self.wqkv_t)?;
         let q = wqkv.narrow(D::Minus1, 0, self.q_dim)?.reshape((b, seq, self.n_heads, self.head_dim))?;
         let k = wqkv.narrow(D::Minus1, self.q_dim, self.kv_dim)?.reshape((b, seq, self.n_kv_heads, self.head_dim))?;
         let v = wqkv.narrow(D::Minus1, self.q_dim + self.kv_dim, self.kv_dim)?.reshape((b, seq, self.n_kv_heads, self.head_dim))?;
 
         let (q, k) = rope.apply(&q, &k, offset)?;
-        let (k, v) = cache.update(k.contiguous()?, v.contiguous()?)?;
+        let (k_cached, v_cached) = cache.update(k.contiguous()?, v.contiguous()?)?;
 
-        // FlashAttention v2 — single fused kernel, GQA native (32 Q heads, 8 KV heads)
-        // Input shapes: q [B, seq_q, n_heads, hd], k [B, seq_kv, n_kv_heads, hd]
-        let causal = seq > 1; // causal during prefill, non-causal for single-token decode
-        let out = flash_attn(&q.contiguous()?, &k.contiguous()?, &v.contiguous()?, self.scale, causal)?;
-        // out: [B, seq_q, n_heads, hd]
-        let out = out.reshape((b, seq, self.q_dim))?;
-        self.wo.forward(&out)
+        if let Some((seqlens_q, seqlens_k)) = varlen_ctx {
+            // Decode: flash_attn_varlen avoids KV contiguous copies.
+            let kv_seq = k_cached.dim(1)?;
+            let q3 = q.reshape((1, self.n_heads, self.head_dim))?;
+            let k3 = k_cached.squeeze(0)?;
+            let v3 = v_cached.squeeze(0)?;
+            let out = flash_attn_varlen(&q3, &k3, &v3, seqlens_q, seqlens_k, 1, kv_seq, self.scale, false)?;
+            let out = out.reshape((b, 1, self.q_dim))?;
+            self.wo.forward(&out)
+        } else {
+            let causal = seq > 1;
+            let out = flash_attn(&q.contiguous()?, &k_cached.contiguous()?, &v_cached.contiguous()?, self.scale, causal)?;
+            let out = out.reshape((b, seq, self.q_dim))?;
+            self.wo.forward(&out)
+        }
     }
 }
 
@@ -567,11 +575,12 @@ impl DecoderLayer {
     /// ADA modulation applies ONLY to the FFN path (after ffn_norm, before MLP).
     fn forward_with_cache_precomputed(
         &self, x: &Tensor, ada_scale: &Tensor, rope: &RoPE, cache: &mut KVCache,
+        varlen_ctx: Option<(&Tensor, &Tensor)>,
     ) -> Result<Tensor> {
         // Attention path (no ADA)
         let residual = x.clone();
         let normed = self.attention_norm.forward(x)?;
-        let attn_out = self.attention.forward_with_cache(&normed, rope, cache)?;
+        let attn_out = self.attention.forward_with_cache(&normed, rope, cache, varlen_ctx)?;
         let x = (&attn_out + &residual)?;
 
         // FFN path (with ADA scale)
@@ -589,7 +598,7 @@ impl DecoderLayer {
         let residual = x.clone();
         let normed = self.attention_norm.forward(x)?;
         let normed_abs = normed.to_dtype(DType::F32)?.abs()?.mean_all()?.to_scalar::<f32>()?;
-        let attn_out = self.attention.forward_with_cache(&normed, rope, cache)?;
+        let attn_out = self.attention.forward_with_cache(&normed, rope, cache, None)?;
         let attn_abs = attn_out.to_dtype(DType::F32)?.abs()?.mean_all()?.to_scalar::<f32>()?;
         let x_after_attn = (&attn_out + &residual)?;
         let after_attn_abs = x_after_attn.to_dtype(DType::F32)?.abs()?.mean_all()?.to_scalar::<f32>()?;
@@ -635,7 +644,13 @@ impl VoxtralModel {
             eprintln!("[CandleNative] Disabled CUDA event tracking (single-stream)");
         }
 
-        // Use env var to select dtype: CANDLE_NATIVE_F32=1 for f32, default bf16
+        // Enable fast BF16 cuBLAS mode: accumulates in BF16 instead of F32.
+        // Slightly less precise but can use faster kernel variants.
+        if std::env::var("CANDLE_FAST_BF16").is_ok() {
+            candle_core::cuda_backend::set_gemm_reduced_precision_bf16(true);
+            eprintln!("[CandleNative] cuBLAS FAST_BF16 mode enabled");
+        }
+
         let dtype = if std::env::var("CANDLE_NATIVE_F32").is_ok() {
             eprintln!("[CandleNative] Using F32 (matching voxtral.c)");
             DType::F32
@@ -729,19 +744,68 @@ impl VoxtralModel {
         let num_layers = std::env::var("CANDLE_NATIVE_LAYERS")
             .ok().and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(self.decoder_layers.len());
-        let diag = std::env::var("DIAG_LAYERS").is_ok();
-        for (i, layer) in self.decoder_layers.iter().enumerate().take(num_layers) {
-            x = layer.forward_with_cache_precomputed(&x, &ada_scales[i], &self.decoder_rope, &mut caches[i])?;
-            if diag && caches[i].seq_len <= 40 {
-                // Only dump during prefill (first forward call)
-                let seq = x.dim(1)?;
-                let dim = x.dim(2)?;
-                let last: Vec<f32> = x.i((0, seq - 1, ..4))?.to_dtype(DType::F32)?.to_vec1()?;
-                let full_row: Vec<f32> = x.i((0, seq - 1, ..))?.to_dtype(DType::F32)?.to_vec1()?;
-                let norm: f32 = full_row.iter().map(|v| v * v).sum::<f32>().sqrt();
-                eprintln!("[DIAG CandleNative layer {}] hidden L2={:.4} first4=[{:.4}, {:.4}, {:.4}, {:.4}]",
-                    i, norm, last[0], last[1], last[2], last[3]);
+        let profile = std::env::var("CANDLE_PROFILE").is_ok();
+
+        // Pre-allocate seqlens for flash_attn_varlen decode path (1 alloc vs 52)
+        let varlen_ctx = if x.dim(1)? == 1 && !caches.is_empty() {
+            let kv_seq = caches[0].seq_len + 1; // +1 because update happens before flash_attn
+            let seqlens_q = Tensor::new(&[0u32, 1u32], &self.device)?;
+            let seqlens_k = Tensor::new(&[0u32, kv_seq as u32], &self.device)?;
+            Some((seqlens_q, seqlens_k))
+        } else {
+            None
+        };
+        let varlen_ref = varlen_ctx.as_ref().map(|(q, k)| (q, k));
+
+        if profile && x.dim(1)? == 1 {
+            // Profiled decode step: measure per-section GPU time
+            let stream = self.device.as_cuda_device()?.cuda_stream();
+            let sync = || { let _ = stream.synchronize(); Instant::now() };
+            let mut t = sync();
+            let mut attn_norm_us = 0u128;
+            let mut attn_us = 0u128;
+            let mut attn_res_us = 0u128;
+            let mut ffn_norm_ada_us = 0u128;
+            let mut ffn_us = 0u128;
+            let mut ffn_res_us = 0u128;
+
+            for (i, layer) in self.decoder_layers.iter().enumerate().take(num_layers) {
+                let residual = x.clone();
+                let normed = layer.attention_norm.forward(&x)?;
+                let t1 = sync(); attn_norm_us += (t1 - t).as_micros(); t = t1;
+
+                let attn_out = layer.attention.forward_with_cache(&normed, &self.decoder_rope, &mut caches[i], varlen_ref)?;
+                let t1 = sync(); attn_us += (t1 - t).as_micros(); t = t1;
+
+                x = (&attn_out + &residual)?;
+                let t1 = sync(); attn_res_us += (t1 - t).as_micros(); t = t1;
+
+                let residual = x.clone();
+                let h = layer.ffn_norm.forward(&x)?;
+                let h = h.broadcast_mul(&ada_scales[i])?;
+                let t1 = sync(); ffn_norm_ada_us += (t1 - t).as_micros(); t = t1;
+
+                let ffn_out = layer.ffn.forward(&h)?;
+                let t1 = sync(); ffn_us += (t1 - t).as_micros(); t = t1;
+
+                x = (&ffn_out + &residual)?;
+                let t1 = sync(); ffn_res_us += (t1 - t).as_micros(); t = t1;
             }
+
+            let normed = self.decoder_norm.forward(&x)?;
+            let t1 = sync();
+            let final_norm_us = (t1 - t).as_micros();
+            let total_us = attn_norm_us + attn_us + attn_res_us + ffn_norm_ada_us + ffn_us + ffn_res_us + final_norm_us;
+            eprintln!("[PROFILE decode step {:.1}ms] attn_norm={:.1}ms attn={:.1}ms attn_res={:.1}ms ffn_norm_ada={:.1}ms ffn={:.1}ms ffn_res={:.1}ms final_norm={:.1}ms",
+                total_us as f64 / 1000.0,
+                attn_norm_us as f64 / 1000.0, attn_us as f64 / 1000.0, attn_res_us as f64 / 1000.0,
+                ffn_norm_ada_us as f64 / 1000.0, ffn_us as f64 / 1000.0, ffn_res_us as f64 / 1000.0,
+                final_norm_us as f64 / 1000.0);
+            return Ok(normed);
+        }
+
+        for (i, layer) in self.decoder_layers.iter().enumerate().take(num_layers) {
+            x = layer.forward_with_cache_precomputed(&x, &ada_scales[i], &self.decoder_rope, &mut caches[i], varlen_ref)?;
         }
         self.decoder_norm.forward(&x)
     }
