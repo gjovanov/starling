@@ -75,21 +75,21 @@ impl BurnRmsNorm {
 
 impl Module for BurnRmsNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Stay in native dtype (bf16) to match burn-candle's behavior exactly
-        // burn-candle's mean_dim, sqrt, etc. all operate in bf16
-        let hidden_size = x.dim(D::Minus1)?;
-        let x_sq = x.sqr()?;
-        let mean_sq = (x_sq.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
-        let rms = (mean_sq + self.eps)?.sqrt()?;
-        x.broadcast_div(&rms)?.broadcast_mul(&self.weight)
+        // Fused CUDA kernel: single launch replaces 7 decomposed ops.
+        // Formula: x / sqrt(mean(x²) + eps) * weight
+        // The CUDA kernel accumulates in F32 internally for bf16 inputs.
+        // Requires contiguous input (residual-add outputs may have non-trivial strides).
+        candle_nn::ops::rms_norm(&x.contiguous()?, &self.weight, self.eps as f32)
     }
 }
 
 // ─── RoPE ───────────────────────────────────────────────────────────────────
 
 pub struct RoPE {
-    cos: Tensor,
-    sin: Tensor,
+    cos_f32: Tensor,     // [max_seq, half] in F32 (for encoder)
+    sin_f32: Tensor,
+    cos_bf16: Tensor,    // [max_seq, half] in BF16 (pre-cast, for decoder)
+    sin_bf16: Tensor,
 }
 
 impl RoPE {
@@ -101,41 +101,36 @@ impl RoPE {
         let inv_freq = Tensor::new(inv_freq, device)?; // [half]
         let positions: Vec<f32> = (0..max_seq).map(|p| p as f32).collect();
         let positions = Tensor::new(positions, device)?; // [max_seq]
-        // [max_seq, half] = outer product
         let freqs = positions.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?;
-        // Compute in f32, store in f32. RoPE for encoder (bf16) casts on the fly.
-        let cos = freqs.cos()?;
-        let sin = freqs.sin()?;
-        Ok(Self { cos, sin })
+        let cos_f32 = freqs.cos()?;
+        let sin_f32 = freqs.sin()?;
+        // Pre-cast to BF16 once at load time — saves 2 to_dtype kernel launches per layer per step
+        let cos_bf16 = cos_f32.to_dtype(DType::BF16)?.contiguous()?;
+        let sin_bf16 = sin_f32.to_dtype(DType::BF16)?.contiguous()?;
+        Ok(Self { cos_f32, sin_f32, cos_bf16, sin_bf16 })
     }
 
     /// Apply interleaved RoPE (is_neox_style=False) to q, k [B, seq, heads, hd].
-    /// Pairs (x[0],x[1]), (x[2],x[3]), ... — NOT split-half.
+    /// Uses candle_nn's fused CUDA kernel: single launch replaces ~36 decomposed ops.
     fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
         let seq_len = q.dim(1)?;
-        let hd = q.dim(3)?;
-        let half = hd / 2;
         let dtype = q.dtype();
-        // cos, sin: [seq, half] → [1, seq, 1, half]
-        let cos = self.cos.i(offset..offset + seq_len)?.to_dtype(dtype)?.unsqueeze(0)?.unsqueeze(2)?;
-        let sin = self.sin.i(offset..offset + seq_len)?.to_dtype(dtype)?.unsqueeze(0)?.unsqueeze(2)?;
-
-        let apply_rope = |x: &Tensor| -> Result<Tensor> {
-            // Interleaved: even indices = x[..., 0::2], odd = x[..., 1::2]
-            let (b, s, h, _d) = x.dims4()?;
-            // Reshape to [..., half, 2] then split
-            let x_pairs = x.reshape((b, s, h, half, 2))?;
-            let x1 = x_pairs.narrow(4, 0, 1)?.squeeze(4)?; // even: [B, seq, heads, half]
-            let x2 = x_pairs.narrow(4, 1, 1)?.squeeze(4)?; // odd:  [B, seq, heads, half]
-            let o1 = x1.broadcast_mul(&cos)?.broadcast_sub(&x2.broadcast_mul(&sin)?)?;
-            let o2 = x2.broadcast_mul(&cos)?.broadcast_add(&x1.broadcast_mul(&sin)?)?;
-            // Interleave back: [o1[i], o2[i]] for each i
-            let o1 = o1.unsqueeze(4)?; // [B, seq, heads, half, 1]
-            let o2 = o2.unsqueeze(4)?;
-            Tensor::cat(&[&o1, &o2], 4)?.reshape((b, s, h, hd))
+        // Use pre-cast table when dtype matches, otherwise cast on the fly (encoder F32 path)
+        let (cos, sin) = if dtype == DType::BF16 {
+            (self.cos_bf16.narrow(0, offset, seq_len)?,
+             self.sin_bf16.narrow(0, offset, seq_len)?)
+        } else {
+            (self.cos_f32.narrow(0, offset, seq_len)?.to_dtype(dtype)?.contiguous()?,
+             self.sin_f32.narrow(0, offset, seq_len)?.to_dtype(dtype)?.contiguous()?)
         };
 
-        Ok((apply_rope(q)?, apply_rope(k)?))
+        // rope_i expects [B, heads, seq, hd] — transpose from [B, seq, heads, hd]
+        let q_t = q.transpose(1, 2)?.contiguous()?;
+        let k_t = k.transpose(1, 2)?.contiguous()?;
+        let q_r = candle_nn::rotary_emb::rope_i(&q_t, &cos, &sin)?;
+        let k_r = candle_nn::rotary_emb::rope_i(&k_t, &cos, &sin)?;
+        // Back to [B, seq, heads, hd]
+        Ok((q_r.transpose(1, 2)?.contiguous()?, k_r.transpose(1, 2)?.contiguous()?))
     }
 }
 
@@ -638,6 +633,13 @@ impl VoxtralModel {
     pub fn load(safetensors_path: &std::path::Path, device: &Device) -> Result<Self> {
         let t0 = Instant::now();
         eprintln!("[CandleNative] Loading from {}", safetensors_path.display());
+
+        // Disable CUDA event tracking — we use a single stream, no cross-stream sync needed.
+        // Eliminates per-allocation overhead (2 CudaEvent objects per CudaSlice).
+        if let Ok(cuda_dev) = device.as_cuda_device() {
+            unsafe { cuda_dev.disable_event_tracking(); }
+            eprintln!("[CandleNative] Disabled CUDA event tracking (single-stream)");
+        }
 
         // Use env var to select dtype: CANDLE_NATIVE_F32=1 for f32, default bf16
         let dtype = if std::env::var("CANDLE_NATIVE_F32").is_ok() {
