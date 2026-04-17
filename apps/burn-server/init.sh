@@ -59,13 +59,32 @@ fi
 echo ""
 echo "[2/4] Building burn-server (release)..."
 cd "$SCRIPT_DIR"
-cargo build --release --bin burn-server 2>&1
 
-BINARY="$SCRIPT_DIR/target/release/burn-server"
+# Load .env to detect backend and derive cargo features
+[ -f "$SCRIPT_DIR/.env" ] && set -a && source "$SCRIPT_DIR/.env" && set +a
+
+FEATURES=""
+case "${BURN_BACKEND:-wgpu}" in
+    candle-native-flash) FEATURES="--features candle-native-flash" ;;
+    candle-native)       FEATURES="--features candle-native" ;;
+    candle)              FEATURES="--features candle" ;;
+    cuda)                FEATURES="--features cuda" ;;
+esac
+
+echo "  Backend: ${BURN_BACKEND:-wgpu}, features: ${FEATURES:-default}"
+cargo build --release --bin burn-server $FEATURES 2>&1
+
+# Check workspace target first, then local
+if [ -f "$PROJECT_DIR/target/release/burn-server" ]; then
+    BINARY="$PROJECT_DIR/target/release/burn-server"
+elif [ -f "$SCRIPT_DIR/target/release/burn-server" ]; then
+    BINARY="$SCRIPT_DIR/target/release/burn-server"
+fi
+
 if [ -f "$BINARY" ]; then
     echo "  [DONE] Binary: $BINARY"
 else
-    echo "  [FAIL] Build failed"
+    echo "  [FAIL] Build failed — binary not found"
     exit 1
 fi
 
