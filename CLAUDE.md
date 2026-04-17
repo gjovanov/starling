@@ -73,7 +73,7 @@ apps/vllm-server/
 - Runs model directly on GPU (no separate model server process)
 - Real-time streaming: ~300ms per 0.5s audio commit
 
-#### candle-native Backend (Primary — BF16 CUDA)
+#### candle-native Backend (Primary — BF16 CUDA, candle 0.9)
 Pure candle implementation matching [voxtral.c](https://github.com/antirez/voxtral.c) architecture. Produces identical transcription output.
 
 **Key architecture details:**
@@ -88,17 +88,34 @@ Pure candle implementation matching [voxtral.c](https://github.com/antirez/voxtr
 - **No right-padding on intermediate commits** — only final flush gets right-pad
 - **Context rotation**: decoder KV caches reset every ~1250 positions (~100s) for constant decode speed
 
-**Performance (BF16, RTX 5090):**
-| Duration | Encode | Decode/step | Total | Realtime |
-|----------|--------|-------------|-------|----------|
-| 5s | 0.2s | 38ms | 3.1s | 0.7× |
-| 60s | 1.3s | 37ms | 30s | 0.9× |
-| 300s | 6.0s | 44ms | 173s | 1.1× |
-| 600s (w/ rotation) | 12s | 38ms | 299s | 1.0× |
+#### candle-native-flash Backend (Fastest — BF16 CUDA, candle 0.10 + FlashAttention v2)
+Same architecture as candle-native but with fused CUDA kernels for 1.75× faster decode:
+- **candle-core 0.10.2** + **candle-flash-attn 0.10.2** (FlashAttention v2 with native GQA)
+- **Fused RmsNorm**: `candle_nn::ops::rms_norm` — 1 CUDA kernel replaces 7 ops (53 calls/step)
+- **Fused interleaved RoPE**: `candle_nn::rotary_emb::rope_i` — 1 kernel replaces ~36 ops (26 calls/step)
+- **Zero-copy RoPE reshape**: for seq=1 decode, reshape instead of transpose+contiguous (no GPU copy)
+- **Pre-cast BF16 RoPE tables**: cos/sin cast to BF16 at load time, not per-step
+- **flash_attn_varlen decode**: avoids KV cache contiguous copies via squeeze(0) contiguous view
+- **Disabled CUDA event tracking**: single-stream inference, no cross-stream sync needed
+- **GPU argmax**: transfers 1 u32 instead of 131K floats per decode step
+
+**Performance (candle-native-flash, BF16, RTX 5090, 300s audio):**
+| Metric | candle-native (0.9) | candle-native-flash (0.10) | Speedup |
+|--------|--------------------|-----------------------------|---------|
+| Decode/step | 25.7ms | **14.6ms** | **1.76×** |
+| Encode (300s) | 7.0s | **4.6s** | 1.52× |
+| Total (300s) | 106.1s | **60.9s** | **1.74×** |
+| Text tokens | 692 | 691 | identical |
+
+**Decode step breakdown (14.6ms, profiled):**
+- Attention (QKV + RoPE + flash_attn + output proj): ~6ms (41%)
+- FFN (gate+up + SiLU + mul + down): ~7ms (45%)
+- Norms + residuals + ADA: ~2ms (14%)
+- ~74% is candle dispatch overhead (~22μs/op × ~500 ops), ~26% is GPU compute (bandwidth-limited)
 
 **Streaming performance (incremental, per 0.5s commit):**
 - ~6 new adapter tokens per commit
-- ~300ms total (mel+conv+encoder+decoder)
+- ~200ms total (mel+conv+encoder+decoder) with flash backend
 - Text appears every 0.5-1s
 
 #### Setup & Run
@@ -121,12 +138,16 @@ cargo build --release --features candle-native
 
 #### Benchmark
 ```bash
-# Batch transcription
+# candle-native (0.9, baseline)
 cargo build --release --features candle-native --bin benchmark
-./target/release/benchmark --backend candle-native --audio ../../media/broadcast_1.wav --models-dir ../../models/cache --duration 60
-
-# Streaming mode (chunked encoder)
 CANDLE_STREAMING=1 ./target/release/benchmark --backend candle-native --audio ../../media/broadcast_1.wav --models-dir ../../models/cache --duration 300
+
+# candle-native-flash (0.10 + FlashAttention v2, fastest)
+cargo build --release --features candle-native-flash --bin benchmark
+CANDLE_STREAMING=1 ./target/release/benchmark --backend candle-native-flash --audio ../../media/broadcast_1.wav --models-dir ../../models/cache --duration 300
+
+# Profile decode step breakdown (per-section GPU timing)
+CANDLE_STREAMING=1 CANDLE_PROFILE=1 ./target/release/benchmark --backend candle-native-flash --audio ../../media/broadcast_1.wav --models-dir ../../models/cache --duration 5
 
 # F32 mode (for debugging, matches voxtral.c exactly)
 CANDLE_NATIVE_F32=1 ./target/release/benchmark --backend candle-native --audio /tmp/broadcast_5s.wav --models-dir ../../models/cache
@@ -144,6 +165,10 @@ apps/burn-server/
         mod.rs                           # Module declaration
         model.rs                         # Full Voxtral model (encoder+decoder+transcribe)
         engine.rs                        # Incremental streaming InferenceSession
+      candle_native_flash/
+        mod.rs                           # Module declaration
+        model.rs                         # Fused kernels (RmsNorm, RoPE, FlashAttn v2)
+        engine.rs                        # Streaming session (same API as candle_native)
       bf16/                              # Burn BF16 backend (burn-candle)
       q4/                                # Burn Q4 backend (wgpu)
     transcription/
@@ -159,7 +184,7 @@ apps/burn-server/
       ws.rs                              # WebSocket + WebRTC signaling
       state.rs                           # AppState, sessions
     web/                                 # WebRTC utilities
-  Cargo.toml                             # Features: candle-native, cuda, candle
+  Cargo.toml                             # Features: candle-native, candle-native-flash, cuda, candle
 ```
 
 #### Q4 Padding Workaround

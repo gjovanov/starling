@@ -33,7 +33,7 @@ pub struct SessionRunnerConfig {
     pub language: String,
 }
 
-fn subtitle(session_id: &str, text: String, is_final: bool, segment_index: u32, timestamp_ms: u64) -> SubtitleMessage {
+fn subtitle(session_id: &str, text: String, is_final: bool, segment_index: u32, timestamp_ms: u64, inference_time_ms: Option<f32>) -> SubtitleMessage {
     SubtitleMessage {
         msg_type: "subtitle".to_string(),
         session_id: session_id.to_string(),
@@ -41,6 +41,7 @@ fn subtitle(session_id: &str, text: String, is_final: bool, segment_index: u32, 
         is_final,
         segment_index,
         timestamp_ms,
+        inference_time_ms,
     }
 }
 
@@ -67,7 +68,7 @@ pub async fn run_session(
         Ok(Err(e)) => {
             eprintln!("[Session {}] Failed to create inference session: {}", session_id, e);
             let _ = state_update_tx.send((session_id.clone(), SessionState::Error)).await;
-            let _ = subtitle_tx.send(subtitle(&session_id, format!("Error: {}", e), true, 0, 0)).await;
+            let _ = subtitle_tx.send(subtitle(&session_id, format!("Error: {}", e), true, 0, 0, None)).await;
             return;
         }
         Err(e) => {
@@ -82,7 +83,7 @@ pub async fn run_session(
         .await;
 
     // Broadcast start
-    let _ = subtitle_tx.send(subtitle(&session_id, String::new(), false, 0, 0)).await;
+    let _ = subtitle_tx.send(subtitle(&session_id, String::new(), false, 0, 0, None)).await;
 
     // Spawn FFmpeg
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<f32>>(64);
@@ -171,6 +172,7 @@ pub async fn run_session(
         while let Ok((batch, current_time)) = batch_rx.recv() {
             inference_session.send_audio(&batch);
 
+            let t_commit = Instant::now();
             let batch_delta = match inference_session.commit() {
                 Ok(delta) => delta,
                 Err(e) => {
@@ -178,6 +180,7 @@ pub async fn run_session(
                     String::new()
                 }
             };
+            let infer_ms = (t_commit.elapsed().as_secs_f32() * 10000.0).round() / 10.0; // round to 0.1ms
 
             if !batch_delta.is_empty() {
                 growing_text.push_str(&batch_delta);
@@ -186,14 +189,14 @@ pub async fn run_session(
                 for sentence in sentences {
                     segment_count += 1;
                     let _ = subtitle_tx.blocking_send(
-                        subtitle(&infer_sid, sentence, true, segment_count - 1, (current_time * 1000.0) as u64));
+                        subtitle(&infer_sid, sentence, true, segment_count - 1, (current_time * 1000.0) as u64, Some(infer_ms)));
                 }
 
                 growing_text = remainder;
 
                 if !growing_text.trim().is_empty() {
                     let _ = subtitle_tx.blocking_send(
-                        subtitle(&infer_sid, growing_text.trim().to_string(), false, segment_count, (current_time * 1000.0) as u64));
+                        subtitle(&infer_sid, growing_text.trim().to_string(), false, segment_count, (current_time * 1000.0) as u64, Some(infer_ms)));
                 }
             }
 
@@ -226,7 +229,7 @@ pub async fn run_session(
             for sentence in all {
                 segment_count += 1;
                 let _ = subtitle_tx.blocking_send(
-                    subtitle(&infer_sid, sentence, true, segment_count - 1, 0));
+                    subtitle(&infer_sid, sentence, true, segment_count - 1, 0, None));
             }
         }
 

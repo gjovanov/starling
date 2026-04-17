@@ -18,6 +18,9 @@ pub struct SubtitleMessage {
     pub is_final: bool,
     pub segment_index: u32,
     pub timestamp_ms: u64,
+    /// Model inference time in milliseconds (per commit)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inference_time_ms: Option<f32>,
 }
 
 /// Session state enumeration
