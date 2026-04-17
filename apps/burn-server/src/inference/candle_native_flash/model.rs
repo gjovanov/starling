@@ -10,31 +10,23 @@ use candle_nn::VarBuilder;
 use candle_flash_attn::flash_attn;
 use std::time::Instant;
 
-// Custom Linear that stores pre-transposed contiguous weight.
-// candle-nn's Linear uses broadcast_left+t which creates non-contiguous views
-// that may cause slightly different cuBLAS execution paths in bf16.
+// Custom Linear that stores pre-transposed, pre-unsqueezed weight.
+// Weight stored as [1, in, out] to avoid per-forward unsqueeze(0).
 struct Linear {
-    weight_t: Tensor,  // [in_features, out_features] — pre-transposed, contiguous
+    weight_3d: Tensor,  // [1, in_features, out_features] — ready for batched matmul
     bias: Option<Tensor>,
 }
 
 impl Linear {
     fn new(weight: Tensor, bias: Option<Tensor>) -> Result<Self> {
-        // weight is [out, in] (PyTorch convention), transpose to [in, out]
-        let weight_t = weight.t()?.contiguous()?;
-        Ok(Self { weight_t, bias })
+        let weight_3d = weight.t()?.contiguous()?.unsqueeze(0)?;
+        Ok(Self { weight_3d, bias })
     }
 }
 
 impl Module for Linear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // x [B, S, in] @ weight_t [in, out] → [B, S, out]
-        let w = if x.dims().len() == 3 {
-            self.weight_t.unsqueeze(0)?
-        } else {
-            self.weight_t.clone()
-        };
-        let out = x.matmul(&w)?;
+        let out = x.matmul(&self.weight_3d)?;
         match &self.bias {
             None => Ok(out),
             Some(bias) => out.broadcast_add(bias),
@@ -113,9 +105,9 @@ impl RoPE {
     /// Apply interleaved RoPE (is_neox_style=False) to q, k [B, seq, heads, hd].
     /// Uses candle_nn's fused CUDA kernel: single launch replaces ~36 decomposed ops.
     fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
-        let seq_len = q.dim(1)?;
+        let (b, seq_len, n_heads, hd) = q.dims4()?;
+        let n_kv_heads = k.dim(2)?;
         let dtype = q.dtype();
-        // Use pre-cast table when dtype matches, otherwise cast on the fly (encoder F32 path)
         let (cos, sin) = if dtype == DType::BF16 {
             (self.cos_bf16.narrow(0, offset, seq_len)?,
              self.sin_bf16.narrow(0, offset, seq_len)?)
@@ -124,13 +116,23 @@ impl RoPE {
              self.sin_f32.narrow(0, offset, seq_len)?.to_dtype(dtype)?.contiguous()?)
         };
 
-        // rope_i expects [B, heads, seq, hd] — transpose from [B, seq, heads, hd]
-        let q_t = q.transpose(1, 2)?.contiguous()?;
-        let k_t = k.transpose(1, 2)?.contiguous()?;
-        let q_r = candle_nn::rotary_emb::rope_i(&q_t, &cos, &sin)?;
-        let k_r = candle_nn::rotary_emb::rope_i(&k_t, &cos, &sin)?;
-        // Back to [B, seq, heads, hd]
-        Ok((q_r.transpose(1, 2)?.contiguous()?, k_r.transpose(1, 2)?.contiguous()?))
+        if seq_len == 1 {
+            // Decode path: [B, 1, heads, hd] → reshape to [B, heads, 1, hd] (zero-copy).
+            // Both have the same flat memory layout when seq=1, so reshape is metadata-only.
+            // Eliminates 4 contiguous() GPU copy kernels per layer.
+            let q_bhsd = q.reshape((b, n_heads, 1, hd))?;
+            let k_bhsd = k.reshape((b, n_kv_heads, 1, hd))?;
+            let q_r = candle_nn::rotary_emb::rope_i(&q_bhsd, &cos, &sin)?;
+            let k_r = candle_nn::rotary_emb::rope_i(&k_bhsd, &cos, &sin)?;
+            Ok((q_r.reshape((b, 1, n_heads, hd))?, k_r.reshape((b, 1, n_kv_heads, hd))?))
+        } else {
+            // Prefill path: seq > 1, need actual transpose + contiguous
+            let q_t = q.transpose(1, 2)?.contiguous()?;
+            let k_t = k.transpose(1, 2)?.contiguous()?;
+            let q_r = candle_nn::rotary_emb::rope_i(&q_t, &cos, &sin)?;
+            let k_r = candle_nn::rotary_emb::rope_i(&k_t, &cos, &sin)?;
+            Ok((q_r.transpose(1, 2)?.contiguous()?, k_r.transpose(1, 2)?.contiguous()?))
+        }
     }
 }
 
@@ -451,7 +453,7 @@ impl DecoderAttention {
         let wv = vb.get((kv_dim, d_model), &format!("{prefix}.attention.wv.weight"))?;
         // Fuse: [q_dim+2*kv_dim, d_model] then transpose to [d_model, q_dim+2*kv_dim]
         let wqkv = Tensor::cat(&[&wq, &wk, &wv], 0)?; // [6144, 3072]
-        let wqkv_t = wqkv.t()?.contiguous()?; // [3072, 6144]
+        let wqkv_t = wqkv.t()?.contiguous()?.unsqueeze(0)?; // [1, 3072, 6144] pre-unsqueezed
 
         let wo = linear_no_bias(q_dim, d_model, vb.pp(&format!("{prefix}.attention.wo")))?;
 
@@ -468,12 +470,8 @@ impl DecoderAttention {
         let (b, seq, _) = x.dims3()?;
         let offset = cache.logical_len();
 
-        // Fused QKV: single matmul instead of 3
-        let wqkv = if x.dims().len() == 3 {
-            x.matmul(&self.wqkv_t.unsqueeze(0)?)?
-        } else {
-            x.matmul(&self.wqkv_t)?
-        };
+        // Fused QKV: single matmul (weight pre-unsqueezed to [1, in, out])
+        let wqkv = x.matmul(&self.wqkv_t)?;
         let q = wqkv.narrow(D::Minus1, 0, self.q_dim)?.reshape((b, seq, self.n_heads, self.head_dim))?;
         let k = wqkv.narrow(D::Minus1, self.q_dim, self.kv_dim)?.reshape((b, seq, self.n_kv_heads, self.head_dim))?;
         let v = wqkv.narrow(D::Minus1, self.q_dim + self.kv_dim, self.kv_dim)?.reshape((b, seq, self.n_kv_heads, self.head_dim))?;
@@ -530,19 +528,15 @@ impl DecoderSwiGLU {
         let w1 = vb.get((hidden_dim, d_model), &format!("{prefix}.feed_forward.w1.weight"))?;
         let w3 = vb.get((hidden_dim, d_model), &format!("{prefix}.feed_forward.w3.weight"))?;
         let w13 = Tensor::cat(&[&w1, &w3], 0)?; // [2*hidden, d_model]
-        let w13_t = w13.t()?.contiguous()?;       // [d_model, 2*hidden]
+        let w13_t = w13.t()?.contiguous()?.unsqueeze(0)?; // [1, d_model, 2*hidden] pre-unsqueezed
 
         let w2 = linear_no_bias(hidden_dim, d_model, vb.pp(&format!("{prefix}.feed_forward.w2")))?;
         Ok(Self { w13_t, w2, hidden_dim })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Fused gate+up: single matmul then split
-        let gate_up = if x.dims().len() == 3 {
-            x.matmul(&self.w13_t.unsqueeze(0)?)?
-        } else {
-            x.matmul(&self.w13_t)?
-        };
+        // Fused gate+up matmul then SwiGLU activation
+        let gate_up = x.matmul(&self.w13_t)?;
         let gate = gate_up.narrow(D::Minus1, 0, self.hidden_dim)?.silu()?;
         let up = gate_up.narrow(D::Minus1, self.hidden_dim, self.hidden_dim)?;
         self.w2.forward(&(gate * up)?)
@@ -625,7 +619,7 @@ pub struct VoxtralModel {
     decoder_norm: BurnRmsNorm,
     decoder_rope: RoPE,
     tok_embed: Tensor,
-    tok_embed_t: Tensor, // [D, V] pre-transposed for lm_head
+    tok_embed_t: Tensor, // [1, D, V] pre-transposed+unsqueezed for lm_head
     device: Device,
 }
 
@@ -674,7 +668,7 @@ impl VoxtralModel {
             (131072, 3072),
             "mm_streams_embeddings.embedding_module.tok_embeddings.weight",
         )?;
-        let tok_embed_t = tok_embed.t()?.contiguous()?; // [3072, 131072] pre-transposed
+        let tok_embed_t = tok_embed.t()?.contiguous()?.unsqueeze(0)?; // [1, 3072, 131072] pre-unsqueezed
         eprintln!("[CandleNative] Token embedding on GPU ({:.0} MB)",
             131072.0 * 3072.0 * 2.0 / 1e6);
 
@@ -754,8 +748,7 @@ impl VoxtralModel {
 
     /// lm_head: hidden @ tok_embed^T → logits (uses pre-transposed weight)
     pub fn lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
-        let embed_t = self.tok_embed_t.unsqueeze(0)?; // [1, D, V]
-        hidden.contiguous()?.matmul(&embed_t)
+        hidden.contiguous()?.matmul(&self.tok_embed_t)
     }
 
     /// lm_head + argmax in one call — avoids GPU→CPU transfer of 131K floats.
@@ -1071,11 +1064,8 @@ pub fn transcribe_streaming(model: &VoxtralModel, mel: &Tensor, t_embed: &Tensor
         let x = (&audio_pos + &text_embed)?;
 
         let hidden = model.decoder_forward(x, &ada_scales, &mut dec_caches)?;
-        let logits = model.lm_head(&hidden)?;
-        let logits_f32: Vec<f32> = logits.to_dtype(DType::F32)?.reshape(131072)?.to_vec1()?;
-        let token = logits_f32.iter().enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32).unwrap_or(0);
+        // GPU argmax: transfers 1 u32 instead of 131K floats
+        let token = model.lm_head_argmax(&hidden)?;
 
         generated.push(token);
         prev_token = token;
