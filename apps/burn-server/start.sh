@@ -23,7 +23,12 @@ if [ -f /usr/share/vulkan/icd.d/dzn_icd.json ]; then
     export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/usr/share/vulkan/icd.d/dzn_icd.json}"
 fi
 
-BINARY="$SCRIPT_DIR/target/release/burn-server"
+# Prefer workspace-level binary (cargo workspace builds go to root target/)
+if [ -f "$PROJECT_DIR/target/release/burn-server" ]; then
+    BINARY="$PROJECT_DIR/target/release/burn-server"
+else
+    BINARY="$SCRIPT_DIR/target/release/burn-server"
+fi
 
 if [ ! -f "$BINARY" ]; then
     echo "ERROR: Binary not found at $BINARY"
