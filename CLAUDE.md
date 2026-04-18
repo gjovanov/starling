@@ -118,6 +118,34 @@ Same architecture as candle-native but with fused CUDA kernels for 1.75× faster
 - ~200ms total (mel+conv+encoder+decoder) with flash backend
 - Text appears every 0.5-1s
 
+#### candle-cpu Backend (CPU-only, Q4 GGUF)
+Pure CPU inference using Q4 GGUF weights. Two sub-variants:
+- **candle-cpu**: candle's built-in Q4 matmul (AVX2 only, 275ms/step)
+- **candle-cpu-ggml**: ggml graph API with AVX-512 + VNNI (105ms/step, 2.6× faster)
+
+**Prerequisites for candle-cpu-ggml:**
+```bash
+# Build ggml static libraries from llama.cpp (one-time)
+cd ~/gjovanov/llama.cpp
+mkdir -p build-cpu && cd build-cpu
+cmake .. -DGGML_CUDA=OFF -DGGML_CPU=ON -DGGML_AVX512=ON \
+  -DGGML_AVX512_VNNI=ON -DGGML_NATIVE=ON -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+make -j$(nproc) ggml
+```
+
+**Performance (AMD Ryzen 9 9955HX3D, 16c/32t, 96MB L3, DDR5-5600, 5s audio):**
+| Metric | candle-cpu (AVX2) | candle-cpu-ggml (AVX-512) | Speedup |
+|--------|-------------------|---------------------------|---------|
+| Decode/step | 275ms | **105ms** | **2.6×** |
+| Encoder (5s) | 172s | **29s** | **5.9×** |
+| Overall | 17× realtime | **3.3× realtime** | **5.2×** |
+
+**Environment variables:**
+- `GGML_THREADS=16` — thread count for ggml matmul (default: 16)
+- `CANDLE_PROFILE=1` — per-component timing (decoder_forward, lm_head)
+- `CANDLE_CPU_F32_DECODER=1` — dequantize decoder to F32 (candle-cpu only, slower)
+
 #### Setup & Run
 ```bash
 cd apps/burn-server
@@ -129,8 +157,11 @@ cd apps/burn-server
 #   TURN_SHARED_SECRET=your-secret
 #   FORCE_RELAY=true
 
-# Build (requires CUDA toolkit)
+# Build GPU (requires CUDA toolkit)
 cargo build --release --features candle-native
+
+# Build CPU with ggml AVX-512 (requires llama.cpp pre-built)
+RUSTFLAGS="-C target-cpu=native" cargo build --release --features candle-cpu-ggml
 
 # Start
 ./start.sh
@@ -142,9 +173,13 @@ cargo build --release --features candle-native
 cargo build --release --features candle-native --bin benchmark
 CANDLE_STREAMING=1 ./target/release/benchmark --backend candle-native --audio ../../media/broadcast_1.wav --models-dir ../../models/cache --duration 300
 
-# candle-native-flash (0.10 + FlashAttention v2, fastest)
+# candle-native-flash (0.10 + FlashAttention v2, fastest GPU)
 cargo build --release --features candle-native-flash --bin benchmark
 CANDLE_STREAMING=1 ./target/release/benchmark --backend candle-native-flash --audio ../../media/broadcast_1.wav --models-dir ../../models/cache --duration 300
+
+# candle-cpu-ggml (CPU with AVX-512)
+RUSTFLAGS="-C target-cpu=native" cargo build --release --features candle-cpu-ggml --bin benchmark
+GGML_THREADS=16 CANDLE_STREAMING=1 ./target/release/benchmark --backend candle-cpu --audio ../../media/broadcast_1.wav --models-dir ../../models/cache --duration 5
 
 # Profile decode step breakdown (per-section GPU timing)
 CANDLE_STREAMING=1 CANDLE_PROFILE=1 ./target/release/benchmark --backend candle-native-flash --audio ../../media/broadcast_1.wav --models-dir ../../models/cache --duration 5
@@ -169,6 +204,10 @@ apps/burn-server/
         mod.rs                           # Module declaration
         model.rs                         # Fused kernels (RmsNorm, RoPE, FlashAttn v2)
         engine.rs                        # Streaming session (same API as candle_native)
+      candle_cpu/
+        mod.rs                           # Module declaration
+        model.rs                         # CPU Q4 model (ggml graph API or candle QMatMul)
+        engine.rs                        # Streaming session for CPU
       bf16/                              # Burn BF16 backend (burn-candle)
       q4/                                # Burn Q4 backend (wgpu)
     transcription/
@@ -184,7 +223,12 @@ apps/burn-server/
       ws.rs                              # WebSocket + WebRTC signaling
       state.rs                           # AppState, sessions
     web/                                 # WebRTC utilities
-  Cargo.toml                             # Features: candle-native, candle-native-flash, cuda, candle
+  Cargo.toml                             # Features: candle-native, candle-native-flash, candle-cpu, candle-cpu-ggml, cuda, candle
+libs/
+  ggml-matmul/                           # FFI wrapper for ggml's AVX-512 Q4 matmul
+    csrc/ggml_matmul_wrapper.c           # C wrapper using ggml graph compute API
+    src/lib.rs                           # Rust FFI bindings
+    build.rs                             # Links pre-built llama.cpp ggml static libs
 ```
 
 #### Q4 Padding Workaround
