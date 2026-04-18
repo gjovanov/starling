@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "libs/voxtral-core",
+    "libs/ggml-matmul",
     "apps/burn-server",
     "apps/wasm-engine",
     "apps/wasm-poc",

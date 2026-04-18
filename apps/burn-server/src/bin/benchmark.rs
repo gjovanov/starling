@@ -503,6 +503,62 @@ fn run_q4(args: &Args) {
     println!("{}", text);
 }
 
+#[cfg(feature = "candle-cpu")]
+fn run_candle_cpu(args: &Args) {
+    use burn_server::inference::candle_cpu::model;
+
+    let device = candle_core_cpu::Device::Cpu;
+    let gguf_path = args.models_dir.join("q4").join("voxtral-q4.gguf");
+    let tokenizer_path = args.models_dir.join("tokenizer").join("tekken.json");
+
+    // Set ggml thread count from GGML_THREADS env var
+    #[cfg(feature = "candle-cpu-ggml")]
+    {
+        let threads = std::env::var("GGML_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(16);
+        ggml_matmul::set_threads(threads);
+        eprintln!("ggml threads: {}", threads);
+    }
+
+    eprintln!("\n=== CandleCpu (Q4 GGUF, CPU) Benchmark ===");
+    eprintln!("GGUF: {}", gguf_path.display());
+
+    let t_load = Instant::now();
+    let vox_model = model::VoxtralModel::load(&gguf_path, &device).expect("model load");
+    let load_secs = t_load.elapsed().as_secs_f32();
+    eprintln!("Model loaded: {:.1}s", load_secs);
+
+    let tokenizer = TekkenDecoder::from_file(&tokenizer_path).expect("tokenizer");
+
+    // Use Q4 padding (76 left-pad tokens for Q4 sensitivity)
+    let (flat, n_mels, n_frames) = prepare_mel_q4(&args.audio, args.duration);
+    let mel = candle_core_cpu::Tensor::new(&flat[..n_mels * n_frames], &device)
+        .and_then(|t| t.reshape((1, n_mels, n_frames)))
+        .expect("mel tensor");
+    let t_embed = model::compute_time_embedding(6.0, 3072, &device).expect("t_embed");
+
+    let t_infer = Instant::now();
+    let token_ids = if std::env::var("CANDLE_STREAMING").is_ok() {
+        model::transcribe_streaming(&vox_model, &mel, &t_embed).expect("transcribe_streaming")
+    } else {
+        model::transcribe(&vox_model, &mel, &t_embed).expect("transcribe")
+    };
+    let infer_secs = t_infer.elapsed().as_secs_f32();
+
+    let text = tokenizer.decode(&token_ids.iter().map(|&t| t as i32).collect::<Vec<_>>());
+    let audio_secs = n_frames as f32 / 200.0;
+
+    eprintln!("\n=== CandleCpu Results ===");
+    eprintln!("Load:       {:.1}s", load_secs);
+    eprintln!("Inference:  {:.1}s", infer_secs);
+    eprintln!("Tokens:     {}", token_ids.len());
+    eprintln!("Realtime:   {:.1}×", infer_secs / audio_secs);
+    eprintln!("Text (200c): {:?}", &text[..text.char_indices().take(200).last().map_or(0, |(i, c)| i + c.len_utf8())]);
+    println!("{}", text);
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -517,8 +573,10 @@ fn main() {
         "candle-native" => run_candle_native(&args),
         #[cfg(feature = "candle-native-flash")]
         "candle-native-flash" => run_candle_native_flash(&args),
+        #[cfg(feature = "candle-cpu")]
+        "candle-cpu" => run_candle_cpu(&args),
         other => {
-            eprintln!("Unknown backend: {}. Use 'wgpu', 'q4', 'cuda', 'candle', 'candle-native', or 'candle-native-flash'.", other);
+            eprintln!("Unknown backend: {}. Use 'wgpu', 'q4', 'cuda', 'candle', 'candle-native', 'candle-native-flash', or 'candle-cpu'.", other);
             std::process::exit(1);
         }
     }

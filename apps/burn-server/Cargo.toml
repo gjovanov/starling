@@ -45,10 +45,16 @@ memmap2 = "0.9"
 # Use 0.9.x to match burn-candle's candle-core version (avoids numerical drift)
 candle-core-native = { version = "0.9", package = "candle-core", features = ["cuda"], optional = true }
 candle-nn-native = { version = "0.9", package = "candle-nn", features = ["cuda"], optional = true }
+# candle 0.9 CPU-only (no CUDA dependency, uses quantized module for Q4 GGUF)
+candle-core-cpu = { version = "0.9", package = "candle-core", default-features = false, optional = true }
+candle-nn-cpu = { version = "0.9", package = "candle-nn", default-features = false, optional = true }
 # candle 0.10 + flash-attn (for future optimization once 0.9 correctness is proven)
 candle-core = { version = "0.10", package = "candle-core", features = ["cuda"], optional = true }
 candle-nn = { version = "0.10", package = "candle-nn", features = ["cuda"], optional = true }
 candle-flash-attn = { version = "0.10", optional = true }
+
+# ggml AVX-512 quantized matmul (CPU-only, no CUDA dependency)
+ggml-matmul = { path = "../../libs/ggml-matmul", optional = true }
 
 # WebRTC
 webrtc = "0.11"
@@ -79,6 +85,8 @@ cuda = ["burn/cuda"]
 candle = ["burn/candle-cuda"]
 candle-native = ["dep:candle-core-native", "dep:candle-nn-native"]
 candle-native-flash = ["dep:candle-core", "dep:candle-nn", "dep:candle-flash-attn"]
+candle-cpu = ["dep:candle-core-cpu", "dep:candle-nn-cpu"]
+candle-cpu-ggml = ["candle-cpu", "dep:ggml-matmul"]
 
 # [patch.crates-io] moved to workspace root Cargo.toml
 
