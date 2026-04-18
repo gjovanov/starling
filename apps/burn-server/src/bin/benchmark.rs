@@ -559,6 +559,83 @@ fn run_candle_cpu(args: &Args) {
     println!("{}", text);
 }
 
+/// Streaming engine benchmark: feeds audio in 0.5s chunks through CandleCpuEngine,
+/// measuring per-commit latency (encoder + decoder breakdown).
+#[cfg(feature = "candle-cpu")]
+fn run_candle_cpu_engine(args: &Args) {
+    use burn_server::inference::candle_cpu::engine::CandleCpuEngine;
+    use burn_server::inference::{InferenceEngine, InferenceSession};
+
+    let gguf_path = args.models_dir.join("q4").join("voxtral-q4.gguf");
+    let tokenizer_path = args.models_dir.join("tokenizer").join("tekken.json");
+
+    #[cfg(feature = "candle-cpu-ggml")]
+    {
+        let threads = std::env::var("GGML_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(16);
+        ggml_matmul::set_threads(threads);
+        eprintln!("ggml threads: {}", threads);
+    }
+
+    eprintln!("\n=== CandleCpu Engine (streaming, 0.5s commits) ===");
+
+    let t_load = Instant::now();
+    let engine = CandleCpuEngine::load(&gguf_path, &tokenizer_path).expect("engine load");
+    eprintln!("Engine loaded: {:.1}s", t_load.elapsed().as_secs_f32());
+
+    // Load audio
+    let reader = hound::WavReader::open(&args.audio).expect("WAV");
+    let spec = reader.spec();
+    let mut samples: Vec<f32> = if spec.bits_per_sample == 16 {
+        reader.into_samples::<i16>().map(|s| s.unwrap() as f32 / 32768.0).collect()
+    } else {
+        reader.into_samples::<f32>().map(|s| s.unwrap()).collect()
+    };
+    if args.duration > 0 {
+        let max = args.duration * spec.sample_rate as usize;
+        if samples.len() > max { samples.truncate(max); }
+    }
+    let audio_secs = samples.len() as f32 / spec.sample_rate as f32;
+    eprintln!("Audio: {:.1}s ({} samples)", audio_secs, samples.len());
+
+    // Create session and feed audio in 0.5s chunks (8000 samples at 16kHz)
+    let mut session = engine.create_session("de").expect("session");
+    let chunk_size = 8000; // 0.5s at 16kHz
+    let mut all_text = String::new();
+
+    let t_start = Instant::now();
+    for (i, chunk) in samples.chunks(chunk_size).enumerate() {
+        session.send_audio(chunk);
+        let t_commit = Instant::now();
+        match session.commit() {
+            Ok(delta) => {
+                let commit_ms = t_commit.elapsed().as_secs_f32() * 1000.0;
+                if !delta.is_empty() {
+                    all_text.push_str(&delta);
+                }
+                if commit_ms > 10.0 { // skip trivial commits
+                    let audio_pos = (i + 1) as f32 * 0.5;
+                    eprintln!(
+                        "[COMMIT #{:3}] {:.0}ms @ {:.1}s | \"{}\"",
+                        i + 1, commit_ms, audio_pos,
+                        if delta.len() > 50 { &delta[..50] } else { &delta }
+                    );
+                }
+            }
+            Err(e) => eprintln!("[COMMIT #{}] ERROR: {}", i + 1, e),
+        }
+    }
+    let total_ms = t_start.elapsed().as_secs_f32() * 1000.0;
+    let realtime = total_ms / 1000.0 / audio_secs;
+
+    eprintln!("\n=== Engine Results ===");
+    eprintln!("Total:      {:.0}ms ({:.2}× realtime for {:.0}s audio)", total_ms, realtime, audio_secs);
+    eprintln!("Text (200c): {:?}", &all_text[..all_text.char_indices().take(200).last().map_or(0, |(i, c)| i + c.len_utf8())]);
+    println!("{}", all_text);
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -575,8 +652,10 @@ fn main() {
         "candle-native-flash" => run_candle_native_flash(&args),
         #[cfg(feature = "candle-cpu")]
         "candle-cpu" => run_candle_cpu(&args),
+        #[cfg(feature = "candle-cpu")]
+        "candle-cpu-engine" => run_candle_cpu_engine(&args),
         other => {
-            eprintln!("Unknown backend: {}. Use 'wgpu', 'q4', 'cuda', 'candle', 'candle-native', 'candle-native-flash', or 'candle-cpu'.", other);
+            eprintln!("Unknown backend: {other}. Available: wgpu, q4, cuda, candle, candle-native, candle-native-flash, candle-cpu, candle-cpu-engine.");
             std::process::exit(1);
         }
     }

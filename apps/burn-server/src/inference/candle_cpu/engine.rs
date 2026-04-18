@@ -82,8 +82,15 @@ pub struct CandleCpuSession {
     audio_samples: Vec<f32>,
     commit_count: usize,
 
+    // Mel + conv caching — avoid recomputing on full audio each commit
+    mel_samples_processed: usize,
+    cached_mel_flat: Vec<f32>,    // [n_mels × n_frames] column-major
+    cached_mel_frames: usize,
+    cached_conv_flat: Vec<f32>,   // [1, T/2, 1280] conv output flattened
+    cached_conv_frames: usize,   // number of conv output frames in cache
+
     // Incremental encoding state
-    processed_conv_frames: usize,
+    processed_conv_frames: usize, // how many conv frames already encoded
     enc_caches: Vec<KVCache>,
     enc_residual: Vec<f32>,
     enc_residual_count: usize,
@@ -126,6 +133,11 @@ impl CandleCpuSession {
             mel_spec: MelSpectrogram::new(MelConfig::default()),
             audio_samples,
             commit_count: 0,
+            mel_samples_processed: 0,
+            cached_mel_flat: Vec::new(),
+            cached_mel_frames: 0,
+            cached_conv_flat: Vec::new(),
+            cached_conv_frames: 0,
             processed_conv_frames: 0,
             enc_caches: VoxtralModel::new_encoder_caches(),
             enc_residual: Vec::new(),
@@ -162,32 +174,153 @@ impl InferenceSession for CandleCpuSession {
 
         let model = self.model.lock().map_err(|e| format!("lock: {}", e))?;
         let device = Device::Cpu;
+        let profile = std::env::var("CANDLE_PROFILE").is_ok();
+        let t_enc_start = Instant::now();
 
-        // Step 1: Compute mel
-        let log_mel = self.mel_spec.compute_log(&self.audio_samples);
-        let n_frames = log_mel.len();
-        let n_mels = if n_frames > 0 { log_mel[0].len() } else { 128 };
-        if n_frames == 0 {
-            return Ok(String::new());
-        }
+        // Step 1: Incremental mel — only compute mel for new audio samples.
+        // STFT uses hop_length=160, window_size=400. Recompute the last few
+        // boundary frames to handle window overlap with new audio.
+        let n_mels = 128;
+        let hop = 160;
+        let window_overlap_frames = 3; // recompute last 3 frames for boundary correctness
+        let total_samples = self.audio_samples.len();
 
-        let mut flat = vec![0.0f32; n_mels * n_frames];
-        for (t, frame) in log_mel.iter().enumerate() {
-            for (m, &val) in frame.iter().enumerate() {
-                flat[m * n_frames + t] = val;
+        if self.mel_samples_processed == 0 {
+            // First commit: compute mel on all audio
+            let log_mel = self.mel_spec.compute_log(&self.audio_samples);
+            let n_frames = log_mel.len();
+            if n_frames == 0 { return Ok(String::new()); }
+            self.cached_mel_flat = vec![0.0f32; n_mels * n_frames];
+            for (t, frame) in log_mel.iter().enumerate() {
+                for (m, &val) in frame.iter().enumerate() {
+                    self.cached_mel_flat[m * n_frames + t] = val;
+                }
             }
-        }
-        let mel = Tensor::new(flat, &device)
-            .and_then(|t| t.reshape((1, n_mels, n_frames)))
-            .map_err(|e| format!("mel: {}", e))?;
+            self.cached_mel_frames = n_frames;
+            self.mel_samples_processed = total_samples;
+        } else {
+            // Incremental: compute mel ONLY on new audio samples + small overlap window.
+            // The overlap ensures boundary mel frames are computed correctly.
+            let overlap_samples = window_overlap_frames * hop + 400; // 400 = window_size
+            let start_sample = if self.mel_samples_processed > overlap_samples {
+                self.mel_samples_processed - overlap_samples
+            } else {
+                0
+            };
+            // Only process from start_sample to end of current audio (NOT from 0)
+            let new_mel = self.mel_spec.compute_log(&self.audio_samples[start_sample..total_samples]);
+            let new_n_frames = new_mel.len();
+            if new_n_frames == 0 { return Ok(String::new()); }
 
-        // Step 2: Conv on full mel
-        let conv_out = model
-            .encoder
-            .conv
-            .forward(&mel)
-            .map_err(|e| format!("conv: {}", e))?;
-        let total_conv = conv_out.dim(1).map_err(|e| format!("dim: {}", e))?;
+            // How many cached frames to keep (before the overlap zone)
+            let keep_frames = if self.cached_mel_frames > window_overlap_frames {
+                self.cached_mel_frames - window_overlap_frames
+            } else {
+                0
+            };
+            let total_frames = keep_frames + new_n_frames;
+
+            // Rebuild flat mel: keep old frames + new frames
+            let mut new_flat = vec![0.0f32; n_mels * total_frames];
+            // Copy kept frames from cache
+            if keep_frames > 0 {
+                for m in 0..n_mels {
+                    let src_offset = m * self.cached_mel_frames;
+                    let dst_offset = m * total_frames;
+                    new_flat[dst_offset..dst_offset + keep_frames]
+                        .copy_from_slice(&self.cached_mel_flat[src_offset..src_offset + keep_frames]);
+                }
+            }
+            // Copy new frames
+            for (t, frame) in new_mel.iter().enumerate() {
+                for (m, &val) in frame.iter().enumerate() {
+                    new_flat[m * total_frames + keep_frames + t] = val;
+                }
+            }
+            self.cached_mel_flat = new_flat;
+            self.cached_mel_frames = total_frames;
+            self.mel_samples_processed = total_samples;
+        }
+
+        // Step 2: Incremental conv — only compute conv on new mel frames.
+        // Conv1 (kernel=3, stride=1, causal) and Conv2 (kernel=3, stride=2, causal)
+        // are causal: output[T] depends only on input[≤T].
+        // We recompute from a few frames before new content to handle kernel overlap.
+        let n_frames = self.cached_mel_frames;
+        let conv_kernel_overlap = 4; // frames of mel context needed for conv boundary
+
+        if self.cached_conv_frames == 0 {
+            // First time: run conv on full mel
+            let mel = Tensor::new(self.cached_mel_flat.clone(), &device)
+                .and_then(|t| t.reshape((1, n_mels, n_frames)))
+                .map_err(|e| format!("mel: {}", e))?;
+            let conv_out = model.encoder.conv.forward(&mel).map_err(|e| format!("conv: {}", e))?;
+            let total_conv = conv_out.dim(1).map_err(|e| format!("dim: {}", e))?;
+            // Cache conv output as flat f32
+            let conv_flat: Vec<f32> = conv_out.flatten_all()
+                .and_then(|t| t.to_vec1())
+                .map_err(|e| format!("conv flatten: {}", e))?;
+            self.cached_conv_flat = conv_flat;
+            self.cached_conv_frames = total_conv;
+        } else {
+            // Incremental: run conv only on recent mel frames (with overlap for kernels)
+            let keep_conv = self.cached_conv_frames;
+            // Conv2 has stride=2, so each conv output frame corresponds to ~2 mel frames.
+            // We need conv_kernel_overlap mel frames of context.
+            let mel_start = if n_frames > conv_kernel_overlap * 4 {
+                // Map back from conv frames to mel frames: conv output T corresponds to mel frame ~2*T
+                let recompute_mel_start = (keep_conv.saturating_sub(conv_kernel_overlap)) * 2;
+                recompute_mel_start.min(n_frames)
+            } else {
+                0
+            };
+
+            // Extract mel slice [n_mels, mel_start..n_frames]
+            let slice_len = n_frames - mel_start;
+            let mut mel_slice = vec![0.0f32; n_mels * slice_len];
+            for m in 0..n_mels {
+                let src_offset = m * n_frames + mel_start;
+                let dst_offset = m * slice_len;
+                mel_slice[dst_offset..dst_offset + slice_len]
+                    .copy_from_slice(&self.cached_mel_flat[src_offset..src_offset + slice_len]);
+            }
+            let mel_partial = Tensor::new(mel_slice, &device)
+                .and_then(|t| t.reshape((1, n_mels, slice_len)))
+                .map_err(|e| format!("mel partial: {}", e))?;
+
+            let conv_partial = model.encoder.conv.forward(&mel_partial)
+                .map_err(|e| format!("conv partial: {}", e))?;
+            let partial_conv_frames = conv_partial.dim(1).map_err(|e| format!("dim: {}", e))?;
+            let partial_flat: Vec<f32> = conv_partial.flatten_all()
+                .and_then(|t| t.to_vec1())
+                .map_err(|e| format!("conv flatten: {}", e))?;
+
+            // Keep old conv frames up to the recompute point, append new
+            let conv_keep = (mel_start / 2).min(keep_conv); // approximate: conv stride=2
+            let new_total = conv_keep + partial_conv_frames;
+            let d = 1280; // conv output dim
+            let mut new_conv_flat = vec![0.0f32; new_total * d];
+            // Copy kept portion
+            if conv_keep > 0 {
+                new_conv_flat[..conv_keep * d].copy_from_slice(&self.cached_conv_flat[..conv_keep * d]);
+            }
+            // Copy new portion
+            new_conv_flat[conv_keep * d..].copy_from_slice(&partial_flat[..partial_conv_frames * d]);
+            self.cached_conv_flat = new_conv_flat;
+            self.cached_conv_frames = new_total;
+        }
+
+        // Create conv_out tensor from cache
+        let total_conv = self.cached_conv_frames;
+        if profile {
+            let mel_conv_ms = t_enc_start.elapsed().as_secs_f32() * 1000.0;
+            eprintln!("[CandleCpu DETAIL] #{} mel+conv={:.0}ms mel_frames={} conv_frames={} mel_samples={} audio_samples={}",
+                self.commit_count, mel_conv_ms, self.cached_mel_frames, total_conv,
+                self.mel_samples_processed, self.audio_samples.len());
+        }
+        let conv_out = Tensor::new(self.cached_conv_flat.clone(), &device)
+            .and_then(|t| t.reshape((1, total_conv, 1280)))
+            .map_err(|e| format!("conv tensor: {}", e))?;
         let total_aligned = (total_conv / 4) * 4;
 
         let safe_boundary = 8;
@@ -202,32 +335,67 @@ impl InferenceSession for CandleCpuSession {
         if new_start >= safe_aligned {
             return Ok(String::new());
         }
+        let new_len = safe_aligned - new_start;
+        if profile {
+            eprintln!("[CandleCpu DETAIL] #{} encoder: new_start={} safe_aligned={} new_len={} kv_cache_seq={}",
+                self.commit_count, new_start, safe_aligned, new_len, self.enc_caches[0].seq_len);
+        }
         let new_conv = conv_out
-            .narrow(1, new_start, safe_aligned - new_start)
+            .narrow(1, new_start, new_len)
             .map_err(|e| format!("narrow: {}", e))?;
         self.processed_conv_frames = safe_aligned;
 
         // Step 3: Encoder on NEW conv frames only
         let new_len = safe_aligned - new_start;
-        let sliding_window = 750;
-        if self.enc_caches[0].seq_len + new_len > sliding_window {
-            let keep = sliding_window / 2;
+        // Compact KV cache aggressively to keep working set in L3 (96MB).
+        // 32 layers × 2(K+V) × keep × 32 × 64 × 4 bytes = keep × 0.5MB.
+        // For 96MB L3: keep ≤ 192. Use 150 for safety margin.
+        let max_kv_before_compact = 200;
+        if self.enc_caches[0].seq_len + new_len > max_kv_before_compact {
+            let keep = 100;
             for cache in &mut self.enc_caches {
                 cache.compact(keep).map_err(|e| format!("compact: {}", e))?;
             }
         }
 
+        let t_enc_layers = Instant::now();
         let mut x = new_conv;
-        for (i, layer) in model.encoder.layers.iter().enumerate() {
-            x = layer
-                .forward(&x, &model.encoder.rope, &mut self.enc_caches[i])
-                .map_err(|e| format!("enc layer {}: {}", i, e))?;
+
+        // Profile first encoder layer in detail for slow commits
+        if profile && self.enc_caches[0].seq_len > 250 {
+            let t_l0 = Instant::now();
+            x = model.encoder.layers[0]
+                .forward(&x, &model.encoder.rope, &mut self.enc_caches[0])
+                .map_err(|e| format!("enc layer 0: {}", e))?;
+            let l0_ms = t_l0.elapsed().as_secs_f32() * 1000.0;
+
+            let t_rest = Instant::now();
+            for (i, layer) in model.encoder.layers.iter().enumerate().skip(1) {
+                x = layer
+                    .forward(&x, &model.encoder.rope, &mut self.enc_caches[i])
+                    .map_err(|e| format!("enc layer {}: {}", i, e))?;
+            }
+            let rest_ms = t_rest.elapsed().as_secs_f32() * 1000.0;
+            eprintln!("[CandleCpu DETAIL] #{} enc layer0={:.0}ms rest={:.0}ms",
+                self.commit_count, l0_ms, rest_ms);
+        } else {
+            for (i, layer) in model.encoder.layers.iter().enumerate() {
+                x = layer
+                    .forward(&x, &model.encoder.rope, &mut self.enc_caches[i])
+                    .map_err(|e| format!("enc layer {}: {}", i, e))?;
+            }
         }
+
         let enc_out = model
             .encoder
             .norm
             .forward(&x)
             .map_err(|e| format!("enc norm: {}", e))?;
+        if profile {
+            eprintln!("[CandleCpu DETAIL] #{} enc_layers={:.0}ms for {} frames, kv_seq={}",
+                self.commit_count, t_enc_layers.elapsed().as_secs_f32() * 1000.0,
+                new_len, self.enc_caches[0].seq_len);
+        }
 
         // Step 4: Adapter (4x reshape) with residual handling
         let to_adapt = if self.enc_residual_count > 0 {
@@ -282,6 +450,8 @@ impl InferenceSession for CandleCpuSession {
             return Ok(String::new());
         }
         let adapter_embeds = adapter_embeds.unwrap();
+        let enc_ms = t_enc_start.elapsed().as_secs_f32() * 1000.0;
+        let t_dec_start = Instant::now();
 
         // Step 5: Decoder
         let prompt_len = 39usize;
@@ -386,6 +556,7 @@ impl InferenceSession for CandleCpuSession {
 
         self.total_adapter_tokens += new_adapter_tokens;
 
+        let dec_ms = t_dec_start.elapsed().as_secs_f32() * 1000.0;
         let infer_ms = t0.elapsed().as_secs_f32() * 1000.0;
         let audio_secs = self.audio_samples.len() as f32 / 16000.0;
 
@@ -400,20 +571,32 @@ impl InferenceSession for CandleCpuSession {
             String::new()
         };
 
-        eprintln!(
-            "[CandleCpu] #{} {:.1}s audio, {} new adapter, {} new text → {:.0}ms \"{}\"",
-            self.commit_count,
-            audio_secs,
-            new_adapter_tokens,
-            new_text_tokens.len(),
-            infer_ms,
-            if delta.len() > 60 { &delta[..60] } else { &delta }
-        );
+        if profile {
+            let new_frames = safe_aligned - new_start;
+            eprintln!(
+                "[CandleCpu COMMIT] #{} enc={:.0}ms({} frames) dec={:.0}ms({} tok) total={:.0}ms | {:.1}s audio \"{}\"",
+                self.commit_count, enc_ms, new_frames, dec_ms, new_adapter_tokens,
+                infer_ms, audio_secs,
+                if delta.len() > 40 { &delta[..40] } else { &delta }
+            );
+        } else {
+            eprintln!(
+                "[CandleCpu] #{} {:.1}s audio, {} adapter, {} text → {:.0}ms \"{}\"",
+                self.commit_count, audio_secs, new_adapter_tokens,
+                new_text_tokens.len(), infer_ms,
+                if delta.len() > 60 { &delta[..60] } else { &delta }
+            );
+        }
 
         Ok(delta)
     }
 
     fn reset(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.mel_samples_processed = 0;
+        self.cached_mel_flat.clear();
+        self.cached_mel_frames = 0;
+        self.cached_conv_flat.clear();
+        self.cached_conv_frames = 0;
         self.processed_conv_frames = 0;
         self.enc_caches = VoxtralModel::new_encoder_caches();
         self.enc_residual.clear();
