@@ -88,17 +88,33 @@ impl Module for QLinear {
         #[cfg(feature = "candle-cpu-ggml")]
         let out = {
             let x_dims = x.dims();
-            // Get contiguous F32 data — avoid redundant dtype cast if already F32
-            let x_flat = if x.dtype() == DType::F32 {
-                x.flatten_all()?.contiguous()?
+            // Ensure F32 contiguous
+            let x_f32 = if x.dtype() == DType::F32 && x.is_contiguous() {
+                x.clone()
+            } else if x.dtype() == DType::F32 {
+                x.contiguous()?
             } else {
-                x.to_dtype(DType::F32)?.flatten_all()?.contiguous()?
+                x.to_dtype(DType::F32)?.contiguous()?
             };
-            let x_data: Vec<f32> = x_flat.to_vec1()?;
-            let m = x_data.len() / self.k;
+            let x_flat = x_f32.flatten_all()?;
+
+            // Zero-copy input: access CpuStorage's f32 slice directly
+            let (storage, layout) = x_flat.storage_and_layout();
+            let x_slice = match &*storage {
+                candle_core_cpu::Storage::Cpu(cpu) => match cpu {
+                    candle_core_cpu::CpuStorage::F32(v) => {
+                        let offset = layout.start_offset();
+                        &v[offset..offset + layout.shape().elem_count()]
+                    }
+                    _ => unreachable!("expected F32 storage"),
+                },
+                _ => unreachable!("expected CPU storage"),
+            };
+            let m = x_slice.len() / self.k;
 
             let mut dst = vec![0.0f32; m * self.n_out];
-            ggml_matmul::q4_matmul(m, self.k, self.n_out, &x_data, &self.q4_data, &mut dst);
+            ggml_matmul::q4_matmul(m, self.k, self.n_out, x_slice, &self.q4_data, &mut dst);
+            drop(storage); // release read lock before creating output tensor
 
             let mut out_shape = x_dims.to_vec();
             *out_shape.last_mut().unwrap() = self.n_out;
