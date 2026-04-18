@@ -111,6 +111,41 @@ Broadcast same `prev_token` to N positions, single forward pass. 4.8ms/step deco
 ### cuBLAS FAST_BF16 Mode
 `set_gemm_reduced_precision_bf16(true)` switches accumulation from F32 to BF16. No measurable speedup — GEMV is bandwidth-limited, not compute-limited.
 
+## CPU Inference: candle-cpu-ggml (Current Best: 1.91× realtime)
+
+Achieved via `candle-cpu-ggml` feature: ggml graph API for Q4 matmul + incremental mel/conv + aggressive KV compaction.
+
+**Performance on AMD Ryzen 9 9955HX3D (16c/32t, 96MB L3, DDR5-5600):**
+
+| Per 0.5s commit | Time | Notes |
+|---|---|---|
+| Mel (incremental) | ~5ms | Cached, only new samples |
+| Conv (incremental) | ~10ms | Cached, only new frames |
+| Encoder (32 layers) | 141-195ms | 24-28 new frames, KV compacted at 200 |
+| Decoder (6-7 steps) | 577-753ms | 85ms/step via ggml AVX-512 |
+| **Total** | **724-955ms** | **1.91× realtime** |
+
+### Key optimizations applied:
+1. **ggml graph API** — llama.cpp's ggml_mul_mat with AVX-512 + VNNI (2.6× faster than candle AVX2)
+2. **Incremental mel** — cache mel output, only recompute on new audio samples with overlap
+3. **Incremental conv** — cache conv output, only run conv on new mel frames
+4. **Aggressive KV compaction** — compact at 200 positions (not 750) to keep 32-layer KV cache in 96MB L3
+5. **Zero-copy input** — access CpuStorage f32 slice directly, no to_vec1() copy
+6. **Persistent work buffer** — reuse ggml work buffer across matmul calls
+
+### Remaining gap to real-time (1.91× → 1.0×):
+The decoder at 85ms/step is the bottleneck (75-80% of commit time). The overhead is from:
+- 182 ggml context create/free per step (~5ms)
+- 182 Vec<f32> output allocations per step (~1ms)
+- Candle non-matmul ops: RoPE, softmax, attention scores, norms (~20ms)
+- Rust↔C boundary crossing overhead (~5ms)
+- Q4 dequant+vec_dot compute (4× above DDR5 bandwidth floor)
+
+### Path to 1.0× (not implemented):
+- **Option F: Full ggml decoder graph** — build entire decoder step as single ggml computation graph (eliminates per-matmul context overhead). Requires implementing attention, softmax, RoPE, norms as ggml ops. Effort: 5+ days. Essentially rewriting the decoder in C.
+- **Option G: Hybrid GPU encoder + CPU decoder** — run encoder on GPU (trivially fast), stream adapter tokens to CPU. Decoder at 600ms/commit is close to 500ms budget.
+- **Option H: llama.cpp Voxtral support** — contribute Voxtral decoder to llama.cpp's ggml. Their runtime runs the full model without Rust↔C boundary. Expected ~30ms/step based on 7B benchmarks.
+
 ## Environment Variables
 
 | Variable | Effect |
@@ -120,3 +155,5 @@ Broadcast same `prev_token` to N positions, single forward pass. 4.8ms/step deco
 | `CANDLE_STREAMING=1` | Use streaming transcribe (chunked encoder + context rotation) |
 | `CANDLE_CHUNK_SIZE=N` | Batched decode chunk size (default 1, >1 breaks quality) |
 | `CANDLE_NATIVE_LAYERS=N` | Limit decoder to first N layers (for debugging) |
+| `GGML_THREADS=16` | Thread count for ggml matmul (default: 16) |
+| `CANDLE_CPU_F32_DECODER=1` | Dequantize decoder to F32 (candle-cpu only, slower) |
