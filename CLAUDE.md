@@ -280,6 +280,19 @@ All env vars prefixed `VOXTRAL_` for vllm-server, `BURN_` for burn-server.
 python3 scripts/benchmark_voxtral.py --duration 300
 ```
 
+## llama.cpp Voxtral Port (WIP)
+
+Local fork at `~/gjovanov/llama.cpp` (issue: ggml-org/llama.cpp#20914).
+Adds `LLM_ARCH_VOXTRAL` with encoder RoPE, causal attention, dual-stream summation.
+
+**Status:** Both models load, encoder produces meaningful embeddings with RoPE + causal mask.
+Output contains real words from audio but not yet correct transcription.
+
+**Remaining:** ADA-RmsNorm decoder graph (`src/models/voxtral.cpp`) + autoregressive prev_token feedback.
+
+**Build:** `cd ~/gjovanov/llama.cpp/build-cpu && make -j16 llama-mtmd-cli`
+**Test:** `llama-mtmd-cli -m /tmp/voxtral-text-f16.gguf --mmproj <mmproj.gguf> --audio <file.wav> -p "Transcribe this audio." -n 256 --no-warmup`
+
 ## Related Projects
 - [parakeet-rs](https://github.com/gjovanov/parakeet-rs) — Rust ASR server using ONNX (Parakeet TDT, Canary 1B) and whisper.cpp. Shares frontend and API contract.
 - [voxtral-mini-realtime-rs](https://github.com/TrevorS/voxtral-mini-realtime-rs) — Reference Rust implementation of Voxtral inference with Burn/WebGPU. burn-server is derived from this.
