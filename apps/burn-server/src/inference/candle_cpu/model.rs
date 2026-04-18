@@ -57,21 +57,6 @@ impl QLinear {
                 panic!("QLinear: unexpected QTensor shape {:?}", dims);
             };
             let q4_data = qt.data().expect("QTensor data access").to_vec();
-            let expected_bytes = (n_out * k / 32) * 18; // Q4_0: 18 bytes per 32 elements
-            let dtype = qt.dtype();
-            // Log first tensor load for verification
-            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!(
-                    "[ggml QLinear] shape=[{}, {}] dtype={:?} data_bytes={} expected_bytes={} match={}",
-                    n_out, k, dtype, q4_data.len(), expected_bytes, q4_data.len() == expected_bytes
-                );
-            }
-            assert_eq!(
-                q4_data.len(), expected_bytes,
-                "Q4 data size mismatch: got {} expected {} for [{}, {}] dtype={:?}",
-                q4_data.len(), expected_bytes, n_out, k, dtype
-            );
             Self {
                 q4_data,
                 n_out,
@@ -102,48 +87,19 @@ impl Module for QLinear {
 
         #[cfg(feature = "candle-cpu-ggml")]
         let out = {
-            // x shape: [B, S, k] or [S, k] or [1, 1, k]
             let x_dims = x.dims();
-            let x_f32 = x.to_dtype(DType::F32)?;
-            let x_contiguous = x_f32.flatten_all()?.contiguous()?;
-            let x_data: Vec<f32> = x_contiguous.to_vec1()?;
-
-            // Determine m (batch × seq) and k
-            let total_elements = x_data.len();
-            let m = total_elements / self.k;
-            assert_eq!(total_elements, m * self.k, "x size mismatch: {} vs {}×{}", total_elements, m, self.k);
+            // Get contiguous F32 data — avoid redundant dtype cast if already F32
+            let x_flat = if x.dtype() == DType::F32 {
+                x.flatten_all()?.contiguous()?
+            } else {
+                x.to_dtype(DType::F32)?.flatten_all()?.contiguous()?
+            };
+            let x_data: Vec<f32> = x_flat.to_vec1()?;
+            let m = x_data.len() / self.k;
 
             let mut dst = vec![0.0f32; m * self.n_out];
             ggml_matmul::q4_matmul(m, self.k, self.n_out, &x_data, &self.q4_data, &mut dst);
 
-            // Validate: compare with candle's QMatMul
-            static VALIDATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !VALIDATED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                use std::borrow::Cow;
-                if let Ok(storage) = quantized::QStorage::from_data(
-                    Cow::Owned(self.q4_data.clone()), x.device(), GgmlDType::Q4_0,
-                ) {
-                    if let Ok(qt) = QTensor::new(storage, (self.n_out, self.k)) {
-                        let candle_mm = QMatMul::QTensor(Arc::new(qt));
-                        if let Ok(x_t) = Tensor::new(x_data.clone(), x.device())
-                            .and_then(|t| t.reshape((m, self.k)))
-                        {
-                            if let Ok(candle_out) = candle_mm.forward(&x_t) {
-                                if let Ok(cv) = candle_out.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
-                                    let n = cv.len().min(dst.len()).min(4);
-                                    eprintln!(
-                                        "[COMPARE] ggml=[{:.4},{:.4},{:.4},{:.4}] candle=[{:.4},{:.4},{:.4},{:.4}]",
-                                        dst[0], dst[1], dst[2], dst[3],
-                                        cv[0], cv[1], cv[2], cv[3]
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Reshape output to match input batch dims
             let mut out_shape = x_dims.to_vec();
             *out_shape.last_mut().unwrap() = self.n_out;
             Tensor::new(dst, x.device())?.reshape(out_shape)?
