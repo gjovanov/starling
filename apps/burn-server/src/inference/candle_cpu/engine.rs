@@ -347,15 +347,15 @@ impl InferenceSession for CandleCpuSession {
 
         // Step 3: Encoder on NEW conv frames only
         let new_len = safe_aligned - new_start;
-        // Compact KV cache aggressively to keep working set in L3 (96MB).
-        // 32 layers × 2(K+V) × keep × 32 × 64 × 4 bytes = keep × 0.5MB.
-        // For 96MB L3: keep ≤ 192. Use 150 for safety margin.
-        let max_kv_before_compact = 200;
-        if self.enc_caches[0].seq_len + new_len > max_kv_before_compact {
-            let keep = 100;
-            for cache in &mut self.enc_caches {
-                cache.compact(keep).map_err(|e| format!("compact: {}", e))?;
-            }
+        // Periodic full reset (vllm-style): drop encoder KV cache when it gets too big.
+        // On CPU, each encoder layer's attention costs O(new_len × kv_seq) per layer.
+        // With 32 layers × 12 heads × 64 head_dim, kv_seq=150 already dominates decode.
+        // Reset threshold 150 = ~3s audio context (plenty for ASR).
+        // vllm does similar periodic resets to bound context.
+        let max_kv_before_reset = std::env::var("VOXTRAL_ENC_RESET")
+            .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(150);
+        if self.enc_caches[0].seq_len + new_len > max_kv_before_reset {
+            self.enc_caches = VoxtralModel::new_encoder_caches();
         }
 
         let t_enc_layers = Instant::now();
@@ -458,6 +458,19 @@ impl InferenceSession for CandleCpuSession {
         let eos_token = 2u32;
         let mut new_text_tokens = Vec::new();
 
+        // Periodic decoder KV cache reset (like vllm).
+        // Decoder attention scales linearly with kv_seq. On CPU, 800+ positions
+        // become slow (~1800ms/commit). Reset drops context but bounds compute.
+        // Default 300 = ~25s of audio context (decoder has sliding_window=8192 but
+        // CPU can't afford to keep it full).
+        let max_dec_kv_before_reset = std::env::var("VOXTRAL_DEC_RESET")
+            .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(300);
+        if self.decoder_started && self.dec_caches[0].seq_len > max_dec_kv_before_reset {
+            self.dec_caches = VoxtralModel::new_decoder_caches();
+            self.decoder_started = false; // will re-prefill with current prefix
+            self.prev_token = 0;
+        }
+
         if !self.decoder_started && self.total_adapter_tokens + new_adapter_tokens >= prompt_len {
             let prompt_ids: Vec<u32> = std::iter::once(1u32)
                 .chain(std::iter::repeat(32u32).take(prompt_len - 1))
@@ -500,56 +513,86 @@ impl InferenceSession for CandleCpuSession {
 
             self.decoder_started = true;
 
+            // Batched decode: all tokens in this commit use the same prev_token
+            // (vllm streaming protocol). One forward pass instead of N.
             let decode_start = pl;
-            for j in decode_start..new_adapter_tokens {
-                let audio_pos = adapter_embeds
-                    .narrow(1, j, 1)
+            let remaining = new_adapter_tokens - decode_start;
+            if remaining > 0 {
+                let audio_chunk = adapter_embeds
+                    .narrow(1, decode_start, remaining)
                     .map_err(|e| format!("narrow: {}", e))?;
                 let text_embed = model
                     .embed_token(self.prev_token)
                     .map_err(|e| format!("embed: {}", e))?;
-                let x = audio_pos
+                let x = audio_chunk
                     .broadcast_add(&text_embed)
                     .map_err(|e| format!("add: {}", e))?;
                 let hidden = model
                     .decoder_forward(x, &self.ada_scales, &mut self.dec_caches)
                     .map_err(|e| format!("forward: {}", e))?;
-                let token = model
-                    .lm_head_argmax(&hidden)
+                let logits = model
+                    .lm_head(&hidden)
                     .map_err(|e| format!("lm_head: {}", e))?;
-                self.generated_tokens.push(token);
-                self.prev_token = token;
-                if token >= 1000 {
-                    new_text_tokens.push(token);
-                }
-                if token == eos_token {
-                    break;
+                for pos in 0..remaining {
+                    let pos_logits = logits
+                        .narrow(1, pos, 1)
+                        .map_err(|e| format!("narrow: {}", e))?;
+                    let logits_f32: Vec<f32> = pos_logits
+                        .to_dtype(candle_core_cpu::DType::F32)
+                        .and_then(|t| t.reshape(131072))
+                        .and_then(|t| t.to_vec1())
+                        .map_err(|e| format!("logits: {}", e))?;
+                    let token = logits_f32.iter().enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(idx, _)| idx as u32).unwrap_or(0);
+                    self.generated_tokens.push(token);
+                    self.prev_token = token;
+                    if token >= 1000 {
+                        new_text_tokens.push(token);
+                    }
+                    if token == eos_token {
+                        break;
+                    }
                 }
             }
         } else if self.decoder_started {
-            for j in 0..new_adapter_tokens {
-                let audio_pos = adapter_embeds
-                    .narrow(1, j, 1)
+            // Batched decode: same approach for running decoder
+            if new_adapter_tokens > 0 {
+                let audio_chunk = adapter_embeds
+                    .narrow(1, 0, new_adapter_tokens)
                     .map_err(|e| format!("narrow: {}", e))?;
                 let text_embed = model
                     .embed_token(self.prev_token)
                     .map_err(|e| format!("embed: {}", e))?;
-                let x = audio_pos
+                let x = audio_chunk
                     .broadcast_add(&text_embed)
                     .map_err(|e| format!("add: {}", e))?;
                 let hidden = model
                     .decoder_forward(x, &self.ada_scales, &mut self.dec_caches)
                     .map_err(|e| format!("forward: {}", e))?;
-                let token = model
-                    .lm_head_argmax(&hidden)
+                let logits = model
+                    .lm_head(&hidden)
                     .map_err(|e| format!("lm_head: {}", e))?;
-                self.generated_tokens.push(token);
-                self.prev_token = token;
-                if token >= 1000 {
-                    new_text_tokens.push(token);
-                }
-                if token == eos_token {
-                    break;
+                for pos in 0..new_adapter_tokens {
+                    let pos_logits = logits
+                        .narrow(1, pos, 1)
+                        .map_err(|e| format!("narrow: {}", e))?;
+                    let logits_f32: Vec<f32> = pos_logits
+                        .to_dtype(candle_core_cpu::DType::F32)
+                        .and_then(|t| t.reshape(131072))
+                        .and_then(|t| t.to_vec1())
+                        .map_err(|e| format!("logits: {}", e))?;
+                    let token = logits_f32.iter().enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(idx, _)| idx as u32).unwrap_or(0);
+                    self.generated_tokens.push(token);
+                    self.prev_token = token;
+                    if token >= 1000 {
+                        new_text_tokens.push(token);
+                    }
+                    if token == eos_token {
+                        break;
+                    }
                 }
             }
         }
