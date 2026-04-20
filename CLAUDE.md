@@ -118,10 +118,9 @@ Same architecture as candle-native but with fused CUDA kernels for 1.75× faster
 - ~200ms total (mel+conv+encoder+decoder) with flash backend
 - Text appears every 0.5-1s
 
-#### candle-cpu Backend (CPU-only, Q4 GGUF)
-Pure CPU inference using Q4 GGUF weights. Two sub-variants:
-- **candle-cpu**: candle's built-in Q4 matmul (AVX2 only, 275ms/step)
-- **candle-cpu-ggml**: ggml graph API with AVX-512 + VNNI (105ms/step, 2.6× faster)
+#### candle-cpu Backend (CPU-only, Q4 GGUF) — STREAMING with KV resets
+Pure CPU inference using Q4 GGUF weights + streaming engine with periodic KV cache resets.
+- **candle-cpu-ggml**: ggml graph API with AVX-512 + VNNI + BF16 native matmul
 
 **Prerequisites for candle-cpu-ggml:**
 ```bash
@@ -134,37 +133,58 @@ cmake .. -DGGML_CUDA=OFF -DGGML_CPU=ON -DGGML_AVX512=ON \
 make -j$(nproc) ggml
 ```
 
-**Performance (AMD Ryzen 9 9955HX3D, 16c/32t, 96MB L3, DDR5-5600, 5s audio):**
-| Metric | candle-cpu (AVX2) | candle-cpu-ggml (AVX-512) | Speedup |
-|--------|-------------------|---------------------------|---------|
-| Decode/step | 275ms | **105ms** | **2.6×** |
-| Encoder (5s) | 172s | **29s** | **5.9×** |
-| Overall | 17× realtime | **3.3× realtime** | **5.2×** |
+**Performance (AMD Ryzen 9 9955HX3D, 16c/32t, 96MB L3, DDR5-5600, streaming 0.5s commits):**
+
+Sequential decode (current default, correct quality):
+| Duration | Realtime factor | Text quality |
+|----------|----------------|--------------|
+| 60s audio | **1.68×** | Correct transcription ("Wort zum Team drin, der ORF am 19. November...") |
+| 300s audio | ~1.7× (with KV resets) | Correct, consistent |
+
+Batched decode (`VOXTRAL_BATCH=6`, experimental, fast but has artifacts):
+| Duration | Realtime factor | Text quality |
+|----------|----------------|--------------|
+| 300s audio | **0.76×** (faster than RT) | Duplicated tokens ("Jahre Jahre Der Der") |
+
+**Key streaming engine fixes (both modes):**
+1. **Periodic encoder KV reset** (`VOXTRAL_ENC_RESET=150`): prevents encoder from growing past L3 cache
+2. **Periodic decoder KV reset** (`VOXTRAL_DEC_RESET=300`): bounds decoder attention cost
+3. **Incremental mel + conv caching**: only new audio processed per commit
 
 **Environment variables:**
 - `GGML_THREADS=16` — thread count for ggml matmul (default: 16)
+- `VOXTRAL_ENC_RESET=150` — encoder KV cache reset threshold
+- `VOXTRAL_DEC_RESET=300` — decoder KV cache reset threshold
 - `CANDLE_PROFILE=1` — per-component timing (decoder_forward, lm_head)
-- `CANDLE_CPU_F32_DECODER=1` — dequantize decoder to F32 (candle-cpu only, slower)
 
 #### Setup & Run
 ```bash
 cd apps/burn-server
 
 # Edit .env for your setup:
-#   BURN_QUANT=bf16
-#   BURN_BACKEND=candle-native
+#   BURN_QUANT=q4                    # Q4 for CPU, bf16 for GPU
+#   BURN_BACKEND=candle-cpu          # CPU streaming (or candle-native-flash for GPU)
 #   TURN_SERVER=turn:your-turn-server:3478
 #   TURN_SHARED_SECRET=your-secret
 #   FORCE_RELAY=true
 
-# Build GPU (requires CUDA toolkit)
-cargo build --release --features candle-native
+# One-stop build (reads BURN_BACKEND from .env):
+./init.sh
 
-# Build CPU with ggml AVX-512 (requires llama.cpp pre-built)
-RUSTFLAGS="-C target-cpu=native" cargo build --release --features candle-cpu-ggml
+# Or build manually:
+# GPU BF16:    cargo build --release --features candle-native-flash
+# CPU Q4:      RUSTFLAGS="-C target-cpu=native" cargo build --release --features candle-cpu-ggml
 
-# Start
+# Start the server (port 8091)
 ./start.sh
+```
+
+**For CPU streaming with the frontend:**
+```bash
+# Set .env: BURN_BACKEND=candle-cpu, BURN_QUANT=q4
+./init.sh          # builds with candle-cpu-ggml feature + AVX-512
+./start.sh         # starts server on :8091
+# Open http://localhost:8091 in browser → record/upload audio via WebRTC
 ```
 
 #### Benchmark
@@ -177,9 +197,17 @@ CANDLE_STREAMING=1 ./target/release/benchmark --backend candle-native --audio ..
 cargo build --release --features candle-native-flash --bin benchmark
 CANDLE_STREAMING=1 ./target/release/benchmark --backend candle-native-flash --audio ../../media/broadcast_1.wav --models-dir ../../models/cache --duration 300
 
-# candle-cpu-ggml (CPU with AVX-512)
+# candle-cpu-ggml (CPU streaming engine — correct quality at 1.68× RT)
 RUSTFLAGS="-C target-cpu=native" cargo build --release --features candle-cpu-ggml --bin benchmark
-GGML_THREADS=16 CANDLE_STREAMING=1 ./target/release/benchmark --backend candle-cpu --audio ../../media/broadcast_1.wav --models-dir ../../models/cache --duration 5
+GGML_THREADS=16 ./target/release/benchmark --backend candle-cpu-engine \
+  --audio ../../media/broadcast_1.wav --models-dir ../../models/cache --duration 300
+
+# Batched mode (faster 0.76× RT but has duplicated tokens):
+# Note: batched mode requires the older commit path — see engine.rs history.
+
+# Profile CPU streaming breakdown (per-commit enc/dec timing)
+CANDLE_PROFILE=1 GGML_THREADS=16 ./target/release/benchmark --backend candle-cpu-engine \
+  --audio ../../media/broadcast_1.wav --models-dir ../../models/cache --duration 20
 
 # Profile decode step breakdown (per-section GPU timing)
 CANDLE_STREAMING=1 CANDLE_PROFILE=1 ./target/release/benchmark --backend candle-native-flash --audio ../../media/broadcast_1.wav --models-dir ../../models/cache --duration 5

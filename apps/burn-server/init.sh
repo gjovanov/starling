@@ -64,15 +64,25 @@ cd "$SCRIPT_DIR"
 [ -f "$SCRIPT_DIR/.env" ] && set -a && source "$SCRIPT_DIR/.env" && set +a
 
 FEATURES=""
+RUSTFLAGS_EXTRA=""
 case "${BURN_BACKEND:-wgpu}" in
     candle-native-flash) FEATURES="--features candle-native-flash" ;;
     candle-native)       FEATURES="--features candle-native" ;;
     candle)              FEATURES="--features candle" ;;
     cuda)                FEATURES="--features cuda" ;;
+    candle-cpu)          FEATURES="--features candle-cpu-ggml"
+                          RUSTFLAGS_EXTRA="-C target-cpu=native" ;;
+    candle-cpu-ggml)     FEATURES="--features candle-cpu-ggml"
+                          RUSTFLAGS_EXTRA="-C target-cpu=native" ;;
 esac
 
 echo "  Backend: ${BURN_BACKEND:-wgpu}, features: ${FEATURES:-default}"
-cargo build --release --bin burn-server $FEATURES 2>&1
+if [ -n "$RUSTFLAGS_EXTRA" ]; then
+    echo "  RUSTFLAGS: $RUSTFLAGS_EXTRA"
+    RUSTFLAGS="$RUSTFLAGS_EXTRA" cargo build --release --bin burn-server $FEATURES 2>&1
+else
+    cargo build --release --bin burn-server $FEATURES 2>&1
+fi
 
 # Check workspace target first, then local
 if [ -f "$PROJECT_DIR/target/release/burn-server" ]; then

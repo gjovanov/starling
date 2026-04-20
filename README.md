@@ -6,10 +6,10 @@ Each app provides a different inference backend for the same model, sharing a co
 
 ## Apps
 
-| App | Backend | Quantization | GPU Memory | Browser Mode | Port |
-|-----|---------|-------------|------------|--------------|------|
-| [**vllm-server**](apps/vllm-server/) | Python/vLLM | BF16 | ~9 GB | No (server only) | 8090 |
-| [**burn-server**](apps/burn-server/) | Rust/Burn | Q4 + BF16 | ~700 MB / ~9 GB | Yes (WASM+WebGPU) | 8091 |
+| App | Backend | Quantization | Performance | Port |
+|-----|---------|-------------|-------------|------|
+| [**vllm-server**](apps/vllm-server/) | Python/vLLM (GPU) | BF16 | 0.2× realtime | 8090 |
+| [**burn-server**](apps/burn-server/) | Rust/Candle+ggml | Q4 (CPU) / BF16 (GPU) | **1.68× RT (CPU) / 0.3× RT (GPU)** | 8091 |
 
 ## Quick Start
 
@@ -23,14 +23,23 @@ sudo ./prerequisites.sh    # System deps (Python, CUDA, FFmpeg)
 ./start.sh                 # Terminal 2: Web server on :8090
 ```
 
-### burn-server (Rust, GPU or Browser)
+### burn-server (Rust, CPU or GPU)
 
 ```bash
 cd apps/burn-server
 ./prerequisites.sh         # Rust toolchain, wasm-pack
-./init.sh                  # Build + model download
+
+# Edit .env to pick backend:
+#   BURN_BACKEND=candle-cpu           # CPU streaming (Q4, 1.68× realtime on AVX-512)
+#   BURN_BACKEND=candle-native-flash  # GPU BF16 (requires CUDA toolkit)
+
+./init.sh                  # Build + model download (reads BURN_BACKEND)
 ./start.sh                 # Server on :8091
+
+# For CPU streaming, llama.cpp must be pre-built (see apps/burn-server/README.md)
 ```
+
+**See [HANDOVER.md](HANDOVER.md) for detailed CPU streaming setup and performance tuning.**
 
 ## Shared Resources
 

@@ -6,8 +6,9 @@ Unlike vllm-server, burn-server runs the model directly in the same process (no 
 
 ## Features
 
-- **Q4 inference**: Fused dequant+matmul WGSL shaders, ~700 MB VRAM, faster than real-time on modern GPUs
-- **BF16 inference**: Full precision, ~9 GB VRAM, highest accuracy
+- **CPU streaming (candle-cpu-ggml)**: Q4 GGUF + ggml AVX-512, **1.68× realtime** on AMD Ryzen 9 9955HX3D with correct German transcription. Periodic KV cache resets (vllm-style) for stable long-audio processing.
+- **GPU BF16 (candle-native-flash)**: FlashAttention v2, ~0.3× realtime on RTX 5090, highest accuracy
+- **Q4 GPU inference**: Fused dequant+matmul WGSL shaders, ~700 MB VRAM
 - **WASM browser mode**: Entire model runs in browser tab via WebGPU (Q4 only)
 - **Same API contract**: Drop-in replacement for vllm-server (shared frontend works with both)
 - **Single process**: No separate model server needed
@@ -112,12 +113,30 @@ apps/burn-server/
     web/                  # WASM bindings (wasm-bindgen)
 ```
 
-## Benchmarks
+## Benchmarks (streaming 0.5s commits)
 
-| Mode | RTF | Tokens/s | VRAM |
-|------|-----|----------|------|
-| Q4 native | ~0.4 | ~19 tok/s | ~700 MB |
-| BF16 native | ~1.5 | ~5 tok/s | ~9 GB |
-| Q4 WASM | ~14 | ~1 tok/s | browser GPU |
+| Mode | Realtime factor | Mean commit | Text quality | Hardware |
+|------|-----------------|-------------|--------------|----------|
+| **candle-cpu-ggml (sequential)** | **1.68×** | 838ms | Correct German | Ryzen 9 9955HX3D AVX-512 |
+| **candle-cpu-ggml (batched)** | **0.76×** | 381ms | Duplicated tokens | Ryzen 9 9955HX3D AVX-512 |
+| **candle-native-flash (BF16)** | **0.3×** | ~150ms | Correct | RTX 5090 |
+| Q4 WGPU | ~14× | — | Correct | browser WebGPU |
 
-(Reference benchmarks from voxtral-mini-realtime-rs on NVIDIA DGX Spark)
+Benchmark:
+```bash
+# CPU streaming (sequential, correct quality, 1.68× RT)
+RUSTFLAGS="-C target-cpu=native" cargo build --release --features candle-cpu-ggml --bin benchmark -p burn-server
+GGML_THREADS=16 ../../target/release/benchmark --backend candle-cpu-engine \
+  --audio ../../media/broadcast_1.wav --models-dir ../../models/cache --duration 60
+
+# GPU (BF16 flash attention, 0.3× RT)
+cargo build --release --features candle-native-flash --bin benchmark -p burn-server
+CANDLE_STREAMING=1 ../../target/release/benchmark --backend candle-native-flash \
+  --audio ../../media/broadcast_1.wav --models-dir ../../models/cache --duration 60
+```
+
+**Performance tuning env vars:**
+- `GGML_THREADS=16` — CPU thread count
+- `VOXTRAL_ENC_RESET=150` — Encoder KV cache reset threshold
+- `VOXTRAL_DEC_RESET=300` — Decoder KV cache reset threshold
+- `CANDLE_PROFILE=1` — Per-commit enc/dec/lm_head breakdown
