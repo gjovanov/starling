@@ -298,52 +298,40 @@ impl InferenceSession for CandleNativeSession {
 
             self.decoder_started = true;
 
-            // Decode remaining adapter tokens from this commit (batched)
+            // Sequential decode: correct autoregressive behavior.
+            // Each position uses the token generated at the previous position.
+            // On GPU (candle-native-flash), each forward pass is ~14ms, so
+            // 6-7 sequential passes per commit = ~90ms (still faster than real-time).
             let decode_start = pl;
-            let remaining = new_adapter_tokens - decode_start;
-            if remaining > 0 {
-                eprintln!("[CandleNative] BATCHED decode (post-prefill): {} tokens in 1 forward pass", remaining);
-                let t_batch = std::time::Instant::now();
-                let audio_chunk = adapter_embeds.narrow(1, decode_start, remaining)
+            for j in decode_start..new_adapter_tokens {
+                let audio_pos = adapter_embeds.narrow(1, j, 1)
                     .map_err(|e| format!("narrow: {}", e))?;
                 let text_embed = model.embed_token(self.prev_token)
                     .map_err(|e| format!("embed: {}", e))?;
-                let x = audio_chunk.broadcast_add(&text_embed)
+                let x = audio_pos.broadcast_add(&text_embed)
                     .map_err(|e| format!("add: {}", e))?;
                 let hidden = model.decoder_forward(x, &self.ada_scales, &mut self.dec_caches)
                     .map_err(|e| format!("forward: {}", e))?;
                 let logits = model.lm_head(&hidden).map_err(|e| format!("lm_head: {}", e))?;
-                eprintln!("[CandleNative] BATCHED forward+lm_head: {:.1}ms for {} tokens ({:.2}ms/tok)",
-                    t_batch.elapsed().as_secs_f32() * 1000.0, remaining,
-                    t_batch.elapsed().as_secs_f32() * 1000.0 / remaining as f32);
-                for pos in 0..remaining {
-                    let pos_logits = logits.narrow(1, pos, 1).map_err(|e| format!("narrow: {}", e))?;
-                    let token = argmax_token(&pos_logits).map_err(|e| format!("argmax: {}", e))?;
-                    self.generated_tokens.push(token);
-                    self.prev_token = token;
-                    if token >= 1000 { new_text_tokens.push(token); }
-                    if token == eos_token { break; }
-                }
+                let token = argmax_token(&logits).map_err(|e| format!("argmax: {}", e))?;
+                self.generated_tokens.push(token);
+                self.prev_token = token;
+                if token >= 1000 { new_text_tokens.push(token); }
+                if token == eos_token { break; }
             }
         } else if self.decoder_started {
-            // Already running — decode new adapter tokens (batched)
-            let audio_chunk = adapter_embeds.narrow(1, 0, new_adapter_tokens)
-                .map_err(|e| format!("narrow: {}", e))?;
-            let text_embed = model.embed_token(self.prev_token)
-                .map_err(|e| format!("embed: {}", e))?;
-            let x = audio_chunk.broadcast_add(&text_embed)
-                .map_err(|e| format!("add: {}", e))?;
-            eprintln!("[CandleNative] BATCHED decode: {} tokens in 1 forward pass", new_adapter_tokens);
-            let t_batch = std::time::Instant::now();
-            let hidden = model.decoder_forward(x, &self.ada_scales, &mut self.dec_caches)
-                .map_err(|e| format!("forward: {}", e))?;
-            let logits = model.lm_head(&hidden).map_err(|e| format!("lm_head: {}", e))?;
-            eprintln!("[CandleNative] BATCHED forward+lm_head: {:.1}ms for {} tokens ({:.1}ms/tok)",
-                t_batch.elapsed().as_secs_f32() * 1000.0, new_adapter_tokens,
-                t_batch.elapsed().as_secs_f32() * 1000.0 / new_adapter_tokens as f32);
-            for pos in 0..new_adapter_tokens {
-                let pos_logits = logits.narrow(1, pos, 1).map_err(|e| format!("narrow: {}", e))?;
-                let token = argmax_token(&pos_logits).map_err(|e| format!("argmax: {}", e))?;
+            // Sequential decode (correct autoregressive behavior)
+            for j in 0..new_adapter_tokens {
+                let audio_pos = adapter_embeds.narrow(1, j, 1)
+                    .map_err(|e| format!("narrow: {}", e))?;
+                let text_embed = model.embed_token(self.prev_token)
+                    .map_err(|e| format!("embed: {}", e))?;
+                let x = audio_pos.broadcast_add(&text_embed)
+                    .map_err(|e| format!("add: {}", e))?;
+                let hidden = model.decoder_forward(x, &self.ada_scales, &mut self.dec_caches)
+                    .map_err(|e| format!("forward: {}", e))?;
+                let logits = model.lm_head(&hidden).map_err(|e| format!("lm_head: {}", e))?;
+                let token = argmax_token(&logits).map_err(|e| format!("argmax: {}", e))?;
                 self.generated_tokens.push(token);
                 self.prev_token = token;
                 if token >= 1000 { new_text_tokens.push(token); }
