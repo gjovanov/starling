@@ -7,11 +7,12 @@
 
 ## TL;DR
 
-**GPU (candle-native-flash):** Works perfectly, 0.3× realtime, correct transcription.
+**GPU (candle-native-flash):** 0.2× realtime (5× faster than RT), correct transcription.
+**CPU (candle-cpu-ggml):** 1.68× realtime (slightly slower than RT), correct transcription.
 
-**CPU (candle-cpu-ggml):** Two modes available in streaming engine:
-- **Sequential decode** (CURRENT DEFAULT): 1.68× realtime, correct German transcription
-- **Batched decode** (experimental, needs revert from 31b448e): 0.76× realtime, duplicated tokens
+Both engines use **sequential autoregressive decode** + **periodic KV cache resets** (vllm-style).
+
+Earlier batched-decode experiments (commits 9decf61, earlier state) produced "Zum Zum Wir Wir" duplication because all positions in a batch shared the same prev_token. Fixed in commits **31b448e** (CPU) and **310fd81** (GPU).
 
 **llama.cpp port:** 28 commits on local fork. End-to-end works, produces German text. Encoder precision gap (0.959 vs candle's BF16) is inherent to ggml's F32 compute — unsolvable without native BF16 kernels. Not blocking anything.
 
@@ -21,9 +22,10 @@
 
 | Commit | Change |
 |--------|--------|
+| `310fd81` | **sequential decode in GPU engine** — correct quality, 0.2× RT |
 | `31b448e` | **sequential decode in CPU engine** — correct quality, 1.68× RT |
 | `e84006c` | **periodic KV cache resets** — encoder@150, decoder@300 (bounds compute) |
-| `9decf61` | batched decode for streaming commits (now reverted to sequential) |
+| `9decf61` | batched decode for streaming commits (reverted in both engines) |
 | `f8b8e40` | incremental mel+conv caching (huge CPU win) |
 | `67fe06a` | zero-copy input for ggml matmul |
 
