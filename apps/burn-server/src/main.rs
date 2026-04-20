@@ -107,6 +107,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("Loading inference engine...");
     let engine: Arc<dyn inference::InferenceEngine> = match (config.quant, config.backend) {
+        // CandleCpu must match BEFORE the generic Q4 case (it also uses Q4 GGUF but on CPU).
+        #[cfg(feature = "candle-cpu")]
+        (_, config::GpuBackend::CandleCpu) => {
+            // CPU backend uses Q4 GGUF regardless of quant setting
+            let gguf_path = config.q4_model_path();
+            if !gguf_path.exists() {
+                eprintln!("ERROR: Q4 GGUF not found at {}", gguf_path.display());
+                eprintln!("       Run ../../models/download.sh first.");
+                std::process::exit(1);
+            }
+            let cpu_engine =
+                inference::candle_cpu::engine::CandleCpuEngine::load(&gguf_path, &tokenizer_path)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            Arc::new(cpu_engine)
+        }
         (config::Quantization::Q4, _) => {
             let q4_engine = inference::engine::Q4Engine::load(&model_path, &tokenizer_path)
                 .map_err(|e| -> Box<dyn std::error::Error> { e })?;
@@ -145,20 +160,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 inference::candle_native_flash::engine::CandleNativeEngine::load(&model_path, &tokenizer_path)
                     .map_err(|e| -> Box<dyn std::error::Error> { e })?;
             Arc::new(flash_engine)
-        }
-        #[cfg(feature = "candle-cpu")]
-        (_, config::GpuBackend::CandleCpu) => {
-            // CPU backend uses Q4 GGUF regardless of quant setting
-            let gguf_path = config.q4_model_path();
-            if !gguf_path.exists() {
-                eprintln!("ERROR: Q4 GGUF not found at {}", gguf_path.display());
-                eprintln!("       Run ../../models/download.sh first.");
-                std::process::exit(1);
-            }
-            let cpu_engine =
-                inference::candle_cpu::engine::CandleCpuEngine::load(&gguf_path, &tokenizer_path)
-                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-            Arc::new(cpu_engine)
         }
     };
     eprintln!("Inference engine ready.");
