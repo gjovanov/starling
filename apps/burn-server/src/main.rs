@@ -30,6 +30,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Port:        {}", config.port);
     eprintln!("Quant:       {}", config.quant);
     eprintln!("Backend:     {}", config.backend);
+    // Show CPU tuning env vars if using CPU backend
+    if format!("{}", config.backend).contains("Cpu") {
+        let batch = std::env::var("VOXTRAL_BATCH").unwrap_or_else(|_| "1".to_string());
+        let threads = std::env::var("GGML_THREADS").unwrap_or_else(|_| "16".to_string());
+        let enc_reset = std::env::var("VOXTRAL_ENC_RESET").unwrap_or_else(|_| "150".to_string());
+        let dec_reset = std::env::var("VOXTRAL_DEC_RESET").unwrap_or_else(|_| "300".to_string());
+        let mode = if batch.parse::<usize>().unwrap_or(1) > 1 { "BATCHED (faster, duplicates)" } else { "SEQUENTIAL (correct quality)" };
+        eprintln!("CPU mode:    {} (VOXTRAL_BATCH={})", mode, batch);
+        eprintln!("CPU tuning:  GGML_THREADS={}, ENC_RESET={}, DEC_RESET={}", threads, enc_reset, dec_reset);
+    }
     eprintln!("Models:      {}", config.models_dir.display());
     eprintln!("Frontend:    {}", config.frontend.display());
     eprintln!("Media:       {}", config.media_dir.display());
