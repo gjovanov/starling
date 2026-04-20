@@ -1106,35 +1106,48 @@ pub fn transcribe_streaming(model: &VoxtralModel, mel: &Tensor, t_embed: &Tensor
     let mut steps_since_rotation = 0usize;
     let mut n_rotations = 0usize;
 
-    for i in prompt_len..audio_seq {
-        // Context rotation: clean restart from current position (like vllm's disconnect/reconnect)
-        // Accept a small text gap (~3s) rather than producing garbled output
+    // Batched decode: process tokens in chunks (1 forward pass per chunk)
+    // Within a chunk, all positions use the same prev_token (like vllm).
+    let batch_size: usize = std::env::var("VOXTRAL_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(1); // tokens per batch (~1 commit worth)
+    let mut i = prompt_len;
+    while i < audio_seq {
+        // Context rotation
         if steps_since_rotation >= rotation_interval {
             dec_caches = (0..26).map(|_| KVCache::new()).collect();
             prev_token = prefill_decoder(&mut dec_caches, i)?;
-            // Skip the prompt-length positions (prefill covers them)
             let skip = prompt_len.min(audio_seq - i);
             for _ in 0..skip.saturating_sub(1) {
-                // These positions are consumed by prefill, just advance i
-                generated.push(32); // pad placeholder
+                generated.push(32);
             }
-            prev_token = 0; // fresh start — model will produce pad then text
+            prev_token = 0;
             steps_since_rotation = 0;
             n_rotations += 1;
         }
 
-        let audio_pos = audio_embeds.narrow(1, i, 1)?;
+        // Batch: process up to batch_size tokens in one forward pass
+        let chunk_end = (i + batch_size).min(audio_seq);
+        let n = chunk_end - i;
+
+        let audio_chunk = audio_embeds.narrow(1, i, n)?;
         let text_embed = model.embed_token(prev_token)?;
-        let x = (&audio_pos + &text_embed)?;
+        let x = audio_chunk.broadcast_add(&text_embed)?;
 
         let hidden = model.decoder_forward(x, &ada_scales, &mut dec_caches)?;
-        // GPU argmax: transfers 1 u32 instead of 131K floats
-        let token = model.lm_head_argmax(&hidden)?;
+        let logits = model.lm_head(&hidden)?;
 
-        generated.push(token);
-        prev_token = token;
-        steps_since_rotation += 1;
-        if token == eos_token { break; }
+        // Extract tokens from all positions
+        for pos in 0..n {
+            let pos_logits = logits.narrow(1, pos, 1)?;
+            let logits_f32: Vec<f32> = pos_logits.to_dtype(DType::F32)?.reshape(131072)?.to_vec1()?;
+            let token = logits_f32.iter().enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(idx, _)| idx as u32).unwrap_or(0);
+            generated.push(token);
+            prev_token = token;
+            if token == eos_token { break; }
+        }
+        steps_since_rotation += n;
+        i = chunk_end;
     }
 
     let decode_ms = t_dec.elapsed().as_millis();
