@@ -513,38 +513,101 @@ impl InferenceSession for CandleCpuSession {
 
             self.decoder_started = true;
 
-            // Sequential decode: correct autoregressive behavior.
-            // Each position uses the token generated at the previous position.
-            // Trade-off: slower than batched but produces correct transcription.
+            // Decode mode: VOXTRAL_BATCH=1 (default) = sequential (correct quality).
+            // VOXTRAL_BATCH>1 = batched (faster but duplicated tokens).
+            let batch_mode: bool = std::env::var("VOXTRAL_BATCH")
+                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1) > 1;
             let decode_start = pl;
-            for j in decode_start..new_adapter_tokens {
-                let audio_pos = adapter_embeds
-                    .narrow(1, j, 1)
-                    .map_err(|e| format!("narrow: {}", e))?;
-                let text_embed = model
-                    .embed_token(self.prev_token)
-                    .map_err(|e| format!("embed: {}", e))?;
-                let x = audio_pos
-                    .broadcast_add(&text_embed)
-                    .map_err(|e| format!("add: {}", e))?;
-                let hidden = model
-                    .decoder_forward(x, &self.ada_scales, &mut self.dec_caches)
-                    .map_err(|e| format!("forward: {}", e))?;
-                let token = model
-                    .lm_head_argmax(&hidden)
-                    .map_err(|e| format!("lm_head: {}", e))?;
-                self.generated_tokens.push(token);
-                self.prev_token = token;
-                if token >= 1000 {
-                    new_text_tokens.push(token);
+
+            if batch_mode {
+                // BATCHED: one forward pass for all tokens (all positions share prev_token).
+                // Faster but produces duplicated tokens within a commit.
+                let remaining = new_adapter_tokens - decode_start;
+                if remaining > 0 {
+                    let audio_chunk = adapter_embeds.narrow(1, decode_start, remaining)
+                        .map_err(|e| format!("narrow: {}", e))?;
+                    let text_embed = model.embed_token(self.prev_token)
+                        .map_err(|e| format!("embed: {}", e))?;
+                    let x = audio_chunk.broadcast_add(&text_embed)
+                        .map_err(|e| format!("add: {}", e))?;
+                    let hidden = model.decoder_forward(x, &self.ada_scales, &mut self.dec_caches)
+                        .map_err(|e| format!("forward: {}", e))?;
+                    let logits = model.lm_head(&hidden).map_err(|e| format!("lm_head: {}", e))?;
+                    for pos in 0..remaining {
+                        let pos_logits = logits.narrow(1, pos, 1).map_err(|e| format!("narrow: {}", e))?;
+                        let logits_f32: Vec<f32> = pos_logits
+                            .to_dtype(candle_core_cpu::DType::F32)
+                            .and_then(|t| t.reshape(131072))
+                            .and_then(|t| t.to_vec1())
+                            .map_err(|e| format!("logits: {}", e))?;
+                        let token = logits_f32.iter().enumerate()
+                            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                            .map(|(idx, _)| idx as u32).unwrap_or(0);
+                        self.generated_tokens.push(token);
+                        self.prev_token = token;
+                        // Dedupe within batch (positions often produce same token)
+                        if token >= 1000 && new_text_tokens.last().copied() != Some(token) {
+                            new_text_tokens.push(token);
+                        }
+                        if token == eos_token { break; }
+                    }
                 }
-                if token == eos_token {
-                    break;
+            } else {
+                // SEQUENTIAL: each position uses previous token as prev_token.
+                // Correct autoregressive — proper quality.
+                for j in decode_start..new_adapter_tokens {
+                    let audio_pos = adapter_embeds.narrow(1, j, 1)
+                        .map_err(|e| format!("narrow: {}", e))?;
+                    let text_embed = model.embed_token(self.prev_token)
+                        .map_err(|e| format!("embed: {}", e))?;
+                    let x = audio_pos.broadcast_add(&text_embed)
+                        .map_err(|e| format!("add: {}", e))?;
+                    let hidden = model.decoder_forward(x, &self.ada_scales, &mut self.dec_caches)
+                        .map_err(|e| format!("forward: {}", e))?;
+                    let token = model.lm_head_argmax(&hidden)
+                        .map_err(|e| format!("lm_head: {}", e))?;
+                    self.generated_tokens.push(token);
+                    self.prev_token = token;
+                    if token >= 1000 { new_text_tokens.push(token); }
+                    if token == eos_token { break; }
                 }
             }
         } else if self.decoder_started {
-            // Sequential decode: correct autoregressive behavior
-            for j in 0..new_adapter_tokens {
+            let batch_mode: bool = std::env::var("VOXTRAL_BATCH")
+                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1) > 1;
+
+            if batch_mode {
+                // BATCHED decode (same approach for steady-state)
+                let audio_chunk = adapter_embeds.narrow(1, 0, new_adapter_tokens)
+                    .map_err(|e| format!("narrow: {}", e))?;
+                let text_embed = model.embed_token(self.prev_token)
+                    .map_err(|e| format!("embed: {}", e))?;
+                let x = audio_chunk.broadcast_add(&text_embed)
+                    .map_err(|e| format!("add: {}", e))?;
+                let hidden = model.decoder_forward(x, &self.ada_scales, &mut self.dec_caches)
+                    .map_err(|e| format!("forward: {}", e))?;
+                let logits = model.lm_head(&hidden).map_err(|e| format!("lm_head: {}", e))?;
+                for pos in 0..new_adapter_tokens {
+                    let pos_logits = logits.narrow(1, pos, 1).map_err(|e| format!("narrow: {}", e))?;
+                    let logits_f32: Vec<f32> = pos_logits
+                        .to_dtype(candle_core_cpu::DType::F32)
+                        .and_then(|t| t.reshape(131072))
+                        .and_then(|t| t.to_vec1())
+                        .map_err(|e| format!("logits: {}", e))?;
+                    let token = logits_f32.iter().enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(idx, _)| idx as u32).unwrap_or(0);
+                    self.generated_tokens.push(token);
+                    self.prev_token = token;
+                    // Dedupe within batch (positions often produce same token)
+                    if token >= 1000 && new_text_tokens.last().copied() != Some(token) {
+                        new_text_tokens.push(token);
+                    }
+                    if token == eos_token { break; }
+                }
+            } else {
+                // SEQUENTIAL decode (steady-state)
+                for j in 0..new_adapter_tokens {
                 let audio_pos = adapter_embeds
                     .narrow(1, j, 1)
                     .map_err(|e| format!("narrow: {}", e))?;
@@ -567,6 +630,7 @@ impl InferenceSession for CandleCpuSession {
                 }
                 if token == eos_token {
                     break;
+                }
                 }
             }
         }
