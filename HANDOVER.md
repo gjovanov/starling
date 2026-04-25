@@ -8,9 +8,18 @@
 ## TL;DR
 
 **GPU (candle-native-flash):** 0.2× realtime (5× faster than RT), correct transcription.
-**CPU (candle-cpu-ggml):** 1.68× realtime (slightly slower than RT), correct transcription.
 
-Both engines use **sequential autoregressive decode** + **periodic KV cache resets** (vllm-style).
+**CPU (candle-cpu-ggml) — 3 modes via env var:**
+
+| Mode | Env | Speed | Quality |
+|------|-----|-------|---------|
+| Sequential | (default) | 1.81× RT | ✅ Correct |
+| **Speculative** ⭐ | `VOXTRAL_SPEC=1` | **1.50× RT** | ✅ Correct (full German content) |
+| Batched | `VOXTRAL_BATCH=6` | 0.86× RT | ❌ Broken ("Jahre Der" only) |
+
+**Recommended: speculative mode** — 17% faster than sequential, correct quality.
+
+All modes use periodic KV cache resets (vllm-style) for long-audio stability.
 
 Earlier batched-decode experiments (commits 9decf61, earlier state) produced "Zum Zum Wir Wir" duplication because all positions in a batch shared the same prev_token. Fixed in commits **31b448e** (CPU) and **310fd81** (GPU).
 

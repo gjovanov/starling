@@ -32,12 +32,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Backend:     {}", config.backend);
     // Show CPU tuning env vars if using CPU backend
     if format!("{}", config.backend).contains("Cpu") {
+        let spec = std::env::var("VOXTRAL_SPEC").unwrap_or_else(|_| "0".to_string());
         let batch = std::env::var("VOXTRAL_BATCH").unwrap_or_else(|_| "1".to_string());
         let threads = std::env::var("GGML_THREADS").unwrap_or_else(|_| "16".to_string());
         let enc_reset = std::env::var("VOXTRAL_ENC_RESET").unwrap_or_else(|_| "150".to_string());
         let dec_reset = std::env::var("VOXTRAL_DEC_RESET").unwrap_or_else(|_| "300".to_string());
-        let mode = if batch.parse::<usize>().unwrap_or(1) > 1 { "BATCHED (faster, duplicates)" } else { "SEQUENTIAL (correct quality)" };
-        eprintln!("CPU mode:    {} (VOXTRAL_BATCH={})", mode, batch);
+        let mode = if spec.parse::<usize>().unwrap_or(0) > 0 {
+            "SPECULATIVE (1.50× RT, correct quality) ⭐"
+        } else if batch.parse::<usize>().unwrap_or(1) > 1 {
+            "BATCHED (0.86× RT but broken quality)"
+        } else {
+            "SEQUENTIAL (1.81× RT, correct quality)"
+        };
+        eprintln!("CPU mode:    {} (VOXTRAL_SPEC={}, VOXTRAL_BATCH={})", mode, spec, batch);
         eprintln!("CPU tuning:  GGML_THREADS={}, ENC_RESET={}, DEC_RESET={}", threads, enc_reset, dec_reset);
     }
     eprintln!("Models:      {}", config.models_dir.display());
