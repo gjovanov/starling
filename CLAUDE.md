@@ -133,29 +133,37 @@ cmake .. -DGGML_CUDA=OFF -DGGML_CPU=ON -DGGML_AVX512=ON \
 make -j$(nproc) ggml
 ```
 
-**Performance (AMD Ryzen 9 9955HX3D, 16c/32t, 96MB L3, DDR5-5600, streaming 0.5s commits):**
+**Performance (AMD Ryzen 9 9955HX3D, 16c/32t, 96MB L3, DDR5-5600, streaming 0.5s commits, 300s audio):**
 
-Sequential decode (current default, correct quality):
-| Duration | Realtime factor | Text quality |
-|----------|----------------|--------------|
-| 60s audio | **1.68×** | Correct transcription ("Wort zum Team drin, der ORF am 19. November...") |
-| 300s audio | ~1.7× (with KV resets) | Correct, consistent |
+Three decode modes available (recommended: speculative):
 
-Batched decode (`VOXTRAL_BATCH=6`, experimental, fast but has artifacts):
-| Duration | Realtime factor | Text quality |
-|----------|----------------|--------------|
-| 300s audio | **0.76×** (faster than RT) | Duplicated tokens ("Jahre Jahre Der Der") |
+| Mode | Env | Speed | Text quality |
+|------|-----|-------|--------------|
+| **Speculative** ⭐ | `VOXTRAL_SPEC=1` | **1.50× RT** | ✅ Full German content |
+| Sequential | (default) | 1.81× RT | ✅ Correct |
+| Batched | `VOXTRAL_BATCH=6` | 0.86× RT | ❌ Broken ("Jahre Der" only) |
 
-**Key streaming engine fixes (both modes):**
+**Speculative decoding** (Leviathan et al. 2023, adapted for Voxtral's dual-stream):
+1. DRAFT pass: batched forward, all N positions share `prev_token` (cheap, wrong)
+2. TRUNCATE: roll back KV cache via `KVCache::truncate_to`
+3. VERIFY pass: batched forward with corrected text embeddings (`text_ids = [prev_token, draft[0], …, draft[N-2]]`)
+4. ACCEPT up to first mismatch + sequential fallback for rejected positions
+
+Per-commit cost: 2 batched forwards (~150ms each) + 0-2 sequential fallback steps. Real speedup ~17% over pure sequential because acceptance rate is high for ASR (audio dominates the prediction).
+
+**Key streaming engine fixes (all modes):**
 1. **Periodic encoder KV reset** (`VOXTRAL_ENC_RESET=150`): prevents encoder from growing past L3 cache
 2. **Periodic decoder KV reset** (`VOXTRAL_DEC_RESET=300`): bounds decoder attention cost
 3. **Incremental mel + conv caching**: only new audio processed per commit
 
 **Environment variables:**
+- `VOXTRAL_SPEC=1` — enable speculative decoding (RECOMMENDED)
+- `VOXTRAL_BATCH=6` — batched (broken quality, only for benchmarking)
 - `GGML_THREADS=16` — thread count for ggml matmul (default: 16)
 - `VOXTRAL_ENC_RESET=150` — encoder KV cache reset threshold
 - `VOXTRAL_DEC_RESET=300` — decoder KV cache reset threshold
 - `CANDLE_PROFILE=1` — per-component timing (decoder_forward, lm_head)
+- `VOXTRAL_PROMPT_LEN=39` — streaming prefix length (TrevorS uses 38, no quality difference)
 
 #### Setup & Run
 ```bash
