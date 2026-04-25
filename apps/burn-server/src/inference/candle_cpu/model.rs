@@ -275,6 +275,20 @@ impl KVCache {
         Ok(())
     }
 
+    /// Truncate from the END: keep the first `keep` positions, drop the rest.
+    /// Used by speculative decoding to roll back tentative decode steps.
+    pub fn truncate_to(&mut self, keep: usize) -> Result<()> {
+        if keep >= self.seq_len {
+            return Ok(());
+        }
+        if let (Some(ck), Some(cv)) = (&self.k, &self.v) {
+            self.k = Some(ck.narrow(1, 0, keep)?.contiguous()?);
+            self.v = Some(cv.narrow(1, 0, keep)?.contiguous()?);
+        }
+        self.seq_len = keep;
+        Ok(())
+    }
+
     fn update(&mut self, k: Tensor, v: Tensor) -> Result<(Tensor, Tensor)> {
         let new_seq = k.dim(1)?;
         let (k, v) = match (&self.k, &self.v) {
@@ -1003,7 +1017,9 @@ pub fn transcribe(model: &VoxtralModel, mel: &Tensor, t_embed: &Tensor) -> Resul
     let mut caches = VoxtralModel::new_decoder_caches();
     let ada_scales = model.precompute_ada_scales(t_embed)?;
 
-    let prompt_len = 39usize.min(audio_seq);
+    let prompt_len_env: usize = std::env::var("VOXTRAL_PROMPT_LEN")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(39);
+    let prompt_len = prompt_len_env.min(audio_seq);
     let prompt_ids: Vec<u32> = std::iter::once(1u32)
         .chain(std::iter::repeat(32u32).take(prompt_len - 1))
         .collect();
@@ -1162,7 +1178,9 @@ pub fn transcribe_streaming(
 
     // Step 3: Decoder
     let ada_scales = model.precompute_ada_scales(t_embed)?;
-    let prompt_len = 39usize.min(audio_seq);
+    let prompt_len_env: usize = std::env::var("VOXTRAL_PROMPT_LEN")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(39);
+    let prompt_len = prompt_len_env.min(audio_seq);
     let prompt_ids: Vec<u32> = std::iter::once(1u32)
         .chain(std::iter::repeat(32u32).take(prompt_len - 1))
         .collect();

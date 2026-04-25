@@ -454,7 +454,12 @@ impl InferenceSession for CandleCpuSession {
         let t_dec_start = Instant::now();
 
         // Step 5: Decoder
-        let prompt_len = 39usize;
+        // Prefix length: BOS + STREAMING_PAD * (prompt_len-1).
+        // - 39 (default): voxtral.c reference = BOS + 38 PADs
+        // - 38 (TrevorS): "position-38 anomaly fix" = BOS + 37 PADs
+        // Configurable for A/B testing.
+        let prompt_len: usize = std::env::var("VOXTRAL_PROMPT_LEN")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(39);
         let eos_token = 2u32;
         let mut new_text_tokens = Vec::new();
 
@@ -513,13 +518,28 @@ impl InferenceSession for CandleCpuSession {
 
             self.decoder_started = true;
 
-            // Decode mode: VOXTRAL_BATCH=1 (default) = sequential (correct quality).
-            // VOXTRAL_BATCH>1 = batched (faster but duplicated tokens).
-            let batch_mode: bool = std::env::var("VOXTRAL_BATCH")
+            // Decode mode (priority order):
+            //   VOXTRAL_SPEC=1     → speculative (correct quality, faster than sequential)
+            //   VOXTRAL_BATCH>1    → batched (fastest but duplicated tokens)
+            //   default            → sequential (correct quality)
+            let spec_mode: bool = std::env::var("VOXTRAL_SPEC")
+                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0) > 0;
+            let batch_mode: bool = !spec_mode && std::env::var("VOXTRAL_BATCH")
                 .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1) > 1;
             let decode_start = pl;
 
-            if batch_mode {
+            if spec_mode {
+                let remaining = new_adapter_tokens - decode_start;
+                if remaining > 0 {
+                    let audio_chunk = adapter_embeds.narrow(1, decode_start, remaining)
+                        .map_err(|e| format!("narrow: {}", e))?;
+                    speculative_decode(
+                        &model, &audio_chunk, &mut self.dec_caches, &self.ada_scales,
+                        &mut self.prev_token, &mut self.generated_tokens, &mut new_text_tokens,
+                        eos_token, remaining,
+                    )?;
+                }
+            } else if batch_mode {
                 // BATCHED: one forward pass for all tokens (all positions share prev_token).
                 // Faster but produces duplicated tokens within a commit.
                 let remaining = new_adapter_tokens - decode_start;
@@ -573,10 +593,20 @@ impl InferenceSession for CandleCpuSession {
                 }
             }
         } else if self.decoder_started {
-            let batch_mode: bool = std::env::var("VOXTRAL_BATCH")
+            let spec_mode: bool = std::env::var("VOXTRAL_SPEC")
+                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0) > 0;
+            let batch_mode: bool = !spec_mode && std::env::var("VOXTRAL_BATCH")
                 .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1) > 1;
 
-            if batch_mode {
+            if spec_mode && new_adapter_tokens > 0 {
+                let audio_chunk = adapter_embeds.narrow(1, 0, new_adapter_tokens)
+                    .map_err(|e| format!("narrow: {}", e))?;
+                speculative_decode(
+                    &model, &audio_chunk, &mut self.dec_caches, &self.ada_scales,
+                    &mut self.prev_token, &mut self.generated_tokens, &mut new_text_tokens,
+                    eos_token, new_adapter_tokens,
+                )?;
+            } else if batch_mode {
                 // BATCHED decode (same approach for steady-state)
                 let audio_chunk = adapter_embeds.narrow(1, 0, new_adapter_tokens)
                     .map_err(|e| format!("narrow: {}", e))?;
@@ -696,4 +726,142 @@ impl InferenceSession for CandleCpuSession {
     fn commit_count(&self) -> usize {
         self.commit_count
     }
+}
+
+/// Speculative decoding for the streaming engine: 2 batched forward passes
+/// + acceptance check, instead of N sequential passes.
+///
+/// Algorithm (Leviathan et al. 2023, adapted for Voxtral's dual-stream):
+/// 1. DRAFT pass: batched forward where all N positions share `prev_token`
+///    as text embedding. Cheap but inaccurate at positions 1..N-1.
+/// 2. TRUNCATE: roll back the KV cache to remove draft entries.
+/// 3. VERIFY pass: batched forward with corrected text embeddings —
+///    position i uses draft[i-1] as text (or prev_token at position 0).
+///    Each verify position is a "true" sequential prediction IF all
+///    preceding drafts were correct.
+/// 4. ACCEPT: position 0 always matches. For positions 1..N-1, accept
+///    while draft[i] == verify[i]. On first mismatch at position k,
+///    `verify[k]` is the correct answer; reject k+1..N-1.
+/// 5. SEQUENTIAL FALLBACK: continue with sequential decode for any
+///    rejected positions.
+///
+/// Cost: 2 batched forwards (~140ms each on CPU) ≈ 280ms per commit
+/// in the best case (vs 540ms sequential for 6 tokens, vs 350ms broken
+/// batched). Real speedup depends on acceptance rate.
+fn speculative_decode(
+    model: &VoxtralModel,
+    audio_chunk: &Tensor,        // [1, N, D]
+    dec_caches: &mut Vec<KVCache>,
+    ada_scales: &[Tensor],
+    prev_token: &mut u32,
+    generated_tokens: &mut Vec<u32>,
+    new_text_tokens: &mut Vec<u32>,
+    eos_token: u32,
+    n: usize,
+) -> Result<(), String> {
+    let argmax_at = |logits: &Tensor, pos: usize| -> Result<u32, String> {
+        let pos_logits = logits.narrow(1, pos, 1).map_err(|e| format!("narrow: {}", e))?;
+        let v: Vec<f32> = pos_logits
+            .to_dtype(DType::F32)
+            .and_then(|t| t.reshape(131072))
+            .and_then(|t| t.to_vec1())
+            .map_err(|e| format!("logits: {}", e))?;
+        Ok(v.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(idx, _)| idx as u32).unwrap_or(0))
+    };
+
+    // Save cache state before this commit's decode work
+    let kv_seq_before = dec_caches[0].seq_len;
+
+    // ── DRAFT pass ───────────────────────────────────────────────────────
+    let text_embed_prev = model.embed_token(*prev_token).map_err(|e| format!("embed: {}", e))?;
+    let x_draft = audio_chunk.broadcast_add(&text_embed_prev).map_err(|e| format!("add: {}", e))?;
+    let h_draft = model.decoder_forward(x_draft, ada_scales, dec_caches)
+        .map_err(|e| format!("draft fwd: {}", e))?;
+    let logits_draft = model.lm_head(&h_draft).map_err(|e| format!("draft lm: {}", e))?;
+    let mut drafts = Vec::with_capacity(n);
+    for pos in 0..n {
+        drafts.push(argmax_at(&logits_draft, pos)?);
+    }
+
+    // ── TRUNCATE: roll back the wrong KV entries ───────────────────────────
+    for cache in dec_caches.iter_mut() {
+        cache.truncate_to(kv_seq_before).map_err(|e| format!("truncate: {}", e))?;
+    }
+
+    // ── VERIFY pass ───────────────────────────────────────────────────────
+    // text_ids = [prev_token, drafts[0], drafts[1], ..., drafts[n-2]]
+    let mut text_ids = Vec::with_capacity(n);
+    text_ids.push(*prev_token);
+    for d in &drafts[..n - 1] {
+        text_ids.push(*d);
+    }
+    let text_embed_verify = model.embed_tokens(&text_ids).map_err(|e| format!("embed_tokens: {}", e))?;
+    let x_verify = (audio_chunk + &text_embed_verify).map_err(|e| format!("add verify: {}", e))?;
+    let h_verify = model.decoder_forward(x_verify, ada_scales, dec_caches)
+        .map_err(|e| format!("verify fwd: {}", e))?;
+    let logits_verify = model.lm_head(&h_verify).map_err(|e| format!("verify lm: {}", e))?;
+    let mut verifies = Vec::with_capacity(n);
+    for pos in 0..n {
+        verifies.push(argmax_at(&logits_verify, pos)?);
+    }
+
+    // ── ACCEPT ────────────────────────────────────────────────────────────
+    // Position 0: always accept verifies[0] (same prev_token as draft, must match)
+    // Position k>0: accept while drafts[k] == verifies[k]
+    let mut accepted = 1usize;
+    for k in 1..n {
+        if drafts[k] == verifies[k] {
+            accepted = k + 1;
+        } else {
+            break;
+        }
+    }
+    // The "truth" tokens: verifies[0..accepted] (or equivalently drafts[0..accepted])
+    let mut truth: Vec<u32> = verifies[..accepted].to_vec();
+
+    // If we have a mismatch at position `accepted`, verifies[accepted] is the
+    // correct answer there (it used the right text embedding). Take it and
+    // truncate cache after that position. KV at position `accepted` is correct
+    // (used drafts[accepted-1] which == verifies[accepted-1] = the truth).
+    if accepted < n {
+        truth.push(verifies[accepted]);
+        accepted += 1;
+    }
+
+    // Truncate KV cache to keep only entries for accepted positions
+    for cache in dec_caches.iter_mut() {
+        cache.truncate_to(kv_seq_before + accepted).map_err(|e| format!("truncate2: {}", e))?;
+    }
+
+    // Emit accepted tokens
+    let mut last = *prev_token;
+    for &t in &truth {
+        generated_tokens.push(t);
+        if t >= 1000 { new_text_tokens.push(t); }
+        last = t;
+        if t == eos_token {
+            *prev_token = last;
+            return Ok(());
+        }
+    }
+    *prev_token = last;
+
+    // ── SEQUENTIAL FALLBACK ────────────────────────────────────────────────
+    // For positions accepted..n: do real sequential decode (one fwd per token)
+    for j in accepted..n {
+        let audio_pos = audio_chunk.narrow(1, j, 1).map_err(|e| format!("narrow seq: {}", e))?;
+        let text_e = model.embed_token(*prev_token).map_err(|e| format!("embed seq: {}", e))?;
+        let x = audio_pos.broadcast_add(&text_e).map_err(|e| format!("add seq: {}", e))?;
+        let hidden = model.decoder_forward(x, ada_scales, dec_caches)
+            .map_err(|e| format!("seq fwd: {}", e))?;
+        let token = model.lm_head_argmax(&hidden).map_err(|e| format!("seq lm: {}", e))?;
+        generated_tokens.push(token);
+        *prev_token = token;
+        if token >= 1000 { new_text_tokens.push(token); }
+        if token == eos_token { break; }
+    }
+
+    Ok(())
 }
