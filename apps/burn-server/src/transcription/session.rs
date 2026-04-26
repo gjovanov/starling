@@ -33,6 +33,13 @@ pub struct SessionRunnerConfig {
     pub language: String,
 }
 
+/// Configuration for a speakers (live, client-uplinked) transcription session.
+#[derive(Debug, Clone)]
+pub struct SpeakersRunnerConfig {
+    pub session_id: String,
+    pub language: String,
+}
+
 fn subtitle(session_id: &str, text: String, is_final: bool, segment_index: u32, timestamp_ms: u64, inference_time_ms: Option<f32>) -> SubtitleMessage {
     SubtitleMessage {
         msg_type: "subtitle".to_string(),
@@ -251,6 +258,247 @@ pub async fn run_session(
     eprintln!(
         "[Session {}] Completed: {:.1}s audio, {} segments, {:.1}s wall time",
         session_id, total_duration, segment_count, wall_time
+    );
+}
+
+/// Run a speakers (browser-uplinked) transcription session.
+///
+/// Audio flows from the WebSocket handler → `audio_rx` as pre-decoded,
+/// resampled 16 kHz f32 mono PCM. This runner accumulates it into 0.5s
+/// batches and runs inference continuously until the session is stopped
+/// or the client disconnects.
+pub async fn run_speakers_session(
+    config: SpeakersRunnerConfig,
+    engine: Arc<dyn InferenceEngine>,
+    mut audio_rx: mpsc::Receiver<Vec<f32>>,
+    subtitle_tx: mpsc::Sender<SubtitleMessage>,
+    state_update_tx: mpsc::Sender<(String, SessionState)>,
+    _app_state: Arc<AppState>,
+) {
+    let session_id = config.session_id.clone();
+    let language = config.language.clone();
+    eprintln!(
+        "[Speakers {}] run_speakers_session started (lang={})",
+        session_id, language
+    );
+
+    // Create inference session
+    let session_result = {
+        let lang = language.clone();
+        let eng = engine.clone();
+        tokio::task::spawn_blocking(move || eng.create_session(&lang)).await
+    };
+
+    let mut inference_session = match session_result {
+        Ok(Ok(session)) => session,
+        Ok(Err(e)) => {
+            eprintln!("[Speakers {}] Failed to create inference session: {}", session_id, e);
+            let _ = state_update_tx.send((session_id.clone(), SessionState::Error)).await;
+            let _ = subtitle_tx.send(subtitle(&session_id, format!("Error: {}", e), true, 0, 0, None)).await;
+            return;
+        }
+        Err(e) => {
+            eprintln!("[Speakers {}] Task join error: {}", session_id, e);
+            let _ = state_update_tx.send((session_id, SessionState::Error)).await;
+            return;
+        }
+    };
+
+    let _ = state_update_tx
+        .send((session_id.clone(), SessionState::Running))
+        .await;
+
+    eprintln!("[Speakers {}] Inference engine ready, RUNNING", session_id);
+
+    let _ = subtitle_tx.send(subtitle(&session_id, String::new(), false, 0, 0, None)).await;
+
+    // Channel: async receiver → blocking inference thread
+    let (batch_tx, batch_rx) = std::sync::mpsc::sync_channel::<(Vec<f32>, f32)>(64);
+
+    // Async task: accumulate incoming PCM into 0.5s batches, send to inference thread
+    let accumulate_sid = session_id.clone();
+    let accumulate_handle = tokio::spawn(async move {
+        let mut total_samples: usize = 0;
+        let mut audio_batch: Vec<f32> = Vec::with_capacity(BATCH_SAMPLES);
+        let mut chunks_received = 0usize;
+        let mut batches_sent = 0usize;
+        let mut last_log = std::time::Instant::now();
+
+        eprintln!(
+            "[Speakers {}] Accumulator started (waiting for audio from uplink)",
+            accumulate_sid
+        );
+
+        while let Some(samples_16k) = audio_rx.recv().await {
+            chunks_received += 1;
+            total_samples += samples_16k.len();
+            audio_batch.extend_from_slice(&samples_16k);
+
+            if chunks_received == 1 {
+                eprintln!(
+                    "[Speakers {}] First audio chunk: {} samples ({:.0}ms)",
+                    accumulate_sid,
+                    samples_16k.len(),
+                    samples_16k.len() as f32 * 1000.0 / 16000.0
+                );
+            }
+
+            while audio_batch.len() >= BATCH_SAMPLES {
+                let batch: Vec<f32> = audio_batch.drain(..BATCH_SAMPLES).collect();
+                let current_time = total_samples as f32 / 16000.0;
+                if batch_tx.try_send((batch, current_time)).is_err() {
+                    eprintln!(
+                        "[Speakers {}] Inference queue full — dropping batch at {:.1}s",
+                        accumulate_sid, current_time
+                    );
+                } else {
+                    batches_sent += 1;
+                }
+            }
+
+            if last_log.elapsed().as_secs() >= 5 {
+                eprintln!(
+                    "[Speakers {}] Accumulator: {} chunks ({:.1}s audio), {} batches forwarded",
+                    accumulate_sid,
+                    chunks_received,
+                    total_samples as f32 / 16000.0,
+                    batches_sent
+                );
+                last_log = std::time::Instant::now();
+            }
+        }
+
+        if !audio_batch.is_empty() {
+            let current_time = total_samples as f32 / 16000.0;
+            let _ = batch_tx.send((audio_batch, current_time));
+        }
+        eprintln!(
+            "[Speakers {}] Accumulator done: {} chunks, {} batches, {:.1}s audio",
+            accumulate_sid,
+            chunks_received,
+            batches_sent,
+            total_samples as f32 / 16000.0
+        );
+
+        total_samples
+    });
+
+    // Blocking inference loop (same structure as run_session's thread)
+    let infer_sid = session_id.clone();
+    let inference_handle = std::thread::spawn(move || {
+        let mut growing_text = String::new();
+        let mut segment_count: u32 = 0;
+        let mut batches_processed = 0usize;
+
+        while let Ok((batch, current_time)) = batch_rx.recv() {
+            batches_processed += 1;
+            inference_session.send_audio(&batch);
+
+            let t_commit = Instant::now();
+            let batch_delta = match inference_session.commit() {
+                Ok(delta) => delta,
+                Err(e) => {
+                    eprintln!(
+                        "[Speakers {}] Inference error at {:.1}s: {}",
+                        infer_sid, current_time, e
+                    );
+                    String::new()
+                }
+            };
+            let infer_ms = (t_commit.elapsed().as_secs_f32() * 10000.0).round() / 10.0;
+
+            if batches_processed == 1 {
+                eprintln!(
+                    "[Speakers {}] First inference commit @ {:.1}s: {} chars in {}ms — \"{}\"",
+                    infer_sid,
+                    current_time,
+                    batch_delta.len(),
+                    infer_ms as u32,
+                    batch_delta.replace('\n', " ")
+                );
+            }
+
+            if !batch_delta.is_empty() {
+                growing_text.push_str(&batch_delta);
+                let (sentences, remainder) = extract_complete_sentences(&growing_text);
+
+                for sentence in sentences {
+                    segment_count += 1;
+                    let _ = subtitle_tx.blocking_send(subtitle(
+                        &infer_sid,
+                        sentence,
+                        true,
+                        segment_count - 1,
+                        (current_time * 1000.0) as u64,
+                        Some(infer_ms),
+                    ));
+                }
+
+                growing_text = remainder;
+
+                if !growing_text.trim().is_empty() {
+                    let _ = subtitle_tx.blocking_send(subtitle(
+                        &infer_sid,
+                        growing_text.trim().to_string(),
+                        false,
+                        segment_count,
+                        (current_time * 1000.0) as u64,
+                        Some(infer_ms),
+                    ));
+                }
+            }
+
+            if inference_session.commit_count() >= MAX_COMMITS_BEFORE_ROTATE {
+                eprintln!(
+                    "[Speakers {}] Rotating ({} commits, {:.1}s audio)",
+                    infer_sid,
+                    inference_session.commit_count(),
+                    current_time
+                );
+                if let Err(e) = inference_session.reset() {
+                    eprintln!("[Speakers {}] Rotation failed: {}", infer_sid, e);
+                }
+            }
+        }
+
+        // Flush any trailing text
+        if !growing_text.trim().is_empty() {
+            let (sentences, remainder) = extract_complete_sentences(&growing_text);
+            let mut all = sentences;
+            if !remainder.trim().is_empty() {
+                all.push(remainder.trim().to_string());
+            }
+            for sentence in all {
+                segment_count += 1;
+                let _ = subtitle_tx.blocking_send(subtitle(
+                    &infer_sid,
+                    sentence,
+                    true,
+                    segment_count - 1,
+                    0,
+                    None,
+                ));
+            }
+        }
+
+        segment_count
+    });
+
+    let total_samples = accumulate_handle.await.unwrap_or(0);
+    let segment_count = tokio::task::spawn_blocking(move || {
+        inference_handle.join().unwrap_or(0)
+    })
+    .await
+    .unwrap_or(0);
+
+    let total_duration = total_samples as f32 / 16000.0;
+    let _ = state_update_tx
+        .send((session_id.clone(), SessionState::Completed))
+        .await;
+
+    eprintln!(
+        "[Speakers {}] Completed: {:.1}s audio, {} segments",
+        session_id, total_duration, segment_count
     );
 }
 

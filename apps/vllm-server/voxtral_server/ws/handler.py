@@ -7,11 +7,21 @@ import json
 import sys
 import uuid
 
-from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
+from aiortc import (
+    MediaStreamTrack,
+    RTCConfiguration,
+    RTCIceCandidate,
+    RTCIceServer,
+    RTCPeerConnection,
+    RTCSessionDescription,
+)
+from av.audio.resampler import AudioResampler
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from ..config import settings, generate_turn_credentials
 from ..state import app_state
+
+import numpy as np
 
 router = APIRouter()
 
@@ -63,6 +73,144 @@ def _parse_ice_candidate(data: dict) -> RTCIceCandidate | None:
     )
 
 
+def _build_ice_servers() -> list[RTCIceServer]:
+    ice_servers = [RTCIceServer(urls="stun:stun.l.google.com:19302")]
+    if settings.turn_server:
+        if settings.turn_shared_secret:
+            username, credential = generate_turn_credentials(
+                settings.turn_shared_secret, settings.turn_credential_ttl
+            )
+        else:
+            username = settings.turn_username
+            credential = settings.turn_password
+        turn_urls = [settings.turn_server]
+        if "?transport=" not in settings.turn_server:
+            turn_urls.append(f"{settings.turn_server}?transport=tcp")
+        ice_servers.append(RTCIceServer(
+            urls=turn_urls,
+            username=username,
+            credential=credential,
+        ))
+    return ice_servers
+
+
+async def _pump_inbound_audio(track: MediaStreamTrack, out_queue: asyncio.Queue, client_id: str) -> None:
+    """Read frames from an inbound WebRTC audio track, convert to 16 kHz mono float
+    PCM and push them into ``out_queue`` for the session runner.
+
+    Uses PyAV's ``AudioResampler`` so we don't have to hand-roll channel mix-down
+    + sample-rate conversion. The browser typically sends Opus 48 kHz **stereo**;
+    aiortc decodes that to a packed s16 frame whose ``ndarray`` shape is
+    ``(1, samples * channels)`` (interleaved L/R), which is *not* what the naive
+    ``axis=0`` mix-down expects. Letting libavfilter do the work avoids that class
+    of bug entirely.
+    """
+    import time
+
+    # Resample to 16 kHz mono float ('flt' → numpy float32 in [-1.0, 1.0]).
+    resampler = AudioResampler(format="flt", layout="mono", rate=16000)
+
+    total = 0
+    frames_seen = 0
+    decode_errors = 0
+    nonzero_frames = 0
+    max_abs_seen = 0.0
+    started_at = time.monotonic()
+    last_log = started_at
+
+    print(f"[WS {client_id}] _pump_inbound_audio started (kind={track.kind})", file=sys.stderr)
+
+    while True:
+        try:
+            frame = await track.recv()
+        except Exception as e:
+            print(
+                f"[WS {client_id}] Inbound track ended after {frames_seen} frames "
+                f"({total / 16000:.1f}s audio): {e}",
+                file=sys.stderr,
+            )
+            break
+
+        frames_seen += 1
+        if frames_seen == 1:
+            print(
+                f"[WS {client_id}] First inbound frame: format={frame.format.name}, "
+                f"layout={frame.layout.name}, rate={frame.sample_rate}, "
+                f"samples={frame.samples}",
+                file=sys.stderr,
+            )
+
+        # AudioResampler.resample yields a list of frames at the target format.
+        try:
+            out_frames = resampler.resample(frame)
+        except Exception as e:
+            decode_errors += 1
+            if decode_errors <= 5:
+                print(
+                    f"[WS {client_id}] Resample error on frame #{frames_seen}: {e}",
+                    file=sys.stderr,
+                )
+            continue
+
+        for of in out_frames:
+            try:
+                arr = of.to_ndarray()
+            except Exception as e:
+                decode_errors += 1
+                if decode_errors <= 5:
+                    print(f"[WS {client_id}] to_ndarray error: {e}", file=sys.stderr)
+                continue
+
+            # 'flt' mono is shape (1, n) — flatten to 1-D
+            samples = arr.flatten().astype(np.float32, copy=False)
+            if samples.size == 0:
+                continue
+
+            # Track audio activity so we can spot silent / corrupt streams.
+            local_max = float(np.abs(samples).max())
+            if local_max > max_abs_seen:
+                max_abs_seen = local_max
+            if local_max > 0.005:  # ~ -46 dBFS, quieter than mic noise floor
+                nonzero_frames += 1
+
+            samples_16k = samples.tolist()
+            total += len(samples_16k)
+
+            try:
+                out_queue.put_nowait(samples_16k)
+            except asyncio.QueueFull:
+                try:
+                    out_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    out_queue.put_nowait(samples_16k)
+                except asyncio.QueueFull:
+                    pass
+
+        now = time.monotonic()
+        if now - last_log >= 5.0:
+            print(
+                f"[WS {client_id}] Uplink: {frames_seen} frames, {total / 16000:.1f}s audio, "
+                f"max|sample|={max_abs_seen:.3f}, "
+                f"{nonzero_frames}/{frames_seen} frames above noise floor, "
+                f"{decode_errors} resample errors",
+                file=sys.stderr,
+            )
+            last_log = now
+
+    try:
+        out_queue.put_nowait(None)
+    except Exception:
+        pass
+    print(
+        f"[WS {client_id}] Inbound pump done: {frames_seen} frames in "
+        f"{time.monotonic() - started_at:.1f}s wall, {total / 16000:.1f}s audio decoded, "
+        f"max|sample|={max_abs_seen:.3f}",
+        file=sys.stderr,
+    )
+
+
 @router.websocket("/ws/{session_id}")
 async def websocket_handler(ws: WebSocket, session_id: str):
     await ws.accept()
@@ -88,13 +236,14 @@ async def websocket_handler(ws: WebSocket, session_id: str):
     # Subscribe to subtitle broadcasts
     sub_queue = ctx.subscribe()
     pc: RTCPeerConnection | None = None
+    is_uplink = False
 
     try:
         # Wait for ready message, handle signaling, and forward subtitles concurrently
         ready_received = asyncio.Event()
 
         async def handle_client_messages():
-            nonlocal pc
+            nonlocal pc, is_uplink
             while True:
                 try:
                     raw = await ws.receive_text()
@@ -108,24 +257,38 @@ async def websocket_handler(ws: WebSocket, session_id: str):
                     if raw.strip().lower() == "ready":
                         ready_received.set()
                         ctx.client_ready.set()
-                        await setup_webrtc()
+                        await setup_webrtc_receiver()
                     continue
 
                 msg_type = msg.get("type", "")
 
                 if msg_type == "ready":
                     ready_received.set()
-                    # Signal client_ready so session runner starts audio
-                    # (even without full WebRTC handshake — subtitles work over WS)
                     ctx.client_ready.set()
-                    await setup_webrtc()
+                    role = msg.get("role", "")
+                    if role == "uplink":
+                        is_uplink = True
+                        await setup_webrtc_uplink()
+                    else:
+                        await setup_webrtc_receiver()
 
-                elif msg_type == "answer" and pc:
+                elif msg_type == "offer" and is_uplink and pc:
+                    sdp = msg.get("sdp", "")
+                    desc = RTCSessionDescription(sdp=sdp, type="offer")
+                    await pc.setRemoteDescription(desc)
+                    answer = await pc.createAnswer()
+                    await pc.setLocalDescription(answer)
+                    await ws.send_json({
+                        "type": "answer",
+                        "sdp": pc.localDescription.sdp,
+                    })
+                    print(f"[WS {client_id}] SDP answer sent (uplink)", file=sys.stderr)
+
+                elif msg_type == "answer" and pc and not is_uplink:
                     sdp = msg.get("sdp", "")
                     desc = RTCSessionDescription(sdp=sdp, type="answer")
                     await pc.setRemoteDescription(desc)
                     print(f"[WS {client_id}] SDP answer set", file=sys.stderr)
-                    # Signal that a client is ready for audio
                     ctx.client_ready.set()
 
                 elif msg_type == "ice-candidate" and pc:
@@ -135,28 +298,60 @@ async def websocket_handler(ws: WebSocket, session_id: str):
                         if candidate:
                             await pc.addIceCandidate(candidate)
 
-        async def setup_webrtc():
+        async def setup_webrtc_uplink():
+            """Speakers: client will send an offer with its local track."""
             nonlocal pc
+            config = RTCConfiguration(iceServers=_build_ice_servers())
+            pc = RTCPeerConnection(configuration=config)
 
-            # Build ICE servers config and pass to RTCPeerConnection
-            ice_servers = [RTCIceServer(urls="stun:stun.l.google.com:19302")]
-            if settings.turn_server:
-                if settings.turn_shared_secret:
-                    username, credential = generate_turn_credentials(
-                        settings.turn_shared_secret, settings.turn_credential_ttl
-                    )
-                else:
-                    username = settings.turn_username
-                    credential = settings.turn_password
-                turn_urls = [settings.turn_server]
-                if "?transport=" not in settings.turn_server:
-                    turn_urls.append(f"{settings.turn_server}?transport=tcp")
-                ice_servers.append(RTCIceServer(
-                    urls=turn_urls,
-                    username=username,
-                    credential=credential,
-                ))
-            config = RTCConfiguration(iceServers=ice_servers)
+            audio_queue = ctx.audio_in_queue
+            if audio_queue is None:
+                await ws.send_json({
+                    "type": "error",
+                    "message": (
+                        "Session does not expect an uplink. Create it with source='speakers' "
+                        "and call /api/sessions/<id>/start before connecting."
+                    ),
+                })
+                return
+
+            @pc.on("track")
+            def on_track(track: MediaStreamTrack):
+                print(
+                    f"[WS {client_id}] Inbound track: kind={track.kind}",
+                    file=sys.stderr,
+                )
+                if track.kind == "audio":
+                    asyncio.create_task(_pump_inbound_audio(track, audio_queue, client_id))
+
+                @track.on("ended")
+                async def _on_ended():
+                    print(f"[WS {client_id}] Track ended", file=sys.stderr)
+
+            @pc.on("icecandidate")
+            async def on_ice_candidate(candidate):
+                if candidate:
+                    await ws.send_json({
+                        "type": "ice-candidate",
+                        "candidate": {
+                            "candidate": candidate.candidate,
+                            "sdpMid": candidate.sdpMid,
+                            "sdpMLineIndex": candidate.sdpMLineIndex,
+                        },
+                    })
+
+            # Note: the client already received the initial welcome on WS open and
+            # used that to fire its startOffer(). Sending a second welcome would
+            # cause the client to build a second PC and send a second offer.
+            print(
+                f"[WS {client_id}] Uplink PC ready — waiting for client SDP offer",
+                file=sys.stderr,
+            )
+
+        async def setup_webrtc_receiver():
+            """Media / SRT: server creates outbound track, sends offer to client."""
+            nonlocal pc
+            config = RTCConfiguration(iceServers=_build_ice_servers())
             pc = RTCPeerConnection(configuration=config)
 
             # Wait for audio track to be created by session runner
@@ -173,7 +368,6 @@ async def websocket_handler(ws: WebSocket, session_id: str):
             else:
                 print(f"[WS {client_id}] WARNING: No audio track available", file=sys.stderr)
 
-            # Handle ICE candidates
             @pc.on("icecandidate")
             async def on_ice_candidate(candidate):
                 if candidate:
@@ -186,7 +380,6 @@ async def websocket_handler(ws: WebSocket, session_id: str):
                         },
                     })
 
-            # Create and send offer
             offer = await pc.createOffer()
             await pc.setLocalDescription(offer)
             await ws.send_json({

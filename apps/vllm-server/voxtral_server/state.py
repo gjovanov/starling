@@ -23,6 +23,10 @@ class SessionContext:
         self.audio_track: Any = None
         # Event signaling that a WebRTC client is ready
         self.client_ready = asyncio.Event()
+        # Inbound audio queue for speakers sessions — the WS handler's
+        # on_track callback pushes 16kHz float PCM chunks here, and the
+        # session runner reads them. None for media/SRT sessions.
+        self.audio_in_queue: asyncio.Queue[list[float]] | None = None
 
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=256)

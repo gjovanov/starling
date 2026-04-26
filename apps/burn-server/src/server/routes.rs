@@ -233,6 +233,9 @@ pub struct CreateSessionRequest {
     pub mode: String,
     pub media_id: Option<String>,
     pub quant: Option<String>,
+    /// Audio source kind: "media" (default), "srt", or "speakers".
+    /// When "speakers", media_id is not required — audio is uploaded via WebRTC.
+    pub source: Option<String>,
 }
 
 fn default_language() -> String {
@@ -262,11 +265,27 @@ pub async fn create_session(
     } else {
         req.model_id.clone()
     };
-    let media_filename = req
-        .media_id
-        .as_deref()
-        .unwrap_or("")
-        .to_string();
+
+    // Normalize source: explicit `source` wins; else infer from media_id/srt
+    let source_type = match req.source.as_deref() {
+        Some("speakers") => "speakers",
+        Some("srt") => "srt",
+        Some("media") => "file",
+        _ if req.media_id.is_some() => "file",
+        _ => "file",
+    };
+
+    // Speakers sessions don't have a media file — the audio is streamed from the browser.
+    if source_type != "speakers" && req.media_id.is_none() {
+        return error_response("Either media_id must be provided or source must be 'speakers'")
+            .into_response();
+    }
+
+    let media_filename = if source_type == "speakers" {
+        "Speakers (live capture)".to_string()
+    } else {
+        req.media_id.as_deref().unwrap_or("").to_string()
+    };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -287,7 +306,7 @@ pub async fn create_session(
         progress_secs: 0.0,
         created_at: now,
         client_count: 0,
-        source_type: "file".to_string(),
+        source_type: source_type.to_string(),
         noise_cancellation: "none".to_string(),
         diarization: false,
         sentence_completion: "off".to_string(),
@@ -298,10 +317,11 @@ pub async fn create_session(
         subscribers: vec![],
         audio_state: None,
         rtp_track: None,
+        audio_in_tx: None,
     };
 
     state.sessions.write().await.insert(session_id, ctx);
-    ApiResponse::ok(info)
+    ApiResponse::ok(info).into_response()
 }
 
 pub async fn get_session(
@@ -352,29 +372,37 @@ pub async fn start_session(
         None => return error_response("Inference engine not loaded").into_response(),
     };
 
-    // Resolve media file path (try with common audio extensions if not found)
-    let media_path = match &session_info.media_id {
-        Some(media_id) => {
-            let direct = state.config.media_dir.join(media_id);
-            if direct.exists() {
-                direct
-            } else {
-                // Try common audio extensions
-                let extensions = ["wav", "mp3", "flac", "ogg", "m4a", "aac", "opus"];
-                extensions
-                    .iter()
-                    .map(|ext| state.config.media_dir.join(format!("{}.{}", media_id, ext)))
-                    .find(|p| p.exists())
-                    .unwrap_or(direct)
-            }
-        }
-        None => return error_response("No media_id specified").into_response(),
-    };
+    let is_speakers = session_info.source_type == "speakers";
 
-    if !media_path.exists() {
-        return error_response(&format!("Media file not found: {}", media_path.display()))
-            .into_response();
-    }
+    // For file-based sessions we resolve the media path up-front.
+    let media_path: Option<std::path::PathBuf> = if is_speakers {
+        None
+    } else {
+        match &session_info.media_id {
+            Some(media_id) => {
+                let direct = state.config.media_dir.join(media_id);
+                let path = if direct.exists() {
+                    direct
+                } else {
+                    let extensions = ["wav", "mp3", "flac", "ogg", "m4a", "aac", "opus"];
+                    extensions
+                        .iter()
+                        .map(|ext| state.config.media_dir.join(format!("{}.{}", media_id, ext)))
+                        .find(|p| p.exists())
+                        .unwrap_or(direct)
+                };
+                if !path.exists() {
+                    return error_response(&format!(
+                        "Media file not found: {}",
+                        path.display()
+                    ))
+                    .into_response();
+                }
+                Some(path)
+            }
+            None => return error_response("No media_id specified").into_response(),
+        }
+    };
 
     // Create subtitle broadcast channel
     let (subtitle_tx, mut subtitle_rx) =
@@ -414,24 +442,53 @@ pub async fn start_session(
         }
     });
 
-    // Spawn the transcription session
-    let runner_config = crate::transcription::session::SessionRunnerConfig {
-        session_id: session_id.clone(),
-        media_path,
-        language: session_info.language.clone(),
-    };
-
     let state_for_runner = state.clone();
-    tokio::spawn(async move {
-        crate::transcription::session::run_session(
-            runner_config,
-            engine,
-            subtitle_tx,
-            state_tx,
-            state_for_runner,
-        )
-        .await;
-    });
+
+    if is_speakers {
+        // Create the inbound audio channel and register it on the session context.
+        // The WS handler will fetch the sender when the client's SDP offer arrives.
+        let (audio_tx, audio_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(128);
+        {
+            let mut sessions = state.sessions.write().await;
+            if let Some(ctx) = sessions.get_mut(&session_id) {
+                ctx.audio_in_tx = Some(audio_tx);
+            }
+        }
+
+        let runner_config = crate::transcription::session::SpeakersRunnerConfig {
+            session_id: session_id.clone(),
+            language: session_info.language.clone(),
+        };
+
+        tokio::spawn(async move {
+            crate::transcription::session::run_speakers_session(
+                runner_config,
+                engine,
+                audio_rx,
+                subtitle_tx,
+                state_tx,
+                state_for_runner,
+            )
+            .await;
+        });
+    } else {
+        let runner_config = crate::transcription::session::SessionRunnerConfig {
+            session_id: session_id.clone(),
+            media_path: media_path.expect("file session without media path"),
+            language: session_info.language.clone(),
+        };
+
+        tokio::spawn(async move {
+            crate::transcription::session::run_session(
+                runner_config,
+                engine,
+                subtitle_tx,
+                state_tx,
+                state_for_runner,
+            )
+            .await;
+        });
+    }
 
     ApiResponse::ok(session_info).into_response()
 }

@@ -54,14 +54,17 @@ async def list_sessions():
 
 @router.post("/api/sessions")
 async def create_session(req: CreateSessionRequest):
-    # Resolve media file or SRT channel
+    # Resolve media file, SRT channel, or speakers source
     media_path = None
     media_filename = ""
     duration_secs = 0.0
     source_type = "file"
     srt_url = ""
 
-    if req.srt_channel_id is not None:
+    if req.source == "speakers":
+        source_type = "speakers"
+        media_filename = "Speakers (live capture)"
+    elif req.srt_channel_id is not None:
         srt_url = _resolve_srt_url(req.srt_channel_id) or ""
         if not srt_url:
             return ApiResponse.err(f"SRT channel {req.srt_channel_id} not found or SRT not configured")
@@ -75,7 +78,7 @@ async def create_session(req: CreateSessionRequest):
         from ..media.manager import get_duration
         duration_secs = await get_duration(media_path)
     else:
-        return ApiResponse.err("Either media_id or srt_channel_id is required")
+        return ApiResponse.err("Either media_id, srt_channel_id, or source='speakers' is required")
 
     info = SessionInfo(
         model_id=req.model_id or "voxtral-mini-4b",
@@ -93,7 +96,11 @@ async def create_session(req: CreateSessionRequest):
     )
 
     app_state.add_session(info)
-    print(f"[Session {info.id}] Created (model={info.model_id}, source={source_type}, media={info.media_id}, lang={info.language})", file=sys.stderr)
+    print(
+        f"[Session {info.id}] Created (model={info.model_id}, source={source_type}, "
+        f"media={info.media_id or '-'}, lang={info.language})",
+        file=sys.stderr,
+    )
     return ApiResponse.ok(info.model_dump())
 
 
@@ -132,10 +139,16 @@ async def start_session(session_id: str):
 
     ctx.info.state = SessionState.STARTING
 
-    # Resolve audio source: SRT URL or media file path
-    if ctx.info.source_type == "srt":
+    # Resolve audio source: speakers (client uplink), SRT URL, or media file path
+    audio_source: Path | str | None
+    if ctx.info.source_type == "speakers":
+        # The audio is uploaded from the browser. Create an inbound queue that
+        # the WebSocket handler's on_track callback will push PCM into.
+        ctx.audio_in_queue = asyncio.Queue(maxsize=512)
+        audio_source = None  # Sentinel: use ctx.audio_in_queue
+    elif ctx.info.source_type == "srt":
         # media_id holds the SRT URL for SRT sessions
-        audio_source: Path | str = ctx.info.media_id
+        audio_source = ctx.info.media_id
     else:
         media_path = get_media_path(ctx.info.media_id)
         if media_path is None and not ctx.info.without_transcription:
@@ -144,13 +157,21 @@ async def start_session(session_id: str):
         audio_source = media_path
 
     # Import here to avoid circular imports
-    from ..transcription.session_runner import run_session
+    if ctx.info.source_type == "speakers":
+        from ..transcription.speakers_runner import run_speakers_session
 
-    ctx.task = asyncio.create_task(
-        run_session(ctx, audio_source),
-        name=f"session-{session_id}",
-    )
+        ctx.task = asyncio.create_task(
+            run_speakers_session(ctx),
+            name=f"session-{session_id}",
+        )
+    else:
+        from ..transcription.session_runner import run_session
+
+        ctx.task = asyncio.create_task(
+            run_session(ctx, audio_source),
+            name=f"session-{session_id}",
+        )
 
     ctx.info.state = SessionState.RUNNING
-    print(f"[Session {session_id}] Started (source={audio_source})", file=sys.stderr)
+    print(f"[Session {session_id}] Started (source={ctx.info.source_type})", file=sys.stderr)
     return ApiResponse.ok(ctx.info.model_dump())

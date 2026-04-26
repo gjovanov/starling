@@ -3,6 +3,7 @@
  */
 import { loadConfig, getConfig } from './config.js';
 import { WebRTCClient } from './modules/webrtc.js';
+import { WebRTCUplinkClient, listAudioInputDevices, captureSpeakersStream } from './modules/webrtc-uplink.js';
 import { SubtitleRenderer } from './modules/subtitles.js';
 import { formatTime } from './modules/utils.js';
 import { SessionManager, formatDuration, formatFileSize } from './modules/session-manager.js';
@@ -25,7 +26,8 @@ function getSilenceEnergyThreshold(sliderValue) {
 }
 
 // Modules
-let webrtcClient = null;
+let webrtcClient = null;       // Receiving (media/SRT sessions)
+let uplinkClient = null;       // Sending (speakers sessions)
 let subtitleRenderer = null;
 let sessionManager = null;
 
@@ -192,11 +194,19 @@ function cacheElements() {
   elements.fabSendTypeGroup = document.getElementById('fab-send-type-group');
   elements.fabSendTypeSelect = document.getElementById('fab-send-type-select');
 
-  // Source type tabs (Media Files vs Live Streams)
+  // Source type tabs (Media Files / Live Streams / Speakers)
   elements.sourceTabs = document.querySelectorAll('.source-tab');
   elements.mediaSourceContent = document.getElementById('media-source-content');
   elements.srtSourceContent = document.getElementById('srt-source-content');
   elements.srtSelect = document.getElementById('srt-select');
+  elements.speakersSourceContent = document.getElementById('speakers-source-content');
+  elements.speakersSelect = document.getElementById('speakers-select');
+  elements.speakersRefreshBtn = document.getElementById('speakers-refresh-btn');
+  elements.speakersPermissionHint = document.getElementById('speakers-permission-hint');
+  elements.speakersMethodRadios = document.querySelectorAll('input[name="speakers-method"]');
+  elements.speakersDeviceRow = document.getElementById('speakers-device-row');
+  elements.speakersTestBtn = document.getElementById('speakers-test-btn');
+  elements.speakersTestStatus = document.getElementById('speakers-test-status');
 }
 
 function setupSessionManagerListeners() {
@@ -229,7 +239,7 @@ function setupEventListeners() {
     });
   });
 
-  // Source type tab switching (Media Files vs Live Streams)
+  // Source type tab switching (Media Files / Live Streams / Speakers)
   if (elements.sourceTabs) {
     elements.sourceTabs.forEach(tab => {
       tab.addEventListener('click', () => {
@@ -246,7 +256,64 @@ function setupEventListeners() {
         if (elements.srtSourceContent) {
           elements.srtSourceContent.style.display = sourceType === 'srt' ? 'block' : 'none';
         }
+        if (elements.speakersSourceContent) {
+          elements.speakersSourceContent.style.display = sourceType === 'speakers' ? 'flex' : 'none';
+        }
+
+        if (sourceType === 'speakers') {
+          // Sync the device row visibility against the current radio state
+          const method = getSpeakersMethod();
+          if (elements.speakersDeviceRow) {
+            elements.speakersDeviceRow.style.display = method === 'device' ? 'flex' : 'none';
+          }
+          if (method === 'device') {
+            refreshAudioInputDevices();
+          }
+        }
       });
+    });
+  }
+
+  // Speakers: method radio buttons toggle the device row
+  if (elements.speakersMethodRadios && elements.speakersMethodRadios.length) {
+    elements.speakersMethodRadios.forEach(radio => {
+      radio.addEventListener('change', () => {
+        const method = getSpeakersMethod();
+        if (elements.speakersDeviceRow) {
+          elements.speakersDeviceRow.style.display = method === 'device' ? 'flex' : 'none';
+        }
+        if (method === 'device') {
+          refreshAudioInputDevices();
+        }
+      });
+    });
+  }
+
+  // Speakers: refresh device list
+  if (elements.speakersRefreshBtn) {
+    elements.speakersRefreshBtn.addEventListener('click', async () => {
+      // Request a transient mic permission so device labels are populated,
+      // then enumerate.
+      try {
+        const tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
+        tmp.getTracks().forEach(t => t.stop());
+        if (elements.speakersPermissionHint) {
+          elements.speakersPermissionHint.style.display = 'none';
+        }
+      } catch (e) {
+        console.warn('[Speakers] Mic permission denied or failed:', e);
+        if (elements.speakersPermissionHint) {
+          elements.speakersPermissionHint.style.display = 'block';
+        }
+      }
+      await refreshAudioInputDevices();
+    });
+  }
+
+  // Speakers: "Test capture" verifies the picker without creating a session
+  if (elements.speakersTestBtn) {
+    elements.speakersTestBtn.addEventListener('click', async () => {
+      await testSpeakersCapture();
     });
   }
 
@@ -413,22 +480,25 @@ function setupEventListeners() {
     // Determine source based on active tab
     let mediaId = null;
     let srtChannelId = null;
+    let sourceOverride = null;
 
     if (state.sourceType === 'srt') {
-      // SRT stream source
       const srtValue = elements.srtSelect?.value;
       if (!srtValue || srtValue === '') {
         alert('Please select an SRT stream');
         return;
       }
       srtChannelId = parseInt(srtValue, 10);
+      sourceOverride = 'srt';
+    } else if (state.sourceType === 'speakers') {
+      sourceOverride = 'speakers';
     } else {
-      // Media file source
       mediaId = elements.mediaSelect.value;
       if (!mediaId) {
         alert('Please select a media file');
         return;
       }
+      sourceOverride = 'media';
     }
 
     if (!withoutTranscription && !modelId) {
@@ -478,6 +548,7 @@ function setupEventListeners() {
       const session = await sessionManager.createSession(modelId, {
         mediaId,
         srtChannelId,
+        source: sourceOverride,
         mode,
         language,
         noiseCancellation,
@@ -493,6 +564,13 @@ function setupEventListeners() {
       });
       // Auto-start the session
       await sessionManager.startSession(session.id);
+
+      // For speakers sessions: immediately capture local audio and connect uplink.
+      // The user already clicked a button, so the gesture requirement for
+      // getDisplayMedia / getUserMedia is satisfied.
+      if (sourceOverride === 'speakers') {
+        await startSpeakersUplink(session.id);
+      }
     } catch (e) {
       alert('Failed to create session: ' + e.message);
     } finally {
@@ -534,7 +612,16 @@ function setupEventListeners() {
     if (state.connected) {
       disconnect();
     } else if (state.selectedSessionId) {
-      connect(state.selectedSessionId);
+      // For speakers sessions, we need to re-capture the stream (can't be joined like a media session)
+      const sess = sessionManager.sessions.find(s => s.id === state.selectedSessionId);
+      if (sess && sess.source_type === 'speakers') {
+        startSpeakersUplink(state.selectedSessionId).catch(e => {
+          console.error('[Speakers] join failed:', e);
+          alert('Failed to start speakers uplink: ' + e.message);
+        });
+      } else {
+        connect(state.selectedSessionId);
+      }
     } else {
       console.log('[Click] No session selected!');
     }
@@ -1029,9 +1116,255 @@ function disconnect() {
     webrtcClient = null;
     window._webrtcClient = null;
   }
+  if (uplinkClient) {
+    uplinkClient.disconnect();
+    uplinkClient = null;
+    window._uplinkClient = null;
+  }
   state.connected = false;
   updateConnectionStatus('disconnected');
   elements.connectBtn.textContent = 'Join Session';
+}
+
+/**
+ * Read the current "Speakers" method from the radio group ("display" or "device").
+ */
+function getSpeakersMethod() {
+  if (!elements.speakersMethodRadios) return 'display';
+  for (const radio of elements.speakersMethodRadios) {
+    if (radio.checked) return radio.value;
+  }
+  return 'display';
+}
+
+/**
+ * Resolve the capture source ID to pass to captureSpeakersStream().
+ *  - method=display → "display" (browser screen-share picker)
+ *  - method=device  → the selected audioinput deviceId
+ */
+function getSpeakersSourceId() {
+  const method = getSpeakersMethod();
+  if (method === 'display') return 'display';
+  const id = elements.speakersSelect?.value || '';
+  if (!id || id === 'display') {
+    throw new Error('Pick an audio input device, or switch to the "Pick a tab/window/screen" method.');
+  }
+  return id;
+}
+
+/**
+ * "Test capture" — verifies the user can grant capture permissions and that
+ * the resulting stream contains an audio track. Stops the stream immediately;
+ * the user can then create a real session.
+ */
+async function testSpeakersCapture() {
+  if (!elements.speakersTestStatus) return;
+  elements.speakersTestStatus.style.color = '#888';
+  elements.speakersTestStatus.textContent = 'Opening picker…';
+
+  let stream;
+  try {
+    const sourceId = getSpeakersSourceId();
+    stream = await captureSpeakersStream(sourceId);
+  } catch (e) {
+    elements.speakersTestStatus.style.color = '#f88';
+    const msg = (e && e.message) || String(e);
+    elements.speakersTestStatus.textContent = `Capture failed: ${msg}`;
+    return;
+  }
+
+  const audioTracks = stream.getAudioTracks();
+  if (!audioTracks.length) {
+    stream.getTracks().forEach(t => t.stop());
+    elements.speakersTestStatus.style.color = '#f88';
+    elements.speakersTestStatus.textContent =
+      'Capture has no audio. Re-try and tick "Share audio" in the dialog.';
+    return;
+  }
+
+  const label = audioTracks[0].label || 'audio source';
+  elements.speakersTestStatus.style.color = '#7d7';
+  elements.speakersTestStatus.textContent = `OK — capturing ${label}. Stopping preview.`;
+
+  // Stop the test stream immediately — the real session will request a fresh one
+  setTimeout(() => {
+    stream.getTracks().forEach(t => t.stop());
+  }, 300);
+}
+
+/**
+ * Populate the speakers device dropdown from enumerateDevices().
+ */
+async function refreshAudioInputDevices() {
+  if (!elements.speakersSelect) return;
+  try {
+    const devices = await listAudioInputDevices();
+    const prev = elements.speakersSelect.value;
+    const opts = [];
+
+    if (devices.length === 0) {
+      opts.push('<option value="">No audio input devices found</option>');
+    } else {
+      // Highlight likely loopback devices (system-audio capture) at the top.
+      const loopbackPattern = /(stereo\s*mix|monitor of|loopback|blackhole|soundflower|virtual.*cable|vb-?audio|wasapi.*loopback|what\s*u\s*hear)/i;
+      const loopback = devices.filter(d => loopbackPattern.test(d.label || ''));
+      const others = devices.filter(d => !loopbackPattern.test(d.label || ''));
+
+      if (loopback.length) {
+        opts.push('<optgroup label="Likely speaker loopback (recommended)">');
+        for (const d of loopback) {
+          opts.push(`<option value="${d.deviceId}">${d.label}</option>`);
+        }
+        opts.push('</optgroup>');
+        opts.push('<optgroup label="Other inputs (microphones, headsets — won\'t capture speakers)">');
+      } else {
+        opts.push('<optgroup label="Microphones / inputs (won\'t capture speakers — install a loopback driver)">');
+      }
+      for (const d of others) {
+        opts.push(`<option value="${d.deviceId}">${d.label}</option>`);
+      }
+      opts.push('</optgroup>');
+    }
+
+    elements.speakersSelect.innerHTML = opts.join('');
+    if (prev && [...elements.speakersSelect.options].some(o => o.value === prev)) {
+      elements.speakersSelect.value = prev;
+    }
+
+    // If all labels are empty, the browser is masking them — need mic permission.
+    if (devices.length > 0 && devices.every(d => !d.label || d.label === 'Unnamed device')) {
+      if (elements.speakersPermissionHint) {
+        elements.speakersPermissionHint.style.display = 'block';
+      }
+    }
+  } catch (e) {
+    console.warn('[Speakers] Failed to enumerate devices:', e);
+  }
+}
+
+/**
+ * Capture local audio and connect as an uplink (client → server) WebRTC peer.
+ */
+async function startSpeakersUplink(sessionId) {
+  if (uplinkClient) {
+    uplinkClient.disconnect();
+    uplinkClient = null;
+  }
+
+  let sourceId;
+  try {
+    sourceId = getSpeakersSourceId();
+  } catch (e) {
+    elements.bufferInfo.textContent = e.message;
+    throw e;
+  }
+
+  elements.bufferInfo.textContent = sourceId === 'display'
+    ? 'Pick a tab/window/screen and tick "Share audio"…'
+    : 'Requesting capture permission…';
+
+  let stream;
+  try {
+    stream = await captureSpeakersStream(sourceId);
+  } catch (e) {
+    console.error('[Speakers] Capture failed:', e);
+    elements.bufferInfo.textContent = 'Capture cancelled';
+    throw e;
+  }
+
+  const audioTracks = stream.getAudioTracks();
+  if (!audioTracks.length) {
+    stream.getTracks().forEach(t => t.stop());
+    throw new Error('No audio track available from the selected source');
+  }
+  console.log('[Speakers] Capturing from', audioTracks[0].label);
+
+  const config = getConfig();
+  const wsUrl = sessionManager.getWebSocketUrl(sessionId);
+
+  uplinkClient = new WebRTCUplinkClient(wsUrl, {
+    iceServers: config.iceServers,
+    iceTransportPolicy: config.iceTransportPolicy || 'all',
+    stream,
+  });
+
+  uplinkClient.on('welcome', (msg) => {
+    console.log('[Speakers] Welcome:', msg);
+  });
+
+  uplinkClient.on('connected', () => {
+    state.connected = true;
+    updateConnectionStatus('connected');
+    elements.connectBtn.disabled = false;
+    elements.connectBtn.textContent = 'Leave Session';
+    elements.playPauseBtn.disabled = true; // No local playback needed
+    elements.bufferInfo.textContent = 'Uplink connected';
+  });
+
+  uplinkClient.on('disconnect', ({ code, reason }) => {
+    state.connected = false;
+    updateConnectionStatus('disconnected');
+    elements.connectBtn.textContent = 'Join Session';
+    console.log('[Speakers] Disconnected:', code, reason);
+  });
+
+  uplinkClient.on('reconnecting', ({ attempt, delay }) => {
+    state.connected = false;
+    updateConnectionStatus('reconnecting');
+    elements.bufferInfo.textContent = `Reconnecting (${attempt})…`;
+  });
+
+  uplinkClient.on('reconnectFailed', () => {
+    state.connected = false;
+    updateConnectionStatus('disconnected');
+    elements.bufferInfo.textContent = 'Reconnection failed';
+  });
+
+  uplinkClient.on('connectionFailed', () => {
+    state.connected = false;
+    updateConnectionStatus('reconnecting');
+    elements.bufferInfo.textContent = 'ICE failed';
+  });
+
+  uplinkClient.on('subtitle', (segment) => {
+    state.subtitleCount++;
+    elements.bufferInfo.textContent = `Subtitles: ${state.subtitleCount}`;
+    subtitleRenderer.addSegment(segment);
+  });
+
+  uplinkClient.on('status', ({ bufferTime, totalDuration }) => {
+    state.totalDuration = totalDuration;
+    elements.durationInfo.textContent = `Duration: ${formatTime(totalDuration)}`;
+    elements.totalDuration.textContent = formatTime(totalDuration);
+  });
+
+  uplinkClient.on('end', ({ totalDuration }) => {
+    console.log('[Speakers] End, total duration:', formatTime(totalDuration));
+  });
+
+  uplinkClient.on('serverError', ({ message }) => {
+    console.error('[Speakers] Server error:', message);
+    alert(`Server error: ${message}`);
+  });
+
+  updateConnectionStatus('connecting');
+  state.subtitleCount = 0;
+
+  // Auto-stop if the user ends sharing from the browser picker
+  audioTracks[0].addEventListener('ended', () => {
+    console.log('[Speakers] Capture track ended — disconnecting');
+    disconnect();
+  });
+
+  try {
+    await uplinkClient.connect();
+    window._uplinkClient = uplinkClient;
+  } catch (e) {
+    console.error('[Speakers] Connect failed:', e);
+    updateConnectionStatus('disconnected');
+    elements.bufferInfo.textContent = 'Connection failed';
+    throw e;
+  }
 }
 
 function updateConnectionStatus(status) {

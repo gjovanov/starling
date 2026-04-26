@@ -160,6 +160,7 @@ export class SessionManager {
     const {
       mediaId = null,
       srtChannelId = null,
+      source = null,                // 'media' | 'srt' | 'speakers' (inferred if omitted)
       mode = 'speedy',
       language = 'de',
       noiseCancellation = 'none',
@@ -190,13 +191,21 @@ export class SessionManager {
         body.model_id = modelId;
       }
 
-      // Add source - either media file or SRT channel (mutually exclusive)
-      if (mediaId) {
+      // Source: media / srt / speakers
+      // Speakers sessions receive audio over WebRTC from the browser — no media_id needed.
+      const resolvedSource = source
+        || (mediaId ? 'media' : srtChannelId != null ? 'srt' : null);
+
+      if (resolvedSource === 'speakers') {
+        body.source = 'speakers';
+      } else if (mediaId) {
         body.media_id = mediaId;
+        body.source = 'media';
       } else if (srtChannelId !== null && srtChannelId !== undefined) {
         body.srt_channel_id = srtChannelId;
+        body.source = 'srt';
       } else {
-        throw new Error('Must specify either mediaId or srtChannelId');
+        throw new Error('Must specify source: speakers, mediaId, or srtChannelId');
       }
 
       // Add pause config if provided

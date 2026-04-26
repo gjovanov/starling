@@ -79,6 +79,10 @@ pub struct SessionContext {
     pub audio_state: Option<SessionAudioState>,
     /// Audio track for WebRTC RTP writing (set by WS handler on "ready")
     pub rtp_track: Option<Arc<TrackLocalStaticRTP>>,
+    /// Inbound audio channel for speakers sessions. When a WS client
+    /// connects with role=uplink, it feeds decoded 16 kHz f32 PCM here.
+    /// The session runner reads from this receiver.
+    pub audio_in_tx: Option<mpsc::Sender<Vec<f32>>>,
 }
 
 /// Shared application state

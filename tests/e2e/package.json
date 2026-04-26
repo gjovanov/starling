@@ -1,0 +1,20 @@
+{
+  "name": "starling-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "End-to-end browser tests for Starling frontends (burn-server + vllm-server).",
+  "scripts": {
+    "install-browsers": "playwright install chromium",
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:ui": "playwright test --ui"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0"
+  },
+  "dependencies": {
+    "@types/ws": "^8.18.1",
+    "typescript": "^6.0.3",
+    "ws": "^8.20.0"
+  }
+}

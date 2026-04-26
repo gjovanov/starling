@@ -13,7 +13,7 @@ use axum::{
     Router,
 };
 use burn_server::{
-    config::{Config, Quantization},
+    config::{Config, GpuBackend, Quantization},
     inference::{InferenceEngine, InferenceSession},
     server::{routes, state::AppState},
 };
@@ -78,6 +78,7 @@ async fn build_e2e_app() -> (Router, Arc<AppState>) {
     let config = Config {
         port: 0,
         quant: Quantization::Q4,
+        backend: GpuBackend::Wgpu,
         models_dir: tmp_dir.join("models"),
         frontend: tmp_dir.join("frontend"),
         media_dir,

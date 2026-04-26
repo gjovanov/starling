@@ -442,6 +442,7 @@
             <div class="source-tabs">
               <button type="button" class="source-tab active" data-source="media">Media Files</button>
               <button type="button" class="source-tab" data-source="srt">Live Streams</button>
+              <button type="button" class="source-tab" data-source="speakers">Speakers</button>
             </div>
           </div>
 
@@ -458,6 +459,73 @@
               <option value="">Loading SRT streams...</option>
             </select>
             <p class="form-hint">Live streams run until stopped manually.</p>
+          </div>
+
+          <!-- Speakers / System Audio Source -->
+          <div id="speakers-source-content" class="form-group" style="display: none;">
+            <label>Capture system / tab audio</label>
+            <p class="form-hint" style="line-height: 1.5;">
+              Browsers don't expose your speakers as a regular input device.
+              To transcribe what's playing on this machine (Audible, YouTube, a video
+              call, etc.), we use the screen-share API. When you start, your browser
+              opens a picker for a tab, window, or whole screen.
+              <strong style="color: #ffb86c;">You must tick "Share audio" in that dialog</strong>
+              — otherwise the captured stream contains only video, which we can't transcribe.
+            </p>
+
+            <!-- Method picker: display (default) or audio input device -->
+            <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 4px;">
+              <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal;">
+                <input type="radio" name="speakers-method" value="display" checked>
+                <span>
+                  <strong>Pick a tab / window / screen</strong> (recommended)<br>
+                  <small style="color: #888;">
+                    Works on every desktop browser. Best for tab audio (Chrome) and
+                    full-screen system audio (Chrome on Windows/ChromeOS).
+                  </small>
+                </span>
+              </label>
+
+              <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal;">
+                <input type="radio" name="speakers-method" value="device">
+                <span>
+                  <strong>Use a specific audio input device</strong> (advanced)<br>
+                  <small style="color: #888;">
+                    For OS loopback drivers like Stereo Mix (Windows), BlackHole (macOS),
+                    or PulseAudio "Monitor of …" (Linux). Plain microphones won't capture
+                    speaker output.
+                  </small>
+                </span>
+              </label>
+            </div>
+
+            <div id="speakers-device-row" style="display: none; flex-direction: column; gap: 6px; margin-top: 6px;">
+              <label for="speakers-select" style="color: #aaa; font-size: 0.85em;">
+                Audio input device
+              </label>
+              <select id="speakers-select">
+                <option value="">Loading devices…</option>
+              </select>
+              <div style="display: flex; gap: 8px; align-items: center;">
+                <button type="button" id="speakers-refresh-btn" class="btn-small btn-primary">
+                  Refresh devices
+                </button>
+                <small id="speakers-permission-hint" style="color: #f0ad4e; display: none;">
+                  Grant microphone permission once to see device labels.
+                </small>
+              </div>
+            </div>
+
+            <div style="display: flex; gap: 10px; margin-top: 8px;">
+              <button type="button" id="speakers-test-btn" class="btn-small btn-primary">
+                Test capture
+              </button>
+              <span id="speakers-test-status" style="font-size: 0.85em; color: #888; align-self: center;"></span>
+            </div>
+            <small style="color: #666; margin-top: 4px;">
+              "Test capture" opens the same dialog you'll see when starting a session,
+              so you can confirm a tab/screen and the audio checkbox are wired up correctly.
+            </small>
           </div>
           <div class="form-group">
             <label for="mode-select">Latency Mode</label>

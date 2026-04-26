@@ -20,7 +20,7 @@ use tower::ServiceExt;
 
 use burn_server::server::routes;
 use burn_server::server::state::AppState;
-use burn_server::config::{Config, Quantization};
+use burn_server::config::{Config, GpuBackend, Quantization};
 
 /// Build a test app with no model loaded and a temp media dir.
 pub async fn build_test_app() -> Router {
@@ -30,6 +30,7 @@ pub async fn build_test_app() -> Router {
     let config = Config {
         port: 0,
         quant: Quantization::Q4,
+        backend: GpuBackend::Wgpu,
         models_dir: tmp_dir.join("models"),
         frontend: tmp_dir.join("frontend"),
         media_dir: tmp_dir.clone(),

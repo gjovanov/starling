@@ -1,5 +1,6 @@
 pub mod chunk;
 pub mod ffmpeg;
+pub mod inbound;
 pub mod mel;
 pub mod opus;
 pub mod pad;

@@ -98,6 +98,9 @@ class CreateSessionRequest(BaseModel):
     language: str = "de"
     media_id: str | None = None
     srt_channel_id: int | None = None
+    # "media" (default), "srt", or "speakers". When "speakers", no media file
+    # is required — audio is uploaded from the browser via WebRTC.
+    source: str | None = None
     noise_cancellation: str = "none"
     diarization: bool = False
     sentence_completion: str = "minimal"
