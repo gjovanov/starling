@@ -156,9 +156,27 @@ Per-commit cost: 2 batched forwards (~150ms each) + 0-2 sequential fallback step
 2. **Periodic decoder KV reset** (`VOXTRAL_DEC_RESET=300`): bounds decoder attention cost
 3. **Incremental mel + conv caching**: only new audio processed per commit
 
+**Phase profiling (`VOXTRAL_PROFILE_PHASES=1`):** per-commit `[PHASES]` log line with draft/verify/fallback/truncate/reset breakdown. Used to validate optimization hypotheses before implementing them. Findings on Ryzen 9 9955HX3D, 60s broadcast_1.wav:
+- Truncate is **0ms** (uses tensor `narrow()` views, no copy)
+- Reset commits are **fast** (~370ms encode-only), NOT P90 spikes
+- P90 driven 100% by **acceptance rate**: 25% of commits hit acc≤3 → 4-5 sequential fallbacks @ 120ms each
+- Decode time split: draft 39%, verify 39%, fallback 21%
+
+**Things ruled out by profiling (don't re-attempt):**
+- ❌ Ring-buffer KV cache — truncate has no cost to save
+- ❌ Async KV-reset — resets aren't slow
+- ❌ Jacobi/lookahead fallback — measured: same mean, +70ms P90 worse. Hard commits gain only 1 position per Jacobi iter at higher per-iter cost (~180ms batched vs ~120ms sequential). Reverted; comment in `speculative_decode` documents why.
+- ❌ Padding M=6→8 — memory-bandwidth bound, no compute headroom
+- ❌ Pipeline encoder/decoder — encoder is only 24% of mean total
+
+**Streaming vs one-shot CPU**: streaming (1.56× RT) is **2.27× faster** than one-shot `transcribe()` (3.54× RT) on the same audio. KV resets + speculative + incremental encoder beat the monolithic encode (54.7s for 30s audio) and 429-step sequential decode of the one-shot path. There is no "streaming overhead" to claw back.
+
+**Ceiling for this CPU/Q4/streaming stack: ~1.40× RT.** Further wins require architectural changes (Q4_K_M weights, layer culling, hybrid CPU+GPU), not algorithmic batching tricks.
+
 **Environment variables:**
 - `VOXTRAL_SPEC=1` — enable speculative decoding (RECOMMENDED)
 - `VOXTRAL_BATCH=6` — batched (broken quality, only for benchmarking)
+- `VOXTRAL_PROFILE_PHASES=1` — per-commit phase histogram (draft/verify/fallback/truncate/reset)
 - `GGML_THREADS=16` — thread count for ggml matmul (default: 16)
 - `VOXTRAL_ENC_RESET=150` — encoder KV cache reset threshold
 - `VOXTRAL_DEC_RESET=300` — decoder KV cache reset threshold
@@ -185,7 +203,19 @@ cd apps/burn-server
 
 # Start the server (port 8091)
 ./start.sh
+# Server logs are tee'd to /tmp/burn-server.log (override via BURN_LOG_FILE env var).
+# Inspect with: grep -aE "Speakers|CandleNative|Error" /tmp/burn-server.log
 ```
+
+**Sessions stuck in `error` state**: a transient inference-engine failure during
+`POST /api/sessions/:id/start` lands the session in `SessionState::Error` with
+no recovery path. The frontend may show a permanently-grey "Recording" button
+even after the underlying issue clears. Workaround:
+`curl -X DELETE http://localhost:8091/api/sessions/<id>` and create a fresh one.
+See `transcription/session.rs::run_speakers_session` lines 295-302 for the
+two error-entry points (engine `create_session()` failure or `spawn_blocking`
+join error). `SessionInfo` does not currently carry an `error_msg` field —
+the actual failure string is only in the server stdout log.
 
 **For CPU streaming with the frontend:**
 ```bash
@@ -331,5 +361,5 @@ Output contains real words from audio but not yet correct transcription.
 
 ## Related Projects
 - [parakeet-rs](https://github.com/gjovanov/parakeet-rs) — Rust ASR server using ONNX (Parakeet TDT, Canary 1B) and whisper.cpp. Shares frontend and API contract.
-- [voxtral-mini-realtime-rs](https://github.com/TrevorS/voxtral-mini-realtime-rs) — Reference Rust implementation of Voxtral inference with Burn/WebGPU. burn-server is derived from this.
+- [voxtral-mini-realtime-rs](https://github.com/TrevorS/voxtral-mini-realtime-rs) — Reference Rust implementation of Voxtral inference with Burn/WebGPU. burn-server is derived from this. **Note: their reported "Q4 GGUF native 0.416 RTF" is GPU/Vulkan on DGX Spark (GB10), NOT CPU.** "Native" in their vocabulary means non-WASM, not non-GPU. `Cargo.toml` default features `["wgpu", "native-tokenizer"]`, `e2e_bench.rs` hardcodes `type Backend = Wgpu`, `src/gguf/tensor.rs` has no CPU Q4 path. Don't compare CPU candle-cpu numbers to those.
 - [voxtral.c](https://github.com/antirez/voxtral.c) — Pure C implementation by antirez. candle-native engine architecture matches this reference.

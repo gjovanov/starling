@@ -68,4 +68,10 @@ ARGS=(
 [ -n "$TURN_PASSWORD" ] && ARGS+=(--turn-password "$TURN_PASSWORD")
 [ "$FORCE_RELAY" = "true" ] && ARGS+=(--force-relay)
 
-"$BINARY" "${ARGS[@]}"
+# Tee stdout+stderr so failures (esp. inference engine errors and WS handler
+# eprintln output) are captured for post-hoc diagnosis. Foreground stays
+# attached for ctrl-C; the log file is overwritten each run.
+LOG_FILE="${BURN_LOG_FILE:-/tmp/burn-server.log}"
+echo "  Log:      $LOG_FILE"
+echo ""
+exec "$BINARY" "${ARGS[@]}" 2>&1 | tee "$LOG_FILE"

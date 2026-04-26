@@ -354,8 +354,10 @@ impl InferenceSession for CandleCpuSession {
         // vllm does similar periodic resets to bound context.
         let max_kv_before_reset = std::env::var("VOXTRAL_ENC_RESET")
             .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(150);
+        let mut enc_reset_now = false;
         if self.enc_caches[0].seq_len + new_len > max_kv_before_reset {
             self.enc_caches = VoxtralModel::new_encoder_caches();
+            enc_reset_now = true;
         }
 
         let t_enc_layers = Instant::now();
@@ -462,6 +464,7 @@ impl InferenceSession for CandleCpuSession {
             .ok().and_then(|v| v.parse().ok()).unwrap_or(39);
         let eos_token = 2u32;
         let mut new_text_tokens = Vec::new();
+        let mut spec_phases: Option<SpecPhases> = None;
 
         // Periodic decoder KV cache reset (like vllm).
         // Decoder attention scales linearly with kv_seq. On CPU, 800+ positions
@@ -470,10 +473,12 @@ impl InferenceSession for CandleCpuSession {
         // CPU can't afford to keep it full).
         let max_dec_kv_before_reset = std::env::var("VOXTRAL_DEC_RESET")
             .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(300);
+        let mut dec_reset_now = false;
         if self.decoder_started && self.dec_caches[0].seq_len > max_dec_kv_before_reset {
             self.dec_caches = VoxtralModel::new_decoder_caches();
             self.decoder_started = false; // will re-prefill with current prefix
             self.prev_token = 0;
+            dec_reset_now = true;
         }
 
         if !self.decoder_started && self.total_adapter_tokens + new_adapter_tokens >= prompt_len {
@@ -533,11 +538,11 @@ impl InferenceSession for CandleCpuSession {
                 if remaining > 0 {
                     let audio_chunk = adapter_embeds.narrow(1, decode_start, remaining)
                         .map_err(|e| format!("narrow: {}", e))?;
-                    speculative_decode(
+                    spec_phases = Some(speculative_decode(
                         &model, &audio_chunk, &mut self.dec_caches, &self.ada_scales,
                         &mut self.prev_token, &mut self.generated_tokens, &mut new_text_tokens,
                         eos_token, remaining,
-                    )?;
+                    )?);
                 }
             } else if batch_mode {
                 // BATCHED: one forward pass for all tokens (all positions share prev_token).
@@ -601,11 +606,11 @@ impl InferenceSession for CandleCpuSession {
             if spec_mode && new_adapter_tokens > 0 {
                 let audio_chunk = adapter_embeds.narrow(1, 0, new_adapter_tokens)
                     .map_err(|e| format!("narrow: {}", e))?;
-                speculative_decode(
+                spec_phases = Some(speculative_decode(
                     &model, &audio_chunk, &mut self.dec_caches, &self.ada_scales,
                     &mut self.prev_token, &mut self.generated_tokens, &mut new_text_tokens,
                     eos_token, new_adapter_tokens,
-                )?;
+                )?);
             } else if batch_mode {
                 // BATCHED decode (same approach for steady-state)
                 let audio_chunk = adapter_embeds.narrow(1, 0, new_adapter_tokens)
@@ -699,6 +704,23 @@ impl InferenceSession for CandleCpuSession {
             );
         }
 
+        // Per-phase profiling: CSV-friendly line for histogram analysis.
+        // Columns: commit, total, enc, dec, n, accepted, fb_steps,
+        //          draft, trunc1, verify, trunc2, fallback, enc_reset, dec_reset
+        let phase_profile: bool = std::env::var("VOXTRAL_PROFILE_PHASES")
+            .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0) > 0;
+        if phase_profile {
+            let p = spec_phases.unwrap_or_default();
+            eprintln!(
+                "[PHASES] #{} total={:.1} enc={:.1} dec={:.1} n={} acc={} jac={} fb={} draft={:.1} trunc1={:.1} verify={:.1} trunc2={:.1} fallback={:.1} enc_reset={} dec_reset={}",
+                self.commit_count, infer_ms, enc_ms, dec_ms,
+                p.n, p.accepted, p.jacobi_iters, p.fallback_steps,
+                p.draft_ms, p.truncate1_ms, p.verify_ms, p.truncate2_ms, p.fallback_ms,
+                if enc_reset_now { 1 } else { 0 },
+                if dec_reset_now { 1 } else { 0 },
+            );
+        }
+
         Ok(delta)
     }
 
@@ -726,6 +748,21 @@ impl InferenceSession for CandleCpuSession {
     fn commit_count(&self) -> usize {
         self.commit_count
     }
+}
+
+/// Per-phase timings for one speculative_decode() call.
+/// Populated unconditionally; only printed when VOXTRAL_PROFILE_PHASES=1.
+#[derive(Default, Clone, Copy)]
+pub struct SpecPhases {
+    pub n: usize,              // requested batch size
+    pub accepted: usize,       // tokens accepted from draft+verify (incl. 1 mismatch correction)
+    pub fallback_steps: usize, // sequential fallback steps actually run (after Jacobi cap)
+    pub jacobi_iters: usize,   // Jacobi/lookahead iterations executed
+    pub draft_ms: f32,         // DRAFT forward + lm_head + argmax loop
+    pub truncate1_ms: f32,     // post-draft KV cache rollback
+    pub verify_ms: f32,        // VERIFY forward + lm_head + argmax loop
+    pub truncate2_ms: f32,     // post-verify KV cache trim to accepted
+    pub fallback_ms: f32,      // total fallback (Jacobi + sequential) ms
 }
 
 /// Speculative decoding for the streaming engine: 2 batched forward passes
@@ -758,7 +795,9 @@ fn speculative_decode(
     new_text_tokens: &mut Vec<u32>,
     eos_token: u32,
     n: usize,
-) -> Result<(), String> {
+) -> Result<SpecPhases, String> {
+    let mut phases = SpecPhases::default();
+    phases.n = n;
     let argmax_at = |logits: &Tensor, pos: usize| -> Result<u32, String> {
         let pos_logits = logits.narrow(1, pos, 1).map_err(|e| format!("narrow: {}", e))?;
         let v: Vec<f32> = pos_logits
@@ -775,6 +814,7 @@ fn speculative_decode(
     let kv_seq_before = dec_caches[0].seq_len;
 
     // ── DRAFT pass ───────────────────────────────────────────────────────
+    let t_draft = Instant::now();
     let text_embed_prev = model.embed_token(*prev_token).map_err(|e| format!("embed: {}", e))?;
     let x_draft = audio_chunk.broadcast_add(&text_embed_prev).map_err(|e| format!("add: {}", e))?;
     let h_draft = model.decoder_forward(x_draft, ada_scales, dec_caches)
@@ -784,14 +824,18 @@ fn speculative_decode(
     for pos in 0..n {
         drafts.push(argmax_at(&logits_draft, pos)?);
     }
+    phases.draft_ms = t_draft.elapsed().as_secs_f32() * 1000.0;
 
     // ── TRUNCATE: roll back the wrong KV entries ───────────────────────────
+    let t_trunc1 = Instant::now();
     for cache in dec_caches.iter_mut() {
         cache.truncate_to(kv_seq_before).map_err(|e| format!("truncate: {}", e))?;
     }
+    phases.truncate1_ms = t_trunc1.elapsed().as_secs_f32() * 1000.0;
 
     // ── VERIFY pass ───────────────────────────────────────────────────────
     // text_ids = [prev_token, drafts[0], drafts[1], ..., drafts[n-2]]
+    let t_verify = Instant::now();
     let mut text_ids = Vec::with_capacity(n);
     text_ids.push(*prev_token);
     for d in &drafts[..n - 1] {
@@ -806,6 +850,7 @@ fn speculative_decode(
     for pos in 0..n {
         verifies.push(argmax_at(&logits_verify, pos)?);
     }
+    phases.verify_ms = t_verify.elapsed().as_secs_f32() * 1000.0;
 
     // ── ACCEPT ────────────────────────────────────────────────────────────
     // Position 0: always accept verifies[0] (same prev_token as draft, must match)
@@ -831,9 +876,12 @@ fn speculative_decode(
     }
 
     // Truncate KV cache to keep only entries for accepted positions
+    let t_trunc2 = Instant::now();
     for cache in dec_caches.iter_mut() {
         cache.truncate_to(kv_seq_before + accepted).map_err(|e| format!("truncate2: {}", e))?;
     }
+    phases.truncate2_ms = t_trunc2.elapsed().as_secs_f32() * 1000.0;
+    phases.accepted = accepted;
 
     // Emit accepted tokens
     let mut last = *prev_token;
@@ -843,13 +891,21 @@ fn speculative_decode(
         last = t;
         if t == eos_token {
             *prev_token = last;
-            return Ok(());
+            return Ok(phases);
         }
     }
     *prev_token = last;
 
     // ── SEQUENTIAL FALLBACK ────────────────────────────────────────────────
-    // For positions accepted..n: do real sequential decode (one fwd per token)
+    // For rejected positions, do per-token sequential decode. Tried Jacobi /
+    // lookahead (batched re-verify) here — empirically a wash because hard
+    // commits (acc≤3, ~25% of traffic) gain only 1 position per Jacobi iter
+    // at higher per-iter cost (~180ms) than a sequential step (~120ms). See
+    // measurement run with MAX_JACOBI=3: P50 +13ms, P90 +70ms, mean unchanged.
+    // The autoregressive dependency on prev_token is the bottleneck; iterating
+    // the lie does not recover information that isn't in the audio.
+    let t_fallback = Instant::now();
+    let mut fallback_steps = 0usize;
     for j in accepted..n {
         let audio_pos = audio_chunk.narrow(1, j, 1).map_err(|e| format!("narrow seq: {}", e))?;
         let text_e = model.embed_token(*prev_token).map_err(|e| format!("embed seq: {}", e))?;
@@ -859,9 +915,12 @@ fn speculative_decode(
         let token = model.lm_head_argmax(&hidden).map_err(|e| format!("seq lm: {}", e))?;
         generated_tokens.push(token);
         *prev_token = token;
+        fallback_steps += 1;
         if token >= 1000 { new_text_tokens.push(token); }
         if token == eos_token { break; }
     }
+    phases.fallback_ms = t_fallback.elapsed().as_secs_f32() * 1000.0;
+    phases.fallback_steps = fallback_steps;
 
-    Ok(())
+    Ok(phases)
 }
