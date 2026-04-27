@@ -45,8 +45,14 @@ const TARGET_BUFFER_AHEAD_SECS = 0.3;   // before flipping to "playing"
 const STARVE_THRESHOLD_SECS = 0.05;     // schedule head this close to now → buffering
 
 export class TtsPlayer extends EventTarget {
-  constructor({ onStateChange } = {}) {
+  constructor({ onStateChange, playbackRate = 1.0 } = {}) {
     super();
+    /**
+     * Playback-rate multiplier. 1.0 = natural; >1 = faster (also slightly
+     * higher pitch — Web Audio doesn't pitch-correct). 0.9–1.25 sounds
+     * natural; outside that range the pitch shift is noticeable.
+     */
+    this._playbackRate = Math.max(0.5, Math.min(2.0, Number(playbackRate) || 1.0));
     /** @type {AudioContext|null} */
     this._ctx = null;
     this._reader = null;
@@ -264,27 +270,39 @@ export class TtsPlayer extends EventTarget {
       }
     }
 
-    // Schedule back-to-back. If we've fallen behind real-time, skip ahead
-    // and flag a starve.
+    // Decide where this source starts. Two cases:
+    //   1. _nextStartAt is already in the future → schedule there (perfect
+    //      back-to-back continuation).
+    //   2. _nextStartAt has fallen behind ctx.currentTime → start at NOW.
+    //      Critically, we use `src.start(now)` not `src.start(<past time>)`
+    //      because Web Audio interprets a past-time `when` by SKIPPING
+    //      INTO the buffer by (now - when). That sliced off the first
+    //      samples of every sentence in long-form mode → "fade-in" effect.
+    //      With max(now, ...) the boundary is a brief silence gap rather
+    //      than mangled audio, which is far less perceptible.
     const now = ctx.currentTime;
-    if (this._nextStartAt < now + STARVE_THRESHOLD_SECS) {
-      this._nextStartAt = now + STARVE_THRESHOLD_SECS;
+    const startAt = Math.max(now, this._nextStartAt);
+    if (startAt > this._nextStartAt + 0.001) {
+      // We had to skip forward — flag as buffering so the UI shows the
+      // gap accurately. (The schedule itself is still correct.)
       this._setState(STATES.BUFFERING);
     }
 
     const src = ctx.createBufferSource();
     src.buffer = buffer;
+    src.playbackRate.value = this._playbackRate;
     src.connect(ctx.destination);
     src.onended = () => {
       this._liveSources.delete(src);
       try { src.disconnect(); } catch (_) { /* ignore */ }
     };
-    src.start(this._nextStartAt);
+    src.start(startAt);
     this._liveSources.add(src);
 
-    if (this._playStartAt === undefined) this._playStartAt = this._nextStartAt;
+    if (this._playStartAt === undefined) this._playStartAt = startAt;
 
-    this._nextStartAt += buffer.duration;
+    // Buffer's *played* duration shrinks/expands by playbackRate.
+    this._nextStartAt = startAt + (buffer.duration / this._playbackRate);
 
     // Once we've buffered enough ahead, switch out of "buffering" into
     // "playing". For very short syntheses we may never accumulate
@@ -292,6 +310,17 @@ export class TtsPlayer extends EventTarget {
     const ahead = this._nextStartAt - now;
     if (this._state === STATES.BUFFERING && ahead >= 0) {
       this._setState(STATES.PLAYING);
+    }
+  }
+
+  /** Adjust playback speed mid-stream. Affects future chunks only. */
+  setPlaybackRate(rate) {
+    const next = Math.max(0.5, Math.min(2.0, Number(rate) || 1.0));
+    this._playbackRate = next;
+    // Apply to any source that hasn't ended yet so the change is audible
+    // immediately rather than waiting for the next chunk.
+    for (const src of this._liveSources) {
+      try { src.playbackRate.value = next; } catch (_) { /* ignore */ }
     }
   }
 

@@ -756,6 +756,7 @@ async function setupTtsTab() {
     charCount:   document.getElementById('tts-char-count'),
     charMax:     document.getElementById('tts-char-max'),
     voice:       document.getElementById('tts-voice'),
+    speed:       document.getElementById('tts-speed'),
     modeRadios:  document.querySelectorAll('input[name="tts-output-mode"]'),
     filenameGrp: document.getElementById('tts-filename-group'),
     filename:    document.getElementById('tts-filename'),
@@ -809,6 +810,12 @@ async function setupTtsTab() {
     setStreamingButtons(els, 'idle');
     els.status.textContent = 'Stopped.';
     els.status.style.color = '#a0a0a0';
+  });
+  // Speed change applies live — the player ramps the rate on every
+  // already-scheduled source so the listener hears it immediately.
+  els.speed?.addEventListener('change', () => {
+    const rate = parseFloat(els.speed.value) || 1.0;
+    ttsState.player?.setPlaybackRate(rate);
   });
 
   // Saved-files list (populated on first render + after each save)
@@ -1038,7 +1045,9 @@ async function generateTts(els) {
       els.audio.hidden = true;          // <audio> is unused in stream mode
       ttsState.player?.cancel();        // tear down any previous player
 
+      const playbackRate = parseFloat(els.speed?.value) || 1.0;
       const player = new TtsPlayer({
+        playbackRate,
         onStateChange: ({ state, currentTimeSecs, bufferedSecs }) => {
           setStreamingButtons(els, state);
           if (state === 'buffering') {
