@@ -765,6 +765,7 @@ async function setupTtsTab() {
     pause:       document.getElementById('tts-pause-btn'),
     resume:      document.getElementById('tts-resume-btn'),
     stop:        document.getElementById('tts-stop-btn'),
+    liveDot:     document.getElementById('tts-live-dot'),
     status:      document.getElementById('tts-status'),
     audio:       document.getElementById('tts-audio'),
     savedGroup:  document.getElementById('tts-saved-files-group'),
@@ -990,6 +991,10 @@ function setStreamingButtons(els, state) {
   els.pause.hidden = state !== 'playing';
   els.resume.hidden = state !== 'paused';
   els.stop.hidden = state === 'idle' || state === 'ended';
+  // Live dot is visible whenever audio is actively streaming or playing.
+  if (els.liveDot) {
+    els.liveDot.hidden = !(state === 'buffering' || state === 'playing');
+  }
 }
 
 async function generateTts(els) {

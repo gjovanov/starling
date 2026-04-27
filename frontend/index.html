@@ -771,8 +771,14 @@
             <button id="tts-pause-btn" class="action-btn small" hidden>Pause</button>
             <button id="tts-resume-btn" class="action-btn small" hidden>Resume</button>
             <button id="tts-stop-btn" class="action-btn small danger" hidden>Stop</button>
+            <span id="tts-live-dot" hidden
+                  style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#dc4040;animation:tts-pulse 1.2s ease-in-out infinite;"
+                  aria-label="streaming"></span>
             <span id="tts-status" style="color:#a0a0a0;font-size:0.9em;"></span>
           </div>
+          <style>
+            @keyframes tts-pulse { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
+          </style>
 
           <div class="form-group">
             <!-- Used only for save-mode playback (Phase 1) and as a visible

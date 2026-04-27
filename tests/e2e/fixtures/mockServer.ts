@@ -389,8 +389,10 @@ export async function startMockServer(
 
         // Streaming branch — chunked audio/wav with 0xFFFFFFFF placeholder
         // sizes, matching the real server's behaviour. We emit the header,
-        // then 3 small PCM chunks with a 25ms gap between them so the
-        // client-side player exercises buffer scheduling.
+        // then several small PCM chunks. Some chunks are intentionally
+        // sized to ODD byte counts so we exercise the player's
+        // mid-sample-boundary carry — this is the bug class that was
+        // producing crackling/distant audio in production.
         if (body.save === false) {
           res.writeHead(200, {
             'Content-Type': 'audio/wav',
@@ -398,12 +400,13 @@ export async function startMockServer(
             'Transfer-Encoding': 'chunked',
           });
           res.write(streamingWavHeader());
-          // 3 chunks × ~0.1 s of silence each (24 kHz mono) = 0.3 s total.
-          // Emit them with small gaps so the player sees real chunked I/O.
-          const chunk = silentPcm(2400);
+          // 6 chunks totalling ~0.6 s of silence. Sizes: 4799, 4801, 4800,
+          // 4799, 4801, 4800 — alternating odd/even on purpose. The
+          // player's _enqueuePcmBytes must carry the odd byte across.
+          const sizes = [4799, 4801, 4800, 4799, 4801, 4800];
           (async () => {
-            for (let i = 0; i < 3; i++) {
-              res.write(chunk);
+            for (const n of sizes) {
+              res.write(Buffer.alloc(n));
               await new Promise(r => setTimeout(r, 25));
             }
             res.end();

@@ -50,8 +50,17 @@ export class TtsPlayer extends EventTarget {
     /** @type {AudioContext|null} */
     this._ctx = null;
     this._reader = null;
-    /** Bytes still to be parsed (header + leftover PCM that didn't align to a frame) */
+    /** Bytes still to be parsed for the WAV header (44 bytes). */
     this._tail = new Uint8Array(0);
+    /**
+     * Trailing bytes that didn't form a whole audio frame on their own.
+     * Carried forward to the next chunk's prefix so every byte ends up at
+     * the correct (LE int16) position. Without this carry, an odd-byte
+     * chunk on the wire — which happens whenever the network/HTTP layer
+     * splits a packet mid-sample — shifts the entire downstream stream by
+     * one byte and decodes as crackling noise.
+     */
+    this._pcmTail = new Uint8Array(0);
     /** When the next AudioBufferSourceNode should start (in ctx.currentTime). */
     this._nextStartAt = 0;
     /** Sources scheduled but not yet ended. We disconnect+null them on stop. */
@@ -133,10 +142,11 @@ export class TtsPlayer extends EventTarget {
       this._bps = fmt.bps;
       this._tail = this._tail.slice(HEADER_BYTES);
 
-      // Body pump: schedule each chunk. We accept any leftover bytes from
-      // the header read as the first PCM payload.
+      // Body pump: feed bytes through the frame-aligning helper. Any
+      // leftover bytes from the header read are the start of the PCM
+      // payload.
       if (this._tail.length > 0) {
-        this._scheduleChunk(this._tail);
+        this._enqueuePcmBytes(this._tail);
         this._tail = new Uint8Array(0);
       }
 
@@ -144,7 +154,15 @@ export class TtsPlayer extends EventTarget {
         if (this._cancelled) break;
         const { value, done } = await this._reader.read();
         if (done) break;
-        if (value && value.length) this._scheduleChunk(value);
+        if (value && value.length) this._enqueuePcmBytes(value);
+      }
+
+      // Flush whole frames left in the tail (drop any partial frame at EOF).
+      const blockAlign = 2 * this._channels;
+      if (this._pcmTail.length >= blockAlign) {
+        const aligned = Math.floor(this._pcmTail.length / blockAlign) * blockAlign;
+        this._scheduleChunk(this._pcmTail.slice(0, aligned));
+        this._pcmTail = new Uint8Array(0);
       }
 
       // Wait for the last scheduled source to finish, then transition to ended.
@@ -187,6 +205,7 @@ export class TtsPlayer extends EventTarget {
       this._reader = null;
     }
     this._tearDownSources();
+    this._pcmTail = new Uint8Array(0);
     if (this._ctx) {
       this._ctx.close().catch(() => { /* ignore */ });
       this._ctx = null;
@@ -203,6 +222,27 @@ export class TtsPlayer extends EventTarget {
     const detail = this.getState();
     try { this._onStateChange?.(detail); } catch (_) { /* ignore */ }
     this.dispatchEvent(new CustomEvent('tts:state', { detail }));
+  }
+
+  /**
+   * Append fresh bytes to the PCM tail buffer, then schedule as many whole
+   * audio frames as the combined buffer permits. The trailing odd-byte
+   * remainder (if any) is carried forward so the next chunk's first byte
+   * lands at the correct (LE) position within an int16 sample.
+   *
+   * Without this carry, an odd-byte network split shifts every subsequent
+   * sample by 1 byte and decodes as crackling noise (which compounds the
+   * longer the stream runs — exactly the "distant / crunching" symptom).
+   */
+  _enqueuePcmBytes(bytes) {
+    if (!bytes || !bytes.length) return;
+    const combined = _concat(this._pcmTail, bytes);
+    const blockAlign = 2 * this._channels;     // bytes per audio frame
+    const aligned = Math.floor(combined.length / blockAlign) * blockAlign;
+    if (aligned > 0) {
+      this._scheduleChunk(combined.subarray(0, aligned));
+    }
+    this._pcmTail = combined.subarray(aligned);
   }
 
   _scheduleChunk(byteArray) {
