@@ -118,8 +118,8 @@ The TTS tab in the web UI talks to a small REST surface that proxies to vllm-omn
 
 ### Streaming play vs save-to-disk
 
-- **Play in browser (`save=false`)** — the server proxies upstream PCM, prepends a streaming WAV header (`0xFFFFFFFF` size placeholders), returns chunked `audio/wav`. The browser-side `TtsPlayer` (Web Audio API) starts playback on the first chunk (TTFB ≈ 50 ms in tests) and schedules `AudioBufferSourceNode`s back-to-back for sample-accurate stitching. Pause / Resume / Stop buttons control the AudioContext.
-- **Save to server (`save=true`)** — the server fully synthesises, wraps in a real (non-streaming) WAV with proper sizes, writes to `VOXTRAL_TTS_OUTPUT_DIR/<filename>`. Filename is sanitised against path-traversal (`[A-Za-z0-9._-]{1,128}` + `.wav` suffix); auto-generated when omitted (`tts_<voice>_<utc-timestamp>.wav`).
+- **Play in browser (`save=false`)** — the server proxies upstream PCM, prepends a streaming WAV header (`0xFFFFFFFF` size placeholders), returns chunked `audio/wav`. The browser-side `TtsPlayer` (Web Audio API) starts playback on the first chunk (TTFB ≈ 50 ms in tests) and schedules `AudioBufferSourceNode`s for sample-accurate stitching. Pause / Resume / Stop buttons + a pulsing live-dot indicator. Speed control (0.85× – 1.5×) via `playbackRate`. The player also runs **per-block loudness normalisation** because Voxtral itself emits long sentences at much lower amplitude than short ones (~30 dB delta in measurements). See `docs/tts_spike.md` Phase 8 for the full audio-quality pipeline (byte-alignment carry, no-skip scheduling, ~500 ms chunk aggregation, normaliser, soft-clip).
+- **Save to server (`save=true`)** — the server fully synthesises, wraps in a real (non-streaming) WAV with proper sizes, writes to `VOXTRAL_TTS_OUTPUT_DIR/<filename>`. Filename is sanitised against path-traversal (`[A-Za-z0-9._-]{1,128}` + `.wav` suffix); auto-generated when omitted (`tts_<voice>_<utc-timestamp>.wav`). Save-mode does NOT run the client-side normaliser; if you want a level-matched WAV for export, do save-mode + post-process with `ffmpeg -af loudnorm` or similar.
 
 ### Long-form
 

@@ -1014,3 +1014,162 @@ Final test counts after Phase 7:
   numbers were CustomVoice-only.
 - Audit log is local-filesystem-only; for multi-tenant deployments
   this should land in a centralized logger. Not required for v1.
+
+## Phase 8 — audio quality fixes (post-launch follow-ups)
+
+After the original Phase 1–7 rollout, four audio-quality issues surfaced
+during real-world streaming-mode playback. All of them are in the
+**frontend player**, not on the server. The fixes are layered through
+`frontend/js/modules/tts-player.js`.
+
+### 1. Byte-alignment carry across chunks
+
+**Symptom:** Audio progressively turns into crackling noise after
+running for a while; gets quieter ("more distant") over time.
+
+**Root cause:** `fetch().body.getReader()` yields chunks at whatever
+boundaries the network gave us. TCP/HTTP-2 do not respect 16-bit sample
+boundaries. When a chunk landed with an odd byte count the previous
+code did `Math.floor(n/2)` and silently dropped the trailing byte. The
+next chunk's first byte then paired with what should have been the
+*second* byte of the next sample, shifting every subsequent LE int16
+by 1 byte → samples decode as random noise; misalignment compounds the
+longer the stream runs.
+
+**Fix:** maintain a `_pcmTail` byte buffer between chunks. The new
+`_enqueuePcmBytes` helper concatenates the previous tail with new
+bytes, schedules only whole audio frames (multiples of 2 bytes for
+mono s16), and carries the leftover odd byte forward.
+
+### 2. No-skip at past-time scheduling
+
+**Symptom:** Audio fades in at the start of every sentence after the
+first; effect compounds across long-form streams.
+
+**Root cause:** When chunks paused briefly between sentences (the gap
+while `synthesize_stream_concat` opens the next per-sentence upstream
+connection), `_nextStartAt` fell behind `ctx.currentTime`. The previous
+code bumped it forward to `now + 50 ms` and called
+`src.start(<that future time>)` — but for the FIRST chunk of the new
+sentence the schedule wasn't actually behind, so subsequent calls
+became `src.start(<past time>)`. Web Audio interprets a past-time
+`when` by **skipping into the buffer** by `(now - when)`. Result: the
+first samples of every sentence after the first got sliced off → the
+listener heard each sentence "fading in" from its midpoint.
+
+**Fix:** clamp the start time to `max(now, _nextStartAt)`. We never
+call `src.start` with a past-time `when` again. When the schedule has
+fallen behind we accept a brief silence gap (which is far less
+perceptible than chopped-off sample heads).
+
+### 3. Chunk aggregation (~500 ms blocks)
+
+**Symptom:** Within a single long sentence (no upstream connection
+breaks, just one continuous stream), the audio still has a periodic
+"breathing" / fade-in-fade-out feel.
+
+**Root cause:** Each upstream chunk is ~400 ms of audio. A 50-second
+sentence becomes ~125 separate `AudioBufferSourceNode`s. Web Audio's
+resampler (24 kHz buffer in a 48 kHz output context) initialises fresh
+state for every source, producing a small amplitude transient at each
+boundary. At ~2.5 Hz, the stack of these transients sounds like a
+sub-bass amplitude tremolo.
+
+**Fix:** aggregate incoming chunks into ~`AGGREGATE_TARGET_SECS` (0.5 s)
+blocks before scheduling. The first chunk still fires immediately so
+TTFB stays low; subsequent chunks are concatenated into one
+Float32Array per block. ~5× fewer source boundaries → tremolo drops
+below the audible AM threshold.
+
+### 4. Per-block loudness normalisation
+
+**Symptom:** Long sentences sound dramatically quieter than short ones,
+even when they're consecutive in the same stream.
+
+**Root cause:** *Voxtral itself* auto-normalises per-sentence — it
+appears to spread "speech-act energy" across the duration. Direct
+measurement against the upstream:
+
+| Sentence       | chars | RMS  | dBFS    |
+|----------------|------:|-----:|--------:|
+| short          | 53    | 0.264 | **−11.6** |
+| short          | 109   | 0.106 | −19.5    |
+| medium         | 112   | 0.021 | −33.4    |
+| medium         | 158   | 0.012 | −38.2    |
+| long           | 335   | 0.008 | **−42.3** |
+
+That's a 32× amplitude ratio — a long sentence is near-silent compared
+to a short one. The bytes are quiet at the source; nothing the
+streaming pump can do about it.
+
+**Fix:** per-aggregated-block loudness normaliser inside
+`_normalizeAndScheduleSamples`. For each ~0.5 s block:
+
+  1. Measure mean-square → RMS.
+  2. Compute target gain = `clamp(LOUDNESS_TARGET_RMS / RMS, ≤ 8×)`.
+  3. Exponentially smooth toward the target (45% on the new value,
+     55% on the previous) so block-to-block gain changes don't pump.
+  4. Skip the gain update when block RMS is below
+     `LOUDNESS_SILENCE_RMS` (otherwise we'd boost the noise floor
+     during natural pauses).
+  5. Apply the smoothed gain in-place, soft-clipping any boosted peak
+     that would otherwise overshoot ±1.0. The soft-clip is a piecewise
+     linear-then-tanh curve so any limiting rolls off smoothly rather
+     than producing a square-wave click.
+
+Verified offline (running the JS algorithm in Python against the same
+upstream output): per-sentence RMS lifted from −34…−41 dBFS into
+−17…−24 dBFS — long sentences ~17 dB louder while short ones stay
+where they were.
+
+Tunable constants at the top of `tts-player.js`:
+`LOUDNESS_TARGET_RMS` (default 0.12 ≈ −18 dBFS),
+`LOUDNESS_MAX_GAIN` (8×, ≈ +18 dB),
+`LOUDNESS_SMOOTH` (0.45 — higher = faster response, more pumping),
+`LOUDNESS_SILENCE_RMS` (0.003 — silence gate),
+`SOFT_CLIP_THRESHOLD` (0.97).
+
+### 5. Client-side speed control
+
+The OpenAI `/v1/audio/speech` `speed` parameter is supported by
+vllm-omni, but only when `stream=false`. To keep streaming benefits we
+do speed client-side via `AudioBufferSourceNode.playbackRate`. UI
+control: `<select id="tts-speed">` with steps from 0.85× to 1.5×.
+`TtsPlayer.setPlaybackRate(rate)` propagates to all live sources so the
+change is heard immediately rather than waiting for the next chunk.
+
+Tradeoff: pitch shifts at the extremes (Web Audio doesn't pitch-correct).
+0.95–1.2× sounds natural; the form-hint text says so. For
+pitch-preserving speed-up, use save-mode + the upstream `speed`
+parameter — left as a follow-up.
+
+### Phase-8 deliverables
+
+- `frontend/js/modules/tts-player.js` —
+  `_enqueuePcmBytes` (byte-alignment carry),
+  past-time `start` clamp, `_aggFragments` aggregator,
+  `_normalizeAndScheduleSamples` (loudness), `_applyGainSoftClip`,
+  `_decodeMonoInt16` / `_decodeMultichannelInt16` helpers,
+  `playbackRate` constructor option + `setPlaybackRate()` setter,
+  pulsing `tts-live-dot` state.
+- `frontend/index.html` — Pause/Resume/Stop buttons, Speed select,
+  pulsing live-dot.
+- `frontend/js/main-sessions.js` — speed-select wiring,
+  `setStreamingButtons` toggles the live dot.
+- `tests/e2e/fixtures/mockServer.ts` — chunked stub now emits
+  intentionally odd-byte sizes (`4799 / 4801 / 4800 …`) so the
+  alignment carry is exercised by every play-mode Playwright test.
+
+### What we did NOT do (open follow-ups)
+
+- True pitch-preserving speed-up (would need an AudioWorklet with a
+  WSOLA / phase-vocoder implementation, or save-mode + upstream
+  `speed` and lose streaming).
+- Per-sentence-aware (rather than per-block) loudness normalisation.
+  Would let us look up sentence-level RMS server-side and pre-bake the
+  gain into the upstream PCM. Server-side is more accurate but loses
+  some streaming benefit.
+- Replace the per-source schedule chain with a single AudioWorklet
+  ring-buffer. Eliminates ALL source boundaries (not just reduces
+  them), but is significantly more code. Revisit if the chunk-
+  aggregation fix proves insufficient for some content.
