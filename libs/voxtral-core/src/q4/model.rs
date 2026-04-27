@@ -7,7 +7,16 @@
 
 use burn::backend::wgpu::WgpuDevice;
 use burn::prelude::ElementConversion;
-use burn::tensor::activation::{gelu, silu, softmax};
+use burn::tensor::activation::{gelu, silu};
+// gpu_softmax (matmul-based, DZN-safe + clamp [-100, 80]) is the only working
+// path on Burn/wgpu Q4. Counter-intuitive but verified 2026-04-26:
+//   * burn::tensor::activation::softmax → English-biased garbage (DZN reductions)
+//   * cpu_softmax (max-shifted CPU) → English-biased garbage too
+//   * gpu_softmax (no max-shift, clamp only) → German emerges late in transcription
+// The clamp's softening of attention scores compensates for a residual numerical
+// bias elsewhere in the Q4 path (suspected: Q4 attention scores have outlier
+// values from quantization noise that proper softmax over-amplifies).
+use crate::layers::attention::gpu_softmax;
 use burn::tensor::{Int, Tensor, TensorData};
 
 use crate::layers::conv::ConvDownsampler;
@@ -139,7 +148,7 @@ impl Q4Attention {
             scores
         };
 
-        let attn = softmax(scores, 3);
+        let attn = gpu_softmax(scores);
         let out = attn.matmul(v);
 
         let out = out.swap_dims(1, 2);
@@ -191,7 +200,7 @@ impl Q4Attention {
             scores
         };
 
-        let attn = softmax(scores, 3);
+        let attn = gpu_softmax(scores);
         let out = attn.matmul(v);
 
         let out = out.swap_dims(1, 2);
@@ -735,12 +744,67 @@ impl Q4LanguageModel {
         t_embed: Tensor<WgpuBackend, 3>,
         caches: &mut LayerCaches<WgpuBackend>,
     ) -> Tensor<WgpuBackend, 3> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let diag = std::env::var("DIAG_LAYERS").is_ok();
+        #[cfg(target_arch = "wasm32")]
+        let diag = false;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if diag {
+            // Dump input (post-embedding) hidden state stats for the last position
+            let [_, seq, dim] = x.dims();
+            let last = x.clone().slice([0..1, (seq - 1)..seq, 0..dim]).reshape([dim]);
+            let data = last.into_data();
+            let vals: Vec<f32> = data.to_vec().unwrap_or_default();
+            let norm: f32 = vals.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let mn: f32 = vals.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+            let mx: f32 = vals.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let first4: Vec<String> = vals.iter().take(4).map(|v| format!("{:+.4}", v)).collect();
+            let cache_seq = caches.seq_len();
+            eprintln!(
+                "[DIAG Q4 INPUT cache_seq={cache_seq}] L2={norm:.4} min={mn:+.4} max={mx:+.4} first4=[{}]",
+                first4.join(", ")
+            );
+        }
+
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(cache) = caches.get_mut(i) {
                 x = layer.forward_with_cache(x, t_embed.clone(), &self.rope, cache);
+
+                #[cfg(not(target_arch = "wasm32"))]
+                if diag {
+                    let [_, seq, dim] = x.dims();
+                    let last = x.clone().slice([0..1, (seq - 1)..seq, 0..dim]).reshape([dim]);
+                    let data = last.into_data();
+                    let vals: Vec<f32> = data.to_vec().unwrap_or_default();
+                    let norm: f32 = vals.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    let mn: f32 = vals.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+                    let mx: f32 = vals.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    let nan_count = vals.iter().filter(|v| v.is_nan()).count();
+                    let inf_count = vals.iter().filter(|v| v.is_infinite()).count();
+                    let first4: Vec<String> = vals.iter().take(4).map(|v| format!("{:+.4}", v)).collect();
+                    let nan_inf = if nan_count > 0 || inf_count > 0 {
+                        format!(" NaN={nan_count} Inf={inf_count}")
+                    } else { String::new() };
+                    eprintln!(
+                        "[DIAG Q4 layer {i:02}] L2={norm:.4} min={mn:+.4} max={mx:+.4} first4=[{}]{nan_inf}",
+                        first4.join(", ")
+                    );
+                }
             }
         }
-        self.norm.forward(x)
+        let out = self.norm.forward(x);
+        #[cfg(not(target_arch = "wasm32"))]
+        if diag {
+            let [_, seq, dim] = out.dims();
+            let last = out.clone().slice([0..1, (seq - 1)..seq, 0..dim]).reshape([dim]);
+            let data = last.into_data();
+            let vals: Vec<f32> = data.to_vec().unwrap_or_default();
+            let norm: f32 = vals.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let first4: Vec<String> = vals.iter().take(4).map(|v| format!("{:+.4}", v)).collect();
+            eprintln!("[DIAG Q4 FINAL_NORM] L2={norm:.4} first4=[{}]\n", first4.join(", "));
+        }
+        out
     }
 
     /// Compute logits from hidden states (LM head with tied embeddings).

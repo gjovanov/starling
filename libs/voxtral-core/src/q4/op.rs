@@ -31,16 +31,20 @@ use super::tensor::Q4Tensor;
 use super::WgpuBackend;
 
 /// M threshold: use tiled kernel when M <= this, naive kernel otherwise.
+#[cfg(not(target_family = "wasm"))]
 const TILED_M_THRESHOLD: usize = 4;
 
 // -- Tiled kernel (shared memory, good for M=1 decode) --
 
+#[cfg(not(target_family = "wasm"))]
 const TILED_WG_X: u32 = 128;
 
+#[cfg(not(target_family = "wasm"))]
 struct Q4MatmulTiledKernel {
     workgroup_size_x: u32,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl KernelSource for Q4MatmulTiledKernel {
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(include_str!("shaders/shader.wgsl"))
@@ -136,9 +140,12 @@ pub fn q4_matmul(input: Tensor<WgpuBackend, 3>, weights: &Q4Tensor) -> Tensor<Wg
 
 /// Dispatch the appropriate kernel variant.
 ///
-/// Tiled for M <= 4 (decoder), naive for M > 4 (encoder/prefill).
-/// Both variants work on native and WASM — the pipelines are keyed by
-/// distinct `KernelId`s so there is no bind group layout conflict.
+/// On native: tiled for M <= 4 (decoder), naive for M > 4 (encoder/prefill).
+/// On WASM: always naive — switching between tiled and naive shaders within
+/// the same session produces incorrect results in WebGPU's bind-group caching.
+/// (Verified 2026-04-26: even when we tried distinct `KernelId` types per
+/// variant, the practical behavior on browser WebGPU was wrong.)
+#[cfg(not(target_family = "wasm"))]
 fn dispatch(
     client: &cubecl::client::ComputeClient<WgpuRuntime>,
     b: usize,
@@ -165,6 +172,17 @@ fn dispatch(
     } else {
         dispatch_naive(client, b, m, n, bindings);
     }
+}
+
+#[cfg(target_family = "wasm")]
+fn dispatch(
+    client: &cubecl::client::ComputeClient<WgpuRuntime>,
+    b: usize,
+    m: usize,
+    n: usize,
+    bindings: Bindings,
+) {
+    dispatch_naive(client, b, m, n, bindings);
 }
 
 fn dispatch_naive(

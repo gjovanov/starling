@@ -4,10 +4,46 @@
 //! then decodes new adapter tokens. Same architecture as candle_native/engine.rs
 //! but targeting CPU with Q4 weights.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use candle_core_cpu::{DType, Device, Module, Tensor};
+
+/// DIAG_LOGITS=<base_path>: dumps each call's [vocab=131072] logits to
+/// <base_path>.<idx>.bin (idx = 0..N), bounded at MAX_DUMPS to limit disk use.
+fn maybe_dump_logits_once(logits: &Tensor, label: &str) {
+    use std::sync::atomic::AtomicUsize;
+    static IDX: AtomicUsize = AtomicUsize::new(0);
+    const MAX_DUMPS: usize = 16;
+    let Ok(base) = std::env::var("DIAG_LOGITS") else { return; };
+    let idx = IDX.fetch_add(1, Ordering::Relaxed);
+    if idx >= MAX_DUMPS { return; }
+
+    let vals: Vec<f32> = match logits
+        .to_dtype(DType::F32)
+        .and_then(|t| t.reshape(131072))
+        .and_then(|t| t.to_vec1::<f32>())
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[DIAG_LOGITS:{label}] readback failed: {e:?}");
+            return;
+        }
+    };
+    let bytes: Vec<u8> = vals.iter().flat_map(|v: &f32| v.to_le_bytes()).collect();
+    let path = format!("{base}.{idx:02}.bin");
+    if let Err(e) = std::fs::write(&path, &bytes) {
+        eprintln!("[DIAG_LOGITS:{label}:{idx:02}] write {path} failed: {e}");
+        return;
+    }
+    let mut top: Vec<(usize, f32)> = vals.iter().copied().enumerate().collect();
+    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let top10: Vec<(usize, f32)> = top[..10.min(top.len())].to_vec();
+    let max = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let min = vals.iter().cloned().fold(f32::INFINITY, f32::min);
+    eprintln!("[DIAG_LOGITS:{label}:{idx:02}] {path} min={min:+.4} max={max:+.4} top10={:?}", top10);
+}
 
 use crate::audio::mel::{MelConfig, MelSpectrogram};
 use crate::audio::pad::PadConfig;
@@ -513,9 +549,26 @@ impl InferenceSession for CandleCpuSession {
             let hidden = model
                 .decoder_forward(last, &self.ada_scales, &mut self.dec_caches)
                 .map_err(|e| format!("forward: {}", e))?;
-            self.prev_token = model
-                .lm_head_argmax(&hidden)
+            // DIAG_LOGITS=<path>: dump first-token logits for offline diff vs Q4-wgpu
+            // engine. Fires once per process. Compute lm_head explicitly (rather than
+            // the fused lm_head_argmax) so we can intercept the logits.
+            let logits = model
+                .lm_head(&hidden)
                 .map_err(|e| format!("lm_head: {}", e))?;
+            maybe_dump_logits_once(&logits, "first_token");
+            let logits_f32: Vec<f32> = logits
+                .to_dtype(candle_core_cpu::DType::F32)
+                .map_err(|e| format!("to_dtype: {}", e))?
+                .reshape(131072)
+                .map_err(|e| format!("reshape: {}", e))?
+                .to_vec1()
+                .map_err(|e| format!("to_vec1: {}", e))?;
+            self.prev_token = logits_f32
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
             self.generated_tokens.push(self.prev_token);
             if self.prev_token >= 1000 {
                 new_text_tokens.push(self.prev_token);
@@ -655,9 +708,20 @@ impl InferenceSession for CandleCpuSession {
                 let hidden = model
                     .decoder_forward(x, &self.ada_scales, &mut self.dec_caches)
                     .map_err(|e| format!("forward: {}", e))?;
-                let token = model
-                    .lm_head_argmax(&hidden)
-                    .map_err(|e| format!("lm_head: {}", e))?;
+                // DIAG_LOGITS dump for cross-engine diff
+                let logits = model.lm_head(&hidden).map_err(|e| format!("lm_head: {}", e))?;
+                maybe_dump_logits_once(&logits, "decode");
+                let logits_f32: Vec<f32> = logits
+                    .to_dtype(candle_core_cpu::DType::F32)
+                    .and_then(|t| t.reshape(131072))
+                    .and_then(|t| t.to_vec1())
+                    .map_err(|e| format!("logits: {}", e))?;
+                let token: u32 = logits_f32
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i as u32)
+                    .unwrap_or(0);
                 self.generated_tokens.push(token);
                 self.prev_token = token;
                 if token >= 1000 {

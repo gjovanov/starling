@@ -338,6 +338,8 @@ impl Q4IncrementalSession {
                 &mut self.decoder_caches,
             );
             let logits = self.model.decoder().lm_head(hidden);
+            #[cfg(not(target_arch = "wasm32"))]
+            self.maybe_dump_logits(&logits, "first_token").await;
             let first_token = self.argmax_async(&logits).await?;
 
             self.prev_token = first_token;
@@ -363,6 +365,8 @@ impl Q4IncrementalSession {
                     &mut self.decoder_caches,
                 );
                 let logits = self.model.decoder().lm_head(hidden);
+                #[cfg(not(target_arch = "wasm32"))]
+                self.maybe_dump_logits(&logits, "decode").await;
                 let token = self.argmax_async(&logits).await?;
 
                 self.generated_tokens.push(token);
@@ -390,6 +394,8 @@ impl Q4IncrementalSession {
                     &mut self.decoder_caches,
                 );
                 let logits = self.model.decoder().lm_head(hidden);
+                #[cfg(not(target_arch = "wasm32"))]
+                self.maybe_dump_logits(&logits, "decode").await;
                 let token = self.argmax_async(&logits).await?;
 
                 self.generated_tokens.push(token);
@@ -466,6 +472,44 @@ impl Q4IncrementalSession {
         }
 
         Ok(best_idx as i32)
+    }
+
+    /// DIAG_LOGITS=<base_path> dumps the [vocab] logits vector at each call to
+    /// <base_path>.<idx>.bin (idx = 0..N), where idx counts call invocations.
+    /// Stats per call go to stderr. Stops after 16 dumps to bound disk use.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn maybe_dump_logits(&self, logits: &Tensor<WgpuBackend, 3>, label: &str) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static IDX: AtomicUsize = AtomicUsize::new(0);
+        const MAX_DUMPS: usize = 16;
+        let Ok(base) = std::env::var("DIAG_LOGITS") else { return; };
+        let idx = IDX.fetch_add(1, Ordering::Relaxed);
+        if idx >= MAX_DUMPS { return; }
+
+        let vocab = logits.dims()[2];
+        let data = match logits.clone().reshape([vocab]).into_data_async().await {
+            Ok(d) => d,
+            Err(e) => { log(format_args!("[DIAG_LOGITS] readback failed: {e:?}")); return; }
+        };
+        let vals: Vec<f32> = match data.to_vec() {
+            Ok(v) => v,
+            Err(e) => { log(format_args!("[DIAG_LOGITS] to_vec failed: {e:?}")); return; }
+        };
+        let bytes: Vec<u8> = vals.iter().flat_map(|v: &f32| v.to_le_bytes()).collect();
+        let path = format!("{base}.{idx:02}.bin");
+        if let Err(e) = std::fs::write(&path, &bytes) {
+            log(format_args!("[DIAG_LOGITS] write {path} failed: {e}"));
+            return;
+        }
+        let mut top: Vec<(usize, f32)> = vals.iter().copied().enumerate().collect();
+        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let top10 = &top[..10.min(top.len())];
+        let max = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let min = vals.iter().cloned().fold(f32::INFINITY, f32::min);
+        log(format_args!(
+            "[DIAG_LOGITS:{label}:{idx:02}] {path} min={min:+.4} max={max:+.4} top10={:?}",
+            top10
+        ));
     }
 
     /// Reset everything for context rotation.

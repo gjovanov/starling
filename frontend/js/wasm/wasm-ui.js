@@ -19,8 +19,11 @@ let wasmSectionEl = null;
 let wasmFileInputEl = null;
 let wasmStartBtnEl = null;
 let wasmStopBtnEl = null;
+let wasmDumpPcmBtnEl = null;
 let wasmTranscriptEl = null;
 let wasmStatsEl = null;
+
+let decodedSourceFileName = null;
 
 /** @type {WasmSession|null} */
 let wasmSession = null;
@@ -99,6 +102,10 @@ export async function initWasmUI(container) {
     <div class="form-actions" style="margin-top: 10px;">
       <button id="wasm-start-btn" class="action-btn" disabled>Start Transcription</button>
       <button id="wasm-stop-btn" class="action-btn small danger" style="display: none;">Stop</button>
+      <button id="wasm-dump-pcm-btn" class="action-btn small" disabled
+              title="Save the in-browser decoded 16kHz mono PCM as a WAV file (for diagnostic comparison against server-side engine).">
+        Download decoded PCM
+      </button>
     </div>
     <div class="form-group" style="margin-top: 10px;">
       <div id="wasm-stats" style="font-size: 0.85em; color: #888; display: none;">
@@ -128,6 +135,7 @@ export async function initWasmUI(container) {
   wasmFileInputEl = document.getElementById('wasm-audio-file');
   wasmStartBtnEl = document.getElementById('wasm-start-btn');
   wasmStopBtnEl = document.getElementById('wasm-stop-btn');
+  wasmDumpPcmBtnEl = document.getElementById('wasm-dump-pcm-btn');
   wasmTranscriptEl = document.getElementById('wasm-transcript');
   wasmStatsEl = document.getElementById('wasm-stats');
 
@@ -146,7 +154,9 @@ export async function initWasmUI(container) {
     if (!file) return;
 
     decodedPcm = null;
+    decodedSourceFileName = null;
     wasmStartBtnEl.disabled = true;
+    if (wasmDumpPcmBtnEl) wasmDumpPcmBtnEl.disabled = true;
 
     const decodeStatus = document.getElementById('wasm-decode-status');
     const decodeText = document.getElementById('wasm-decode-text');
@@ -156,10 +166,12 @@ export async function initWasmUI(container) {
 
     try {
       decodedPcm = await decodeToMono16k(file);
+      decodedSourceFileName = file.name;
       const durationS = decodedPcm.length / 16000;
       decodeText.textContent = `Decoded: ${durationS.toFixed(1)}s of audio (${(decodedPcm.length).toLocaleString()} samples)`;
       decodeText.style.color = '#28a745';
       wasmStartBtnEl.disabled = false;
+      if (wasmDumpPcmBtnEl) wasmDumpPcmBtnEl.disabled = false;
       console.log(`[wasm] Audio decoded: ${durationS.toFixed(1)}s`);
     } catch (err) {
       console.error('[wasm] Audio decode failed:', err);
@@ -167,6 +179,22 @@ export async function initWasmUI(container) {
       decodeText.style.color = '#dc3545';
     }
   });
+
+  // Dump button — exports the in-browser decoded PCM as a 16kHz mono WAV file
+  if (wasmDumpPcmBtnEl) {
+    wasmDumpPcmBtnEl.addEventListener('click', () => {
+      if (!decodedPcm) {
+        console.warn('[wasm] No decoded PCM to dump');
+        return;
+      }
+      const baseName = (decodedSourceFileName || 'browser-decoded')
+        .replace(/\.[^.]+$/, '');
+      const outName = `${baseName}.browser-pcm.wav`;
+      const blob = encodeWavMono16k(decodedPcm);
+      triggerDownload(blob, outName);
+      console.log(`[wasm] Dumped ${decodedPcm.length} samples (${(decodedPcm.length / 16000).toFixed(2)}s) -> ${outName}`);
+    });
+  }
 
   // Start button — load model (if needed) and start transcription
   wasmStartBtnEl.addEventListener('click', async () => {
@@ -361,4 +389,63 @@ export function isWasmModeEnabled() {
  */
 export function getWasmSession() {
   return wasmSession;
+}
+
+/**
+ * Encode a Float32Array (mono 16kHz) as a 16-bit PCM WAV Blob.
+ * Header is the standard 44-byte canonical WAV (RIFF/WAVE/fmt /data).
+ * @param {Float32Array} samples - mono 16kHz samples in [-1, 1]
+ * @returns {Blob}
+ */
+function encodeWavMono16k(samples) {
+  const sampleRate = 16000;
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+  const dataLen = samples.length * 2;
+  const buffer = new ArrayBuffer(44 + dataLen);
+  const view = new DataView(buffer);
+
+  let p = 0;
+  const writeStr = (s) => { for (let i = 0; i < s.length; i++) view.setUint8(p++, s.charCodeAt(i)); };
+  const u32 = (v) => { view.setUint32(p, v, true); p += 4; };
+  const u16 = (v) => { view.setUint16(p, v, true); p += 2; };
+
+  writeStr('RIFF');
+  u32(36 + dataLen);
+  writeStr('WAVE');
+  writeStr('fmt ');
+  u32(16);              // fmt chunk size
+  u16(1);               // PCM format
+  u16(numChannels);
+  u32(sampleRate);
+  u32(byteRate);
+  u16(blockAlign);
+  u16(bitsPerSample);
+  writeStr('data');
+  u32(dataLen);
+
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(p, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    p += 2;
+  }
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+/**
+ * Trigger a browser download of a Blob with the given filename.
+ * @param {Blob} blob
+ * @param {string} filename
+ */
+function triggerDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }

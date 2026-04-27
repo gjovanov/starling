@@ -28,7 +28,38 @@ fn standard_softmax<B: Backend>(scores: Tensor<B, 4>) -> Tensor<B, 4> {
     exp_vals / sum_vals
 }
 
-fn gpu_softmax<B: Backend>(scores: Tensor<B, 4>) -> Tensor<B, 4> {
+/// CPU-based stable softmax — uses max-shift, no clamp distortion.
+/// Use when GPU softmax precision is suspect (e.g. DZN driver oddities).
+/// Slow on long-K decode (full readback each call) but always correct.
+pub(crate) fn cpu_softmax<B: Backend>(scores: Tensor<B, 4>) -> Tensor<B, 4> {
+    let [b, h, s, kv] = scores.dims();
+    let device = scores.device();
+    let data = scores.reshape([b * h * s, kv]).into_data();
+    let vals: Vec<f32> = data.to_vec().expect("cpu_softmax readback");
+    let n_rows = b * h * s;
+    let mut out = vec![0.0f32; n_rows * kv];
+    for row in 0..n_rows {
+        let src = &vals[row * kv..(row + 1) * kv];
+        let dst = &mut out[row * kv..(row + 1) * kv];
+        let max_val = src.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for j in 0..kv {
+            let e = (src[j] - max_val).exp();
+            dst[j] = e;
+            sum += e;
+        }
+        if sum > 0.0 {
+            for j in 0..kv { dst[j] /= sum; }
+        }
+    }
+    let t2 = Tensor::<B, 2>::from_data(
+        burn::tensor::TensorData::new(out, [n_rows, kv]),
+        &device,
+    );
+    t2.reshape([b, h, s, kv])
+}
+
+pub(crate) fn gpu_softmax<B: Backend>(scores: Tensor<B, 4>) -> Tensor<B, 4> {
     let [b, h, s, kv] = scores.dims();
     let device = scores.device();
 

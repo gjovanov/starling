@@ -28,10 +28,28 @@ base64 = "0.22"
 # WAV loading (native only)
 hound = { version = "3.5", optional = true }
 
+# Blocking executor for the native test harness (bin/q4_incremental_test.rs)
+pollster = { version = "0.3", optional = true }
+
 # WASM getrandom support
 getrandom = { version = "0.3", optional = true, features = ["wasm_js"] }
 
 [features]
 default = ["native"]
-native = ["dep:hound"]
+native = ["dep:hound", "dep:pollster"]
 wasm = ["dep:getrandom"]
+
+[[bin]]
+name = "q4_incremental_test"
+path = "src/bin/q4_incremental_test.rs"
+required-features = ["native"]
+
+[[bin]]
+name = "q4_matmul_correctness"
+path = "src/bin/q4_matmul_correctness.rs"
+required-features = ["native"]
+
+[[bin]]
+name = "burn_matmul_precision"
+path = "src/bin/burn_matmul_precision.rs"
+required-features = ["native"]
