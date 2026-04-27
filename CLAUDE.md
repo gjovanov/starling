@@ -383,6 +383,53 @@ The upstream left-pads audio with 32 silence tokens. After mel/conv/reshape, thi
 - No sync GPU readback → `into_data_async().await`
 - 256 workgroup invocation limit → patched CubeCL
 
+#### Q4 Browser Path: Burn/wgpu Is Broken (do not invest more)
+
+**TL;DR**: voxtral-core's Q4-on-Burn/wgpu produces semantically wrong output (English-biased, not the source language) on every dzn/WebGPU driver tested. After exhaustive bisection (2026-04-26/27) we proved the bug is *cumulative fp32 accumulation drift* across 26 decoder layers — a class of bug the WGSL spec **explicitly permits**. There is no portable fix. Pivot to **ggml-WASM** (compile candle-cpu's exact CPU path to wasm32 with WASM SIMD) is the recommended product path. Don't chase more workarounds in the Burn/wgpu Q4 stack.
+
+**Symptom**: streaming German news audio, the wasm engine emits coherent English ("Thank you. If you're interested in what's the most important thing about the West..."), with German finally emerging only after 12-15 commits of context. Server `candle-cpu-engine` (ggml on the SAME PCM exported from the browser) produces correct German throughout.
+
+**What we ruled out (each verified with a dedicated test on RTX 5090 via dzn):**
+| Hypothesis | Verdict | Evidence |
+|---|---|---|
+| Audio resampling | ✅ innocent | "Download decoded PCM" button (`frontend/js/wasm/wasm-ui.js`) → server candle-cpu transcribes the dump as correct German |
+| Mel computation | ✅ innocent | `voxtral-core/src/audio/mel.rs` byte-identical to `apps/burn-server/src/audio/mel.rs` |
+| Shared layer code (RoPE/attn/RmsNorm/etc.) | ✅ innocent | All files byte-identical to BF16 path |
+| Q4 fused dequant+matmul WGSL kernel | ✅ bit-exact | `q4_matmul_correctness` bin tests 8 weights up to K=9216 → max abs err ≤ 3e-6 |
+| Burn fp32 matmul on dzn (single op) | ✅ bit-exact | `burn_matmul_precision` bin tests RmsNorm/lm_head/QK/attn-V shapes → all OK |
+| Full RmsNorm composition (mul + matmul + div + sqrt + broadcast) | ✅ bit-exact | Same bin → OK |
+| GQA `expand_kv` reshape pattern | ✅ correct | Same bin → OK |
+| Tiled vs naive Q4 dispatch | ✅ neutral | Always-naive same English bias |
+| Browser WebGPU vs Linux dzn | ✅ same bug | Native dzn reproduces identically |
+| Burn 0.20→0.21 / cubecl 0.9→0.10 upgrade | ❌ no fix | Identical broken output. Side win: 18% perf. |
+| burn::tensor::activation::softmax (DZN max_dim/sum_dim broken) | ❌ FIXED | Replaced with `gpu_softmax` (matmul-based) at `q4/model.rs:142,194` — bumps quality from full English to partial German |
+| `cpu_softmax` (max-shifted, mathematically correct) | ❌ counter-intuitive | Produces FULL English output (worse than `gpu_softmax`); confirms gpu_softmax's `clamp(-100, 80)` is *accidentally* compensating for some other drift |
+
+**What we proved is the actual root cause** — DIAG_LOGITS dump comparison at the same audio position:
+- candle-cpu (correct): logit range `[-30, +11]`, STREAMING_PAD/STREAMING_WORD clearly dominate at silent positions
+- Q4-wgpu (broken): logit range `[-30, +3]`, **compressed** — STREAMING_PAD doesn't dominate, random English text tokens win after the mask
+
+The hidden-state magnitude through 26 decoder layers drifts on dzn — not from any single buggy op (we verified each one) but from cumulative fp32 accumulation order across ~500 ops/token. **WGSL spec does not guarantee bit-deterministic fp32 across implementations.** Different drivers will produce different drift profiles; there is no universal patch.
+
+**Diagnostic infra to keep** (already committed, useful for any future Q4-wgpu work):
+- `libs/voxtral-core/src/bin/q4_incremental_test.rs` — runs the same code as wasm-engine on Linux dzn, ~2s repro of any wasm bug, no browser needed
+- `libs/voxtral-core/src/bin/q4_matmul_correctness.rs` — bit-exactness regression test for the Q4 WGSL kernel (any future kernel changes must pass this)
+- `libs/voxtral-core/src/bin/burn_matmul_precision.rs` — Burn fp32 matmul precision tests on dzn, useful for ruling out single-op regressions
+- `DIAG_LAYERS=1` in `q4/model.rs::forward_hidden_with_cache` — per-layer L2/min/max/first4 dump, gated by cfg(not(target_arch="wasm32"))
+- `DIAG_LOGITS=<base_path>` in both `voxtral-core/q4/incremental_engine.rs` and `apps/burn-server/src/inference/candle_cpu/engine.rs` — dumps first 16 emission logits as `<base>.NN.bin` for cross-engine offline diff
+- "Download decoded PCM" button in `frontend/js/wasm/wasm-ui.js` — exports browser's resampled audio as 16 kHz mono WAV for server-side comparison
+- Vendored `apps/burn-server/patches/cubecl-wgpu-0.10.0-pre.3/` (currently inactive on Burn 0.20) — restores the `WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER` instance flag fix needed for dzn on wgpu 26 if we ever migrate to Burn 0.21
+
+**Real fix shipped**: `libs/voxtral-core/src/q4/model.rs:142,194` — Q4 attention now uses `gpu_softmax` (matmul-based, DZN-safe) instead of `burn::tensor::activation::softmax` (uses broken `max_dim`/`sum_dim` on dzn). This raises wasm output quality from full English hallucination to partial German (German emerges after ~12 streaming commits). Not a complete fix but a real improvement; suitable to ship while we work on the proper ggml-WASM port.
+
+**Next step for browser ASR**: Path D (ggml-WASM). Compile ggml's exact CPU path to wasm32 with WASM SIMD. Quality matches server (deterministic accumulation order is the *reason* candle-cpu works), ~3-5× RT in browser, predictable across drivers. ~1 week of work. Path C (custom WGSL flash kernels) becomes optional "fast mode" later if we want browser realtime — but on a clean foundation, not built atop the broken Burn/wgpu stack.
+
+**Don't re-litigate**:
+- ❌ Trying to "fix" Burn/wgpu Q4 numerics. We've patched 4 layers of DZN bugs already; each one was a workaround. Cumulative drift cannot be patched away in a portable way.
+- ❌ Upgrading Burn — 0.21 doesn't fix it, and even if a hypothetical future version did, browser drivers would still each have their own drift.
+- ❌ Removing the STREAMING_PAD mask in argmax — `cpu_softmax` test proved unmasked Q4-wgpu output is no better; it's just differently wrong.
+- ❌ More single-op precision tests in voxtral-core. Every primitive op is bit-correct in isolation; the bug is in their composition.
+
 ## Shared Infrastructure
 
 ### Model Storage
