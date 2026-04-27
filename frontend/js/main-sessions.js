@@ -8,6 +8,18 @@ import { SubtitleRenderer } from './modules/subtitles.js';
 import { formatTime } from './modules/utils.js';
 import { SessionManager, formatDuration, formatFileSize } from './modules/session-manager.js';
 import { initWasmUI } from './wasm/wasm-ui.js';
+import {
+  fetchVoices as ttsFetchVoices,
+  fetchTtsConfig,
+  fetchTtsStatus,
+  fetchSavedFiles as ttsFetchSavedFiles,
+  deleteSavedFile as ttsDeleteSavedFile,
+  synthesizeAndSave as ttsSynthesizeAndSave,
+  synthesizeForPlayback as ttsSynthesizeForPlayback,
+  uploadVoiceRef as ttsUploadVoiceRef,
+  deleteVoiceRef as ttsDeleteVoiceRef,
+} from './modules/tts-manager.js';
+import { TtsPlayer, exposePlayerForTests } from './modules/tts-player.js';
 
 // Application state
 const state = {
@@ -97,6 +109,14 @@ async function init() {
     wasmContainer.style.display = 'block';
     await initWasmUI(wasmContainer);
     console.log('WASM UI initialized');
+  }
+
+  // Initialize the TTS tab. Failures here must NOT block the rest of the
+  // app — the TTS server is optional and may not be running.
+  try {
+    await setupTtsTab();
+  } catch (err) {
+    console.warn('TTS tab init failed (server may be down):', err);
   }
 
   console.log('Multi-session application initialized');
@@ -717,6 +737,383 @@ function setupEventListeners() {
 
   // Update stats periodically
   setInterval(updateStats, 1000);
+}
+
+// ─── TTS tab ────────────────────────────────────────────────────────────
+
+const ttsState = {
+  voices: [],
+  config: null,
+  loaded: false,
+  inFlight: false,
+  /** @type {TtsPlayer|null} */
+  player: null,
+};
+
+async function setupTtsTab() {
+  const els = {
+    text:        document.getElementById('tts-text'),
+    charCount:   document.getElementById('tts-char-count'),
+    charMax:     document.getElementById('tts-char-max'),
+    voice:       document.getElementById('tts-voice'),
+    modeRadios:  document.querySelectorAll('input[name="tts-output-mode"]'),
+    filenameGrp: document.getElementById('tts-filename-group'),
+    filename:    document.getElementById('tts-filename'),
+    overwrite:   document.getElementById('tts-overwrite'),
+    outputDir:   document.getElementById('tts-output-dir'),
+    generate:    document.getElementById('tts-generate-btn'),
+    pause:       document.getElementById('tts-pause-btn'),
+    resume:      document.getElementById('tts-resume-btn'),
+    stop:        document.getElementById('tts-stop-btn'),
+    status:      document.getElementById('tts-status'),
+    audio:       document.getElementById('tts-audio'),
+    savedGroup:  document.getElementById('tts-saved-files-group'),
+    savedList:   document.getElementById('tts-saved-files'),
+    engineBadge: document.getElementById('tts-engine-badge'),
+  };
+  if (!els.text || !els.voice || !els.generate) return; // tab not present in DOM
+
+  // Fetch the catalog + static config in parallel; either failing leaves
+  // the tab in a clearly-disabled state.
+  const [voices, cfg] = await Promise.all([ttsFetchVoices(), fetchTtsConfig()]);
+  ttsState.voices = voices;
+  ttsState.config = cfg;
+  renderVoiceSelect(els);
+  els.voice.disabled = false;
+  els.generate.disabled = false;
+
+  els.charMax.textContent = cfg.max_chars;
+  els.text.maxLength = cfg.max_chars;
+  els.outputDir.textContent = cfg.output_dir;
+  ttsState.loaded = true;
+
+  // Live char-count
+  els.text.addEventListener('input', () => {
+    els.charCount.textContent = els.text.value.length;
+  });
+
+  // Mode toggle: show filename input only when "save" is selected
+  for (const r of els.modeRadios) {
+    r.addEventListener('change', () => {
+      const mode = document.querySelector('input[name="tts-output-mode"]:checked')?.value;
+      els.filenameGrp.style.display = mode === 'save' ? '' : 'none';
+    });
+  }
+
+  els.generate.addEventListener('click', () => generateTts(els));
+  els.pause.addEventListener('click', () => ttsState.player?.pause());
+  els.resume.addEventListener('click', () => ttsState.player?.resume());
+  els.stop.addEventListener('click', () => {
+    ttsState.player?.cancel();
+    setStreamingButtons(els, 'idle');
+    els.status.textContent = 'Stopped.';
+    els.status.style.color = '#a0a0a0';
+  });
+
+  // Saved-files list (populated on first render + after each save)
+  await refreshSavedFiles(els);
+
+  // Lifecycle status badge — poll while the tab is active.
+  await refreshTtsEngineStatus(els);
+  setInterval(() => refreshTtsEngineStatus(els), 5000);
+
+  // Voice-cloning panel.
+  const cloneEls = {
+    name:        document.getElementById('tts-clone-name'),
+    text:        document.getElementById('tts-clone-text'),
+    file:        document.getElementById('tts-clone-file'),
+    permission:  document.getElementById('tts-clone-permission'),
+    upload:      document.getElementById('tts-clone-upload-btn'),
+    status:      document.getElementById('tts-clone-status'),
+    listGroup:   document.getElementById('tts-clone-list-group'),
+    list:        document.getElementById('tts-clone-list'),
+  };
+  if (cloneEls.upload) {
+    cloneEls.permission.addEventListener('change', () => updateCloneUploadEnabled(cloneEls));
+    [cloneEls.name, cloneEls.text, cloneEls.file].forEach(el =>
+      el.addEventListener('input', () => updateCloneUploadEnabled(cloneEls))
+    );
+    cloneEls.upload.addEventListener('click', () => uploadClone(cloneEls, els));
+    refreshCloneList(cloneEls, els);
+  }
+}
+
+/** Render the voice <select> grouped by language plus a "Custom voices" group. */
+function renderVoiceSelect(els) {
+  const voices = ttsState.voices ?? [];
+  const cfg = ttsState.config;
+  const builtin = voices.filter(v => v.kind !== 'cloned');
+  const cloned = voices.filter(v => v.kind === 'cloned');
+
+  const byLang = {};
+  for (const v of builtin) (byLang[v.language] ||= []).push(v);
+  let html = Object.entries(byLang).map(([lang, vs]) => {
+    const opts = vs.map(v => {
+      const sel = v.id === cfg?.default_voice ? ' selected' : '';
+      return `<option value="${v.id}"${sel}>${v.display_name}</option>`;
+    }).join('');
+    return `<optgroup label="${lang}">${opts}</optgroup>`;
+  }).join('');
+
+  if (cloned.length) {
+    const opts = cloned.map(v =>
+      `<option value="ref:${v.id}">${v.name}</option>`
+    ).join('');
+    html += `<optgroup label="Custom voices">${opts}</optgroup>`;
+  }
+  els.voice.innerHTML = html;
+}
+
+function updateCloneUploadEnabled(cloneEls) {
+  const ok =
+    !!cloneEls.name.value.trim() &&
+    !!cloneEls.text.value.trim() &&
+    !!cloneEls.file.files?.[0] &&
+    cloneEls.permission.checked;
+  cloneEls.upload.disabled = !ok;
+}
+
+async function uploadClone(cloneEls, els) {
+  const file = cloneEls.file.files?.[0];
+  if (!file) return;
+  cloneEls.upload.disabled = true;
+  cloneEls.status.textContent = 'Uploading…';
+  cloneEls.status.style.color = '#a0a0a0';
+  try {
+    await ttsUploadVoiceRef({
+      file,
+      name: cloneEls.name.value.trim(),
+      refText: cloneEls.text.value.trim(),
+      permissionConfirmed: cloneEls.permission.checked,
+    });
+    cloneEls.status.textContent = 'Uploaded.';
+    cloneEls.status.style.color = '#7fbf7f';
+    // Reset form
+    cloneEls.name.value = '';
+    cloneEls.text.value = '';
+    cloneEls.file.value = '';
+    cloneEls.permission.checked = false;
+    // Re-fetch voices and refresh both the dropdown and the list.
+    ttsState.voices = await ttsFetchVoices();
+    renderVoiceSelect(els);
+    await refreshCloneList(cloneEls, els);
+  } catch (err) {
+    cloneEls.status.textContent = `Error: ${err.message || err}`;
+    cloneEls.status.style.color = '#dc8b8b';
+  } finally {
+    updateCloneUploadEnabled(cloneEls);
+  }
+}
+
+async function refreshCloneList(cloneEls, els) {
+  const all = ttsState.voices ?? (await ttsFetchVoices());
+  const cloned = all.filter(v => v.kind === 'cloned');
+  if (!cloned.length) {
+    cloneEls.listGroup.style.display = 'none';
+    cloneEls.list.innerHTML = '';
+    return;
+  }
+  cloneEls.listGroup.style.display = '';
+  cloneEls.list.innerHTML = cloned.map(v => {
+    const created = new Date(v.created_at * 1000).toLocaleString();
+    return `
+      <div class="media-item" style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 12px;background:#16213e;border-radius:6px;margin-bottom:6px;">
+        <div style="flex:1;min-width:0;">
+          <div style="color:white;font-weight:500;">${v.name}</div>
+          <div style="font-size:0.8em;color:#a0a0a0;">${v.duration_secs.toFixed(1)} s · ${created}</div>
+        </div>
+        <button class="action-btn small danger" data-clone-delete="${v.id}">Delete</button>
+      </div>`;
+  }).join('');
+
+  cloneEls.list.querySelectorAll('[data-clone-delete]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      try {
+        await ttsDeleteVoiceRef(btn.dataset.cloneDelete);
+        ttsState.voices = await ttsFetchVoices();
+        renderVoiceSelect(els);
+        await refreshCloneList(cloneEls, els);
+      } catch (err) {
+        console.warn('clone delete failed:', err);
+      }
+    });
+  });
+}
+
+/** Render the TTS engine status badge from /api/tts/status. */
+async function refreshTtsEngineStatus(els) {
+  if (!els.engineBadge) return;
+  let info;
+  try {
+    info = await fetchTtsStatus();
+  } catch (_) {
+    els.engineBadge.textContent = 'unreachable';
+    els.engineBadge.style.background = '#5a3a3a';
+    els.engineBadge.style.color = '#dc8b8b';
+    return;
+  }
+  const presets = {
+    idle:     { label: 'idle',                 bg: '#3a3a4a', fg: '#a0a0a0' },
+    starting: { label: 'warming up…',          bg: '#5a4a2a', fg: '#ffd866' },
+    ready:    { label: 'ready',                bg: '#2a5a3a', fg: '#7fbf7f' },
+    stopping: { label: 'stopping…',            bg: '#5a4a2a', fg: '#ffd866' },
+    blocked:  { label: 'blocked by ASR',       bg: '#5a3a3a', fg: '#dc8b8b' },
+  };
+  const p = presets[info.state] ?? presets.idle;
+  let label = p.label;
+  if (info.state === 'starting' && info.boot_elapsed_secs != null && info.boot_timeout_secs) {
+    const remaining = Math.max(0, info.boot_timeout_secs - info.boot_elapsed_secs);
+    label = `warming up · ${remaining.toFixed(0)}s left`;
+  } else if (info.state === 'blocked' && info.blocked_reason) {
+    label = info.blocked_reason;
+  }
+  els.engineBadge.textContent = label;
+  els.engineBadge.style.background = p.bg;
+  els.engineBadge.style.color = p.fg;
+
+  // Disable Generate while blocked.
+  if (info.state === 'blocked') {
+    els.generate.disabled = true;
+    els.generate.title = info.blocked_reason || 'TTS blocked';
+  } else if (ttsState.loaded) {
+    els.generate.disabled = ttsState.inFlight;
+    els.generate.title = '';
+  }
+}
+
+/**
+ * Toggle the visibility of Pause/Resume/Stop buttons based on player state.
+ * `idle` hides everything; `playing` shows Pause+Stop; `paused` shows
+ * Resume+Stop; `buffering` shows Stop (no pause-while-buffering).
+ */
+function setStreamingButtons(els, state) {
+  els.pause.hidden = state !== 'playing';
+  els.resume.hidden = state !== 'paused';
+  els.stop.hidden = state === 'idle' || state === 'ended';
+}
+
+async function generateTts(els) {
+  if (ttsState.inFlight) return;
+  const text = els.text.value.trim();
+  if (!text) {
+    els.status.textContent = 'Enter some text first.';
+    els.status.style.color = '#dc8b8b';
+    return;
+  }
+  // Cloned-voice options use the `ref:<uuid>` prefix in the <select> value.
+  const raw = els.voice.value;
+  const isCloned = raw.startsWith('ref:');
+  const voice = isCloned ? '' : raw;
+  const voiceRefId = isCloned ? raw.slice(4) : null;
+  const mode = document.querySelector('input[name="tts-output-mode"]:checked')?.value || 'play';
+
+  ttsState.inFlight = true;
+  els.generate.disabled = true;
+  els.status.style.color = '#a0a0a0';
+  els.status.textContent = 'Synthesizing…';
+
+  try {
+    if (mode === 'save') {
+      const filename = (els.filename.value || '').trim() || null;
+      const result = await ttsSynthesizeAndSave({
+        text, voice, voiceRefId, filename,
+        overwrite: !!els.overwrite.checked,
+      });
+      els.status.textContent =
+        `Saved ${result.filename} (${formatFileSize(result.bytes)}, ${result.elapsed_secs.toFixed(2)}s)`;
+      els.status.style.color = '#7fbf7f';
+      els.audio.hidden = false;
+      els.audio.src = `/api/tts/output/${encodeURIComponent(result.filename)}`;
+      await refreshSavedFiles(els);
+    } else {
+      // Phase 4: progressive playback via Web Audio. We hand the streaming
+      // Response straight to TtsPlayer.start() — no `await response.blob()`
+      // round-trip, so first audio plays as soon as the first PCM chunk
+      // lands on the wire.
+      els.audio.hidden = true;          // <audio> is unused in stream mode
+      ttsState.player?.cancel();        // tear down any previous player
+
+      const player = new TtsPlayer({
+        onStateChange: ({ state, currentTimeSecs, bufferedSecs }) => {
+          setStreamingButtons(els, state);
+          if (state === 'buffering') {
+            els.status.textContent = 'Buffering…';
+            els.status.style.color = '#a0a0a0';
+          } else if (state === 'playing') {
+            els.status.textContent =
+              `Playing (${currentTimeSecs.toFixed(1)} s, ${bufferedSecs.toFixed(1)} s buffered)`;
+            els.status.style.color = '#7fbf7f';
+          } else if (state === 'paused') {
+            els.status.textContent = 'Paused.';
+            els.status.style.color = '#d0d050';
+          } else if (state === 'ended') {
+            els.status.textContent = `Done (${currentTimeSecs.toFixed(1)} s).`;
+            els.status.style.color = '#7fbf7f';
+          }
+        },
+      });
+      ttsState.player = player;
+      // Make the player observable to Playwright via window.__ttsPlayerState.
+      try { exposePlayerForTests(player); } catch (_) { /* ignore in prod */ }
+
+      const t0 = performance.now();
+      const response = await ttsSynthesizeForPlayback({ text, voice, voiceRefId });
+      try {
+        await player.start(response);
+      } catch (err) {
+        console.warn('TtsPlayer.start failed:', err);
+        els.status.textContent = `Player error: ${err.message || err}`;
+        els.status.style.color = '#dc8b8b';
+      }
+      const elapsed = (performance.now() - t0) / 1000;
+      // Final status is set by the onStateChange handler; just append timing.
+      els.status.textContent += ` · TTFB→done ${elapsed.toFixed(2)} s`;
+      setStreamingButtons(els, 'ended');
+    }
+  } catch (err) {
+    console.error('TTS synth failed:', err);
+    els.status.textContent = `Error: ${err.message || err}`;
+    els.status.style.color = '#dc8b8b';
+  } finally {
+    ttsState.inFlight = false;
+    els.generate.disabled = false;
+  }
+}
+
+async function refreshSavedFiles(els) {
+  let files = [];
+  try { files = await ttsFetchSavedFiles(); } catch (_) { return; }
+  if (!files.length) {
+    els.savedGroup.style.display = 'none';
+    els.savedList.innerHTML = '';
+    return;
+  }
+  els.savedGroup.style.display = '';
+  els.savedList.innerHTML = files.map(f => {
+    const created = new Date(f.created_at * 1000).toLocaleString();
+    const url = `/api/tts/output/${encodeURIComponent(f.name)}`;
+    return `
+      <div class="media-item" style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 12px;background:#16213e;border-radius:6px;margin-bottom:6px;">
+        <div style="flex:1;min-width:0;">
+          <div style="color:white;font-weight:500;">${f.name}</div>
+          <div style="font-size:0.8em;color:#a0a0a0;">${formatFileSize(f.bytes)} · ${created}</div>
+        </div>
+        <a href="${url}" download="${f.name}" class="action-btn small">Download</a>
+        <button class="action-btn small danger" data-tts-delete="${encodeURIComponent(f.name)}">Delete</button>
+      </div>`;
+  }).join('');
+
+  els.savedList.querySelectorAll('[data-tts-delete]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const name = decodeURIComponent(btn.dataset.ttsDelete);
+      try {
+        await ttsDeleteSavedFile(name);
+        await refreshSavedFiles(els);
+      } catch (err) {
+        console.warn('TTS delete failed:', err);
+      }
+    });
+  });
 }
 
 function showTab(tabName) {

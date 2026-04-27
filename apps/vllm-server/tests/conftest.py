@@ -35,6 +35,7 @@ def test_app() -> FastAPI:
         media_routes,
         model_routes,
         session_routes,
+        tts_routes,
     )
     from voxtral_server.ws import handler as ws_handler
 
@@ -43,6 +44,7 @@ def test_app() -> FastAPI:
     app.include_router(media_routes.router)
     app.include_router(model_routes.router)
     app.include_router(session_routes.router)
+    app.include_router(tts_routes.router)
     app.include_router(ws_handler.router)
     return app
 

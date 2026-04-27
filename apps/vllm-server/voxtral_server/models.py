@@ -128,3 +128,77 @@ class SubtitleMessage(BaseModel):
     end: float = 0.0
     is_final: bool = False
     inference_time_ms: int | None = None
+
+
+# ---------------------------------------------------------------------------
+# Text-to-speech
+# ---------------------------------------------------------------------------
+
+class TtsConfig(BaseModel):
+    """Static TTS server config the frontend needs to render the TTS tab."""
+
+    output_dir: str
+    max_chars: int
+    default_voice: str
+    sample_rate: int = 24000
+    supported_formats: list[str] = ["wav"]
+
+
+class TtsSynthesizeRequest(BaseModel):
+    text: str = Field(..., min_length=1, description="Text to synthesize.")
+    voice: str = Field(default="", description="Voice id from /api/tts/voices. Empty → default.")
+    voice_ref_id: str | None = Field(
+        default=None,
+        description=(
+            "Uploaded voice reference id (from /api/tts/voices kind=cloned). "
+            "When set, the upstream is restarted into --task-type Base and "
+            "the cloned voice is used instead of the built-in `voice`."
+        ),
+    )
+    save: bool = Field(default=True, description="Persist the result under VOXTRAL_TTS_OUTPUT_DIR.")
+    save_filename: str | None = Field(
+        default=None,
+        description=(
+            "Optional filename (must end in .wav, [A-Za-z0-9._-]{1,128}). "
+            "Auto-generated when omitted."
+        ),
+    )
+    overwrite: bool = Field(
+        default=False,
+        description="Allow replacing an existing file with the same name.",
+    )
+
+
+class TtsSynthesizeResponse(BaseModel):
+    """Returned by POST /api/tts/synthesize when save=true."""
+
+    filename: str
+    path: str
+    bytes: int
+    voice: str
+    sample_rate: int
+    duration_secs: float | None = None
+    elapsed_secs: float
+
+
+class TtsOutputFile(BaseModel):
+    name: str
+    bytes: int
+    created_at: float
+
+
+# ---------------------------------------------------------------------------
+# Voice cloning (Phase 7)
+# ---------------------------------------------------------------------------
+
+class VoiceRefInfo(BaseModel):
+    """Public representation of an uploaded voice reference. Maps directly
+    onto the on-disk sidecar JSON minus internal paths."""
+    id: str
+    name: str
+    ref_text: str
+    permission_confirmed: bool
+    sample_rate: int = 24000
+    duration_secs: float
+    created_at: float
+    kind: str = "cloned"

@@ -394,6 +394,7 @@
         <button class="session-tab active" data-tab="sessions">Sessions</button>
         <button class="session-tab" data-tab="create">Create New</button>
         <button class="session-tab" data-tab="media">Media Files</button>
+        <button class="session-tab" data-tab="tts">TTS</button>
       </div>
 
       <!-- Sessions List -->
@@ -707,6 +708,138 @@
         </div>
         <div id="media-list" class="media-list" style="margin-top: 15px;">
           <!-- Media files will be listed here -->
+        </div>
+      </div>
+
+      <!-- Text-to-Speech (Voxtral-4B-TTS) -->
+      <div id="tts-content" class="session-content">
+        <div class="create-form">
+          <div class="form-group" style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="color:#a0a0a0;font-size:0.9em;">TTS engine status:</span>
+            <span id="tts-engine-badge"
+                  style="padding:3px 10px;border-radius:10px;font-size:0.8em;font-weight:500;background:#3a3a4a;color:#a0a0a0;">
+              unknown
+            </span>
+          </div>
+          <div class="form-group">
+            <label for="tts-text">Text</label>
+            <textarea id="tts-text" rows="6"
+                      placeholder="Enter the text to synthesize (long-form: split into sentences automatically)…"
+                      maxlength="20000"
+                      style="width:100%;padding:10px;border-radius:6px;border:1px solid #1f4068;background:#0f1825;color:#e0e0e0;font-family:inherit;font-size:14px;resize:vertical;"></textarea>
+            <div class="form-hint">
+              <span id="tts-char-count">0</span> / <span id="tts-char-max">20000</span> characters
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="tts-voice">Voice</label>
+            <select id="tts-voice" disabled>
+              <option value="">Loading voices…</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label>Output</label>
+            <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;">
+              <label style="display:flex;gap:6px;align-items:center;cursor:pointer;">
+                <input type="radio" name="tts-output-mode" value="play" checked>
+                Play in browser
+              </label>
+              <label style="display:flex;gap:6px;align-items:center;cursor:pointer;">
+                <input type="radio" name="tts-output-mode" value="save">
+                Save to server
+              </label>
+            </div>
+          </div>
+
+          <div class="form-group" id="tts-filename-group" style="display:none;">
+            <label for="tts-filename">Filename</label>
+            <input id="tts-filename" type="text" placeholder="auto-generated"
+                   pattern="[A-Za-z0-9._\-]+\.wav"
+                   style="width:100%;padding:8px;border-radius:6px;border:1px solid #1f4068;background:#0f1825;color:#e0e0e0;">
+            <div class="form-hint">
+              Saves to: <code id="tts-output-dir">…</code> &nbsp;·&nbsp;
+              <label style="display:inline-flex;gap:4px;align-items:center;font-size:0.85em;cursor:pointer;">
+                <input type="checkbox" id="tts-overwrite"> overwrite if exists
+              </label>
+            </div>
+          </div>
+
+          <div class="form-actions" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+            <button id="tts-generate-btn" class="action-btn" disabled>Generate</button>
+            <button id="tts-pause-btn" class="action-btn small" hidden>Pause</button>
+            <button id="tts-resume-btn" class="action-btn small" hidden>Resume</button>
+            <button id="tts-stop-btn" class="action-btn small danger" hidden>Stop</button>
+            <span id="tts-status" style="color:#a0a0a0;font-size:0.9em;"></span>
+          </div>
+
+          <div class="form-group">
+            <!-- Used only for save-mode playback (Phase 1) and as a visible
+                 progress hint for stream-mode playback (Phase 4). -->
+            <audio id="tts-audio" controls hidden style="width:100%;margin-top:10px;"></audio>
+          </div>
+
+          <div class="form-group" id="tts-saved-files-group" style="display:none;">
+            <label>Saved files</label>
+            <div id="tts-saved-files" class="media-list"></div>
+          </div>
+
+          <!-- Voice cloning (Phase 7) -->
+          <details id="tts-cloning" style="margin-top:20px;border-top:1px solid #1f4068;padding-top:15px;">
+            <summary style="cursor:pointer;color:#a0a0ff;user-select:none;">
+              Custom voices (zero-shot cloning)
+            </summary>
+            <div style="margin-top:10px;font-size:0.85em;color:#a0a0a0;">
+              Upload 5–30 s of clean audio plus its exact transcript. The TTS engine
+              re-loads in ~75 s the first time you use a custom voice (it has to
+              switch to <code>--task-type Base</code>).
+            </div>
+
+            <div class="form-group" style="margin-top:10px;">
+              <label for="tts-clone-name">Name</label>
+              <input id="tts-clone-name" type="text" maxlength="64"
+                     placeholder="e.g. Aunt Helen"
+                     style="width:100%;padding:8px;border-radius:6px;border:1px solid #1f4068;background:#0f1825;color:#e0e0e0;">
+            </div>
+
+            <div class="form-group">
+              <label for="tts-clone-text">Transcript (exactly what the audio says)</label>
+              <textarea id="tts-clone-text" rows="3" maxlength="1000"
+                        placeholder="The quick brown fox jumps over the lazy dog."
+                        style="width:100%;padding:8px;border-radius:6px;border:1px solid #1f4068;background:#0f1825;color:#e0e0e0;font-family:inherit;resize:vertical;"></textarea>
+            </div>
+
+            <div class="form-group">
+              <label for="tts-clone-file">Audio file</label>
+              <input id="tts-clone-file" type="file"
+                     accept="audio/wav,audio/mpeg,audio/flac,audio/ogg,audio/mp4">
+              <div class="form-hint" style="font-size:0.8em;">
+                WAV/MP3/FLAC/OGG/M4A · 5–30 s · max 5 MB
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer;font-weight:normal;">
+                <input id="tts-clone-permission" type="checkbox">
+                <span style="font-size:0.85em;line-height:1.4;">
+                  I confirm I have permission from the speaker to clone this voice.
+                  Voice cloning without consent may be illegal; I take responsibility
+                  for how this clone is used.
+                </span>
+              </label>
+            </div>
+
+            <div class="form-actions" style="display:flex;gap:10px;align-items:center;">
+              <button id="tts-clone-upload-btn" class="action-btn" disabled>Upload</button>
+              <span id="tts-clone-status" style="color:#a0a0a0;font-size:0.9em;"></span>
+            </div>
+
+            <div class="form-group" id="tts-clone-list-group" style="display:none;margin-top:15px;">
+              <label>Your custom voices</label>
+              <div id="tts-clone-list" class="media-list"></div>
+            </div>
+          </details>
         </div>
       </div>
     </section>

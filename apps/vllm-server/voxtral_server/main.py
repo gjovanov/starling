@@ -15,10 +15,24 @@ from .api.config_routes import router as config_router
 from .api.media_routes import router as media_router
 from .api.model_routes import router as model_router
 from .api.session_routes import router as session_router
+from .api.tts_routes import router as tts_router
 from .config import settings
 from .ws.handler import router as ws_router
 
 app = FastAPI(title="Voxtral Server", version="0.1.0")
+
+
+@app.on_event("shutdown")
+async def _stop_tts_subprocess() -> None:
+    """Best-effort: kill the on-demand TTS process (if running) when
+    voxtral-server itself shuts down. Keeps the GPU clean for the next
+    boot. Failures are logged but never block server shutdown."""
+    try:
+        from .tts.lifecycle import get_lifecycle
+
+        await get_lifecycle().ensure_stopped()
+    except Exception as exc:  # noqa: BLE001 — diagnostic only
+        print(f"[Server] WARN: failed to stop TTS subprocess: {exc}", file=sys.stderr)
 
 # CORS
 app.add_middleware(
@@ -39,6 +53,7 @@ app.include_router(config_router)
 app.include_router(model_router)
 app.include_router(media_router)
 app.include_router(session_router)
+app.include_router(tts_router)
 app.include_router(ws_router)
 
 # Serve frontend static files (must be last — catch-all)

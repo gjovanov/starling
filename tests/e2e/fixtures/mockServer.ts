@@ -48,13 +48,108 @@ export type SignalingEvent = {
   raw: any;
 };
 
+export type TtsOutputFile = {
+  name: string;
+  bytes: number;
+  created_at: number;
+};
+
+export type TtsStatus = {
+  state: 'idle' | 'starting' | 'ready' | 'stopping' | 'blocked';
+  pid?: number | null;
+  boot_started_at?: number | null;
+  boot_elapsed_secs?: number | null;
+  boot_timeout_secs?: number | null;
+  blocked_reason?: string | null;
+  inflight_synths?: number;
+};
+
+export type ClonedVoice = {
+  id: string;
+  name: string;
+  ref_text: string;
+  permission_confirmed: boolean;
+  sample_rate: number;
+  duration_secs: number;
+  created_at: number;
+  kind: 'cloned';
+};
+
 export type MockServer = {
   port: number;
   url: string;
   events: SignalingEvent[];
   sessions: SessionInfo[];
+  ttsRequests: any[];
+  ttsOutputs: TtsOutputFile[];
+  /** Mutable: tests can set this to drive the lifecycle badge through
+   * different states. Defaults to `{ state: 'ready' }`. */
+  ttsStatus: TtsStatus;
+  /** Voice clones uploaded during a test. Reset in beforeEach. */
+  clonedVoices: ClonedVoice[];
   close: () => Promise<void>;
 };
+
+const MOCK_VOICES = [
+  { id: 'casual_female',    display_name: 'Casual (Female)',    language: 'English',    language_code: 'en', gender: 'female' },
+  { id: 'casual_male',      display_name: 'Casual (Male)',      language: 'English',    language_code: 'en', gender: 'male' },
+  { id: 'cheerful_female',  display_name: 'Cheerful (Female)',  language: 'English',    language_code: 'en', gender: 'female' },
+  { id: 'neutral_female',   display_name: 'Neutral (Female)',   language: 'English',    language_code: 'en', gender: 'female' },
+  { id: 'neutral_male',     display_name: 'Neutral (Male)',     language: 'English',    language_code: 'en', gender: 'male' },
+  { id: 'de_female',        display_name: 'German (Female)',    language: 'German',     language_code: 'de', gender: 'female' },
+  { id: 'de_male',          display_name: 'German (Male)',      language: 'German',     language_code: 'de', gender: 'male' },
+  { id: 'fr_male',          display_name: 'French (Male)',      language: 'French',     language_code: 'fr', gender: 'male' },
+  { id: 'fr_female',        display_name: 'French (Female)',    language: 'French',     language_code: 'fr', gender: 'female' },
+  { id: 'es_male',          display_name: 'Spanish (Male)',     language: 'Spanish',    language_code: 'es', gender: 'male' },
+  { id: 'es_female',        display_name: 'Spanish (Female)',   language: 'Spanish',    language_code: 'es', gender: 'female' },
+];
+
+function stubWavBytes(): Buffer {
+  // Minimal 44-byte RIFF/WAVE/PCM header + 16 zero samples (stub).
+  const dataLen = 16;
+  const buf = Buffer.alloc(44 + dataLen);
+  buf.write('RIFF', 0);
+  buf.writeUInt32LE(36 + dataLen, 4);
+  buf.write('WAVE', 8);
+  buf.write('fmt ', 12);
+  buf.writeUInt32LE(16, 16);          // fmt chunk size
+  buf.writeUInt16LE(1, 20);           // PCM
+  buf.writeUInt16LE(1, 22);           // mono
+  buf.writeUInt32LE(24000, 24);       // sample rate
+  buf.writeUInt32LE(24000 * 2, 28);   // byte rate
+  buf.writeUInt16LE(2, 32);           // block align
+  buf.writeUInt16LE(16, 34);          // bits/sample
+  buf.write('data', 36);
+  buf.writeUInt32LE(dataLen, 40);
+  return buf;
+}
+
+/** Streaming-WAV header (44 bytes) with 0xFFFFFFFF size placeholders.
+ * Matches the real server's `voxtral_server/tts/wav.py::streaming_header`.
+ */
+function streamingWavHeader(): Buffer {
+  const buf = Buffer.alloc(44);
+  buf.write('RIFF', 0);
+  buf.writeUInt32LE(0xFFFFFFFF, 4);
+  buf.write('WAVE', 8);
+  buf.write('fmt ', 12);
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20);
+  buf.writeUInt16LE(1, 22);
+  buf.writeUInt32LE(24000, 24);
+  buf.writeUInt32LE(24000 * 2, 28);
+  buf.writeUInt16LE(2, 32);
+  buf.writeUInt16LE(16, 34);
+  buf.write('data', 36);
+  buf.writeUInt32LE(0xFFFFFFFF, 40);
+  return buf;
+}
+
+/** Build a Buffer containing `samples` mono int16 zero-samples (silence).
+ * Used by the streaming stub to emit several PCM bursts back-to-back. */
+function silentPcm(samples: number): Buffer {
+  return Buffer.alloc(samples * 2);
+}
 
 export async function startMockServer(
   frontendDir: string,
@@ -62,6 +157,10 @@ export async function startMockServer(
 ): Promise<MockServer> {
   const sessions: SessionInfo[] = [];
   const events: SignalingEvent[] = [];
+  const ttsRequests: any[] = [];
+  const ttsOutputs: TtsOutputFile[] = [];
+  const ttsStatus: TtsStatus = { state: 'ready' };
+  const clonedVoices: ClonedVoice[] = [];
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -187,6 +286,176 @@ export async function startMockServer(
         return;
       }
 
+      // ─── TTS routes ───────────────────────────────────────────────
+      if (req.method === 'GET' && pathname === '/api/tts/status') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          success: true,
+          data: { ...ttsStatus, autostart: true },
+        }));
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/api/tts/voices') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        const builtins = MOCK_VOICES.map(v => ({ ...v, kind: 'builtin' }));
+        res.end(JSON.stringify({
+          success: true,
+          data: [...builtins, ...clonedVoices],
+        }));
+        return;
+      }
+
+      if (req.method === 'POST' && pathname === '/api/tts/voices/upload') {
+        const fields = await readMultipartFields(req);
+        const permission = (fields.permission_confirmed ?? '') === 'true';
+        if (!permission) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            success: false,
+            error: 'permission_confirmed must be true',
+          }));
+          return;
+        }
+        const id = `mock${Date.now()}${Math.random().toString(36).slice(2, 8)}`.toLowerCase();
+        const voice: ClonedVoice = {
+          id,
+          name: fields.name ?? 'unnamed',
+          ref_text: fields.ref_text ?? '',
+          permission_confirmed: true,
+          sample_rate: 24000,
+          duration_secs: 6.0,
+          created_at: Date.now() / 1000,
+          kind: 'cloned',
+        };
+        clonedVoices.push(voice);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, data: voice }));
+        return;
+      }
+
+      if (req.method === 'DELETE' && /^\/api\/tts\/voices\/[^/]+$/.test(pathname)) {
+        const id = decodeURIComponent(pathname.slice('/api/tts/voices/'.length));
+        const idx = clonedVoices.findIndex(v => v.id === id);
+        if (idx >= 0) clonedVoices.splice(idx, 1);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          success: idx >= 0,
+          data: { deleted: id },
+          error: idx >= 0 ? null : 'voice ref not found',
+        }));
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/api/tts/config') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          success: true,
+          data: {
+            output_dir: '/tmp/tts_out_mock',
+            max_chars: 20000,
+            default_voice: 'casual_male',
+            sample_rate: 24000,
+            supported_formats: ['wav'],
+            long_max_secs: 300,
+          },
+        }));
+        return;
+      }
+
+      if (req.method === 'POST' && pathname === '/api/tts/synthesize') {
+        const body = await readJson(req);
+        ttsRequests.push(body);
+        // Basic server-side validation mirroring the real route, just enough
+        // for the negative-path E2E cases to assert error shapes.
+        if (!body.text || !body.text.trim()) {
+          if (body.save === false) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+          } else {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+          }
+          res.end(JSON.stringify({ success: false, error: 'text is empty' }));
+          return;
+        }
+        if (body.voice && !MOCK_VOICES.some(v => v.id === body.voice)) {
+          if (body.save === false) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+          } else {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+          }
+          res.end(JSON.stringify({ success: false, error: `unknown voice: '${body.voice}'` }));
+          return;
+        }
+
+        // Streaming branch — chunked audio/wav with 0xFFFFFFFF placeholder
+        // sizes, matching the real server's behaviour. We emit the header,
+        // then 3 small PCM chunks with a 25ms gap between them so the
+        // client-side player exercises buffer scheduling.
+        if (body.save === false) {
+          res.writeHead(200, {
+            'Content-Type': 'audio/wav',
+            'Cache-Control': 'no-store',
+            'Transfer-Encoding': 'chunked',
+          });
+          res.write(streamingWavHeader());
+          // 3 chunks × ~0.1 s of silence each (24 kHz mono) = 0.3 s total.
+          // Emit them with small gaps so the player sees real chunked I/O.
+          const chunk = silentPcm(2400);
+          (async () => {
+            for (let i = 0; i < 3; i++) {
+              res.write(chunk);
+              await new Promise(r => setTimeout(r, 25));
+            }
+            res.end();
+          })().catch(() => res.end());
+          return;
+        }
+
+        const filename = body.save_filename || `tts_${body.voice || 'casual_male'}_${Date.now()}.wav`;
+        ttsOutputs.push({
+          name: filename,
+          bytes: 12_345,
+          created_at: Date.now() / 1000,
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          success: true,
+          data: {
+            filename,
+            path: `/tmp/tts_out_mock/${filename}`,
+            bytes: 12_345,
+            voice: body.voice || 'casual_male',
+            sample_rate: 24000,
+            duration_secs: 0.5,
+            elapsed_secs: 0.05,
+          },
+        }));
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/api/tts/output') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, data: [...ttsOutputs] }));
+        return;
+      }
+
+      if (req.method === 'GET' && /^\/api\/tts\/output\/[^/]+$/.test(pathname)) {
+        // Serve a tiny valid WAV blob so <audio> can pretend to load it.
+        const wav = stubWavBytes();
+        res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': String(wav.length) });
+        res.end(wav);
+        return;
+      }
+
+      if (req.method === 'DELETE' && /^\/api\/tts\/output\/[^/]+$/.test(pathname)) {
+        const name = decodeURIComponent(pathname.slice('/api/tts/output/'.length));
+        const idx = ttsOutputs.findIndex(o => o.name === name);
+        if (idx >= 0) ttsOutputs.splice(idx, 1);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, data: { deleted: name } }));
+        return;
+      }
+
       // Serve the shared frontend statically
       const rel = pathname === '/' ? '/index.html' : pathname;
       const filePath = path.normalize(path.join(frontendDir, rel));
@@ -270,11 +539,41 @@ export async function startMockServer(
     url: `http://localhost:${port}`,
     events,
     sessions,
+    ttsRequests,
+    ttsOutputs,
+    ttsStatus,
+    clonedVoices,
     async close() {
       wss.close();
       await new Promise<void>(res => server.close(() => res()));
     },
   };
+}
+
+/** Tiny multipart parser: returns a flat object of name→last-string-value
+ * for fields, ignoring binary parts. Sufficient for our voice-clone tests
+ * where we don't need to re-derive the audio bytes. */
+async function readMultipartFields(req: http.IncomingMessage): Promise<Record<string, string>> {
+  const ct = req.headers['content-type'] ?? '';
+  const boundary = /boundary=(.+)$/.exec(ct)?.[1];
+  if (!boundary) return {};
+  const body: Buffer = await new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+  const text = body.toString('latin1');     // preserve binary boundaries
+  const parts = text.split(`--${boundary}`);
+  const fields: Record<string, string> = {};
+  for (const part of parts) {
+    const m = /Content-Disposition: form-data; name="([^"]+)"(?:; filename="([^"]+)")?\r\n(?:Content-Type:[^\r]*\r\n)?\r\n([\s\S]*?)\r\n$/.exec(part);
+    if (!m) continue;
+    const [, name, filename, value] = m;
+    if (filename) continue;          // skip the audio blob; we don't need it
+    fields[name] = value;
+  }
+  return fields;
 }
 
 function contentType(p: string): string {

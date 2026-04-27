@@ -5,8 +5,13 @@
 # Idempotent — safe to re-run; skips steps that are already done.
 #
 # Usage:
-#   ./init.sh              # Full setup (venv + vLLM + voxtral-server + model download)
+#   ./init.sh              # ASR-only setup (venv + vLLM + voxtral-server + BF16 model)
+#   ./init.sh --tts        # Also install vllm-omni + Voxtral-4B-TTS for the TTS tab
 #   ./init.sh --no-model   # Skip model download (if you already have it cached)
+#   ./init.sh --dry-run    # Print every install command without executing it (used by tests)
+#
+# Env-var equivalents:
+#   VOXTRAL_INSTALL_TTS=1  same as --tts
 #
 # Prerequisites:
 #   - Python 3.10+
@@ -25,21 +30,53 @@ MODEL_ID="mistralai/Voxtral-Mini-4B-Realtime-2602"
 
 # Parse args
 SKIP_MODEL=false
+DRY_RUN=false
+INSTALL_TTS="${VOXTRAL_INSTALL_TTS:-false}"
 for arg in "$@"; do
     case "$arg" in
         --no-model) SKIP_MODEL=true ;;
+        --tts)      INSTALL_TTS=true ;;
+        --dry-run)  DRY_RUN=true ;;
     esac
 done
+
+# Normalise the env-var form to a strict boolean
+case "$INSTALL_TTS" in
+    1|true|TRUE|yes|YES|y|Y) INSTALL_TTS=true ;;
+    *) INSTALL_TTS=false ;;
+esac
+
+# Step counts (we add one extra step when TTS is requested)
+TOTAL_STEPS=6
+[ "$INSTALL_TTS" = true ] && TOTAL_STEPS=7
+
+# `_run` is the canonical wrapper for any side-effecting command.
+# In dry-run mode it prints the command instead of executing it; otherwise
+# it evals it. Use `_run cmd args…` (NOT inside another quoted string).
+_run() {
+    if [ "$DRY_RUN" = true ]; then
+        printf "  [DRY-RUN] %s\n" "$*"
+    else
+        eval "$@"
+    fi
+}
 
 echo "========================================"
 echo "  Voxtral Server Initialization"
 echo "========================================"
+echo "  TTS support:  $INSTALL_TTS"
+echo "  Skip model:   $SKIP_MODEL"
+echo "  Dry-run:      $DRY_RUN"
 echo ""
 
 # ─── 1. Check prerequisites ─────────────────────────────────────────
 
 check_prerequisites() {
-    echo "[1/6] Checking prerequisites..."
+    echo "[1/${TOTAL_STEPS}] Checking prerequisites..."
+    if [ "$DRY_RUN" = true ]; then
+        echo "  [DRY-RUN] (skipping host-environment checks)"
+        return 0
+    fi
     local ok=true
 
     # Python
@@ -144,16 +181,22 @@ check_prerequisites() {
 # ─── 2. Create Python virtual environment ────────────────────────────
 
 setup_venv() {
+    if [ "$DRY_RUN" = true ]; then
+        echo "[2/${TOTAL_STEPS}] Create Python venv at $VENV_DIR (dry-run)"
+        echo "  [DRY-RUN] python3 -m venv $VENV_DIR"
+        return 0
+    fi
+
     if [ -f "$VENV_DIR/bin/activate" ]; then
-        echo "[2/6] Python venv already exists at $VENV_DIR"
+        echo "[2/${TOTAL_STEPS}] Python venv already exists at $VENV_DIR"
     else
         # Remove broken venv if it exists without activate
         if [ -d "$VENV_DIR" ]; then
-            echo "[2/6] Removing broken venv..."
+            echo "[2/${TOTAL_STEPS}] Removing broken venv..."
             rm -rf "$VENV_DIR"
         fi
 
-        echo "[2/6] Creating Python venv at $VENV_DIR..."
+        echo "[2/${TOTAL_STEPS}] Creating Python venv at $VENV_DIR..."
 
         # Try with ensurepip first, fall back to without + manual pip install
         if python3 -m venv "$VENV_DIR" 2>/dev/null; then
@@ -181,14 +224,14 @@ setup_venv() {
 
 install_pytorch() {
     # Check if torch is already installed with CUDA
-    if python -c "import torch; assert torch.cuda.is_available(), 'no CUDA'" 2>/dev/null; then
+    if [ "$DRY_RUN" = false ] && python -c "import torch; assert torch.cuda.is_available(), 'no CUDA'" 2>/dev/null; then
         local torch_ver
         torch_ver=$(python -c "import torch; print(torch.__version__)")
-        echo "[3/6] PyTorch $torch_ver with CUDA already installed"
+        echo "[3/${TOTAL_STEPS}] PyTorch $torch_ver with CUDA already installed"
         return 0
     fi
 
-    echo "[3/6] Installing PyTorch with CUDA support..."
+    echo "[3/${TOTAL_STEPS}] Installing PyTorch with CUDA support..."
 
     # Detect best CUDA version for torch
     # PyTorch supports cu118, cu121, cu124, cu126
@@ -205,65 +248,147 @@ install_pytorch() {
     fi
 
     echo "  Installing torch with $cuda_ver..."
-    pip install --quiet torch --index-url "https://download.pytorch.org/whl/${cuda_ver}"
+    _run pip install --quiet torch --index-url "https://download.pytorch.org/whl/${cuda_ver}"
 
-    # Verify
-    if python -c "import torch; assert torch.cuda.is_available(), 'no CUDA'" 2>/dev/null; then
-        local torch_ver
-        torch_ver=$(python -c "import torch; print(torch.__version__)")
-        echo "  [DONE] PyTorch $torch_ver with CUDA"
-    else
-        echo "  [WARN] PyTorch installed but CUDA not available. vLLM may not work."
+    # Verify (only when actually installed)
+    if [ "$DRY_RUN" = false ]; then
+        if python -c "import torch; assert torch.cuda.is_available(), 'no CUDA'" 2>/dev/null; then
+            local torch_ver
+            torch_ver=$(python -c "import torch; print(torch.__version__)")
+            echo "  [DONE] PyTorch $torch_ver with CUDA"
+        else
+            echo "  [WARN] PyTorch installed but CUDA not available. vLLM may not work."
+        fi
     fi
 }
 
 # ─── 4. Install vLLM ────────────────────────────────────────────────
 
 install_vllm() {
-    if python -c "import vllm; print(vllm.__version__)" 2>/dev/null; then
+    if [ "$DRY_RUN" = false ] && python -c "import vllm; print(vllm.__version__)" 2>/dev/null; then
         local vllm_ver
         vllm_ver=$(python -c "import vllm; print(vllm.__version__)")
-        echo "[4/6] vLLM $vllm_ver already installed"
+        echo "[4/${TOTAL_STEPS}] vLLM $vllm_ver already installed"
         return 0
     fi
 
-    echo "[4/6] Installing vLLM + mistral_common..."
-    pip install --quiet vllm "mistral_common[soundfile]>=1.9.0"
+    echo "[4/${TOTAL_STEPS}] Installing vLLM + mistral_common..."
+    _run pip install --quiet vllm 'mistral_common[soundfile]>=1.9.0'
 
-    local vllm_ver
-    vllm_ver=$(python -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo "unknown")
-    echo "  [DONE] vLLM $vllm_ver"
+    if [ "$DRY_RUN" = false ]; then
+        local vllm_ver
+        vllm_ver=$(python -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo "unknown")
+        echo "  [DONE] vLLM $vllm_ver"
+    fi
+}
+
+# ─── 5. (optional) Install vllm-omni for the TTS tab ──────────────────
+#
+# vllm-omni MUST be installed AFTER vllm. Order is enforced by the
+# install_vllm() step running first; this step asserts vllm is importable
+# before pulling in vllm-omni. Do NOT pass --upgrade here — it pulls
+# torch 2.11 which breaks vllm's compiled extensions (HF discussion #29).
+
+install_vllm_omni() {
+    if [ "$INSTALL_TTS" != true ]; then
+        # Not a numbered step when skipped — keeps slot 5 reserved for
+        # voxtral-server in the no-TTS flow.
+        echo "      vllm-omni: skipped (re-run with --tts to install)"
+        return 0
+    fi
+
+    if [ "$DRY_RUN" = false ] && python -c "import vllm_omni" 2>/dev/null; then
+        echo "[5/${TOTAL_STEPS}] vllm-omni already installed"
+        # Even when present, run the integrity check — torch may have been
+        # bumped by some unrelated install since.
+        _run_tts_integrity_check
+        return 0
+    fi
+
+    echo "[5/${TOTAL_STEPS}] Installing vllm-omni (TTS engine)..."
+    echo "  Note: pulls gradio + diffusers + librosa (~3 GB extra)."
+
+    # Pre-condition: vllm must already be present (otherwise vllm-omni's
+    # compiled extensions look up the wrong torch ABI and fail to load).
+    if [ "$DRY_RUN" = false ] && ! python -c "import vllm" 2>/dev/null; then
+        echo "  [FAIL] vllm is not importable — install_vllm() must run first"
+        exit 1
+    fi
+
+    # Capture torch version before the install so we can detect a bump.
+    local torch_before=""
+    if [ "$DRY_RUN" = false ]; then
+        torch_before=$(python -c "import torch; print(torch.__version__)" 2>/dev/null || echo "unknown")
+    fi
+
+    # IMPORTANT: do NOT pass --upgrade — see file header comment.
+    _run pip install --quiet vllm-omni
+
+    if [ "$DRY_RUN" = false ]; then
+        local torch_after
+        torch_after=$(python -c "import torch; print(torch.__version__)" 2>/dev/null || echo "unknown")
+        if [ "$torch_before" != "$torch_after" ]; then
+            echo "  [WARN] torch was changed during install: $torch_before → $torch_after"
+            echo "         Run scripts/check_tts_install.py manually to verify."
+        else
+            echo "  [OK] torch unchanged ($torch_after)"
+        fi
+        _run_tts_integrity_check
+        echo "  [DONE] vllm-omni installed"
+    fi
+}
+
+_run_tts_integrity_check() {
+    if [ -x "$SCRIPT_DIR/scripts/check_tts_install.py" ] || [ -f "$SCRIPT_DIR/scripts/check_tts_install.py" ]; then
+        python "$SCRIPT_DIR/scripts/check_tts_install.py" || {
+            echo "  [FAIL] vllm-omni integrity check failed (see above)"
+            exit 1
+        }
+    fi
 }
 
 # ─── 5. Install voxtral-server ──────────────────────────────────────
 
 install_voxtral_server() {
-    if python -c "import voxtral_server" 2>/dev/null; then
-        echo "[5/6] voxtral-server already installed"
+    # Step number: 5 when no TTS, 6 when TTS (since vllm-omni took slot 5).
+    local step=5
+    [ "$INSTALL_TTS" = true ] && step=6
+
+    if [ "$DRY_RUN" = false ] && python -c "import voxtral_server" 2>/dev/null; then
+        echo "[${step}/${TOTAL_STEPS}] voxtral-server already installed"
     else
-        echo "[5/6] Installing voxtral-server..."
+        echo "[${step}/${TOTAL_STEPS}] Installing voxtral-server..."
     fi
 
     # Always reinstall in editable mode (fast, picks up code changes)
-    pip install --quiet -e "$SCRIPT_DIR"
-    echo "  [DONE] voxtral-server installed"
+    _run pip install --quiet -e "$SCRIPT_DIR"
+    if [ "$DRY_RUN" = false ]; then
+        echo "  [DONE] voxtral-server installed"
+    fi
 }
 
 # ─── 6. Download model / Verify ─────────────────────────────────────
 
 download_model() {
+    # Step number: 6 when no TTS, 7 when TTS (vllm-omni in slot 5 pushed +1).
+    local step=6
+    [ "$INSTALL_TTS" = true ] && step=7
+
     if [ "$SKIP_MODEL" = true ]; then
-        echo "[6/6] Skipping model download (--no-model)"
+        echo "[${step}/${TOTAL_STEPS}] Skipping model download (--no-model)"
         return 0
     fi
 
-    echo "[6/6] Ensuring model is cached: $MODEL_ID"
+    echo "[${step}/${TOTAL_STEPS}] Ensuring model(s) are cached..."
 
     # Use shared model download script if available
     local download_script="$PROJECT_DIR/models/download.sh"
     if [ -x "$download_script" ]; then
         echo "  Using shared model downloader..."
-        "$download_script" --bf16-only
+        _run "$download_script" --bf16-only
+        if [ "$INSTALL_TTS" = true ]; then
+            _run "$download_script" --tts-only
+        fi
         return 0
     fi
 
@@ -307,6 +432,12 @@ print(f'  [DONE] Model cached at: {path}')
 }
 
 verify_setup() {
+    if [ "$DRY_RUN" = true ]; then
+        echo ""
+        echo "[DRY-RUN] Skipping verification (no files were actually installed)."
+        return 0
+    fi
+
     echo ""
     echo "========================================"
     echo "  Verification"
@@ -340,6 +471,16 @@ verify_setup() {
     else
         echo "  [FAIL] vLLM"
         ok=false
+    fi
+
+    # vllm-omni (only when --tts was selected)
+    if [ "$INSTALL_TTS" = true ]; then
+        if "$VENV_DIR/bin/python" -c "import vllm_omni" 2>/dev/null; then
+            echo "  [OK] vllm-omni (TTS engine)"
+        else
+            echo "  [FAIL] vllm-omni (--tts requested but import failed)"
+            ok=false
+        fi
     fi
 
     # voxtral-server
@@ -392,13 +533,18 @@ check_prerequisites
 setup_venv
 install_pytorch
 install_vllm
+install_vllm_omni
 install_voxtral_server
 download_model
 verify_setup
 
 echo ""
 echo "========================================"
-echo "  Initialization Complete!"
+if [ "$DRY_RUN" = true ]; then
+    echo "  Dry-run Complete (no changes)"
+else
+    echo "  Initialization Complete!"
+fi
 echo "========================================"
 echo ""
 echo "Next steps:"
@@ -406,11 +552,27 @@ echo ""
 echo "  1. Activate the venv:"
 echo "     source $VENV_DIR/bin/activate"
 echo ""
-echo "  2. Start vLLM (GPU server, separate terminal):"
+echo "  2. Start vLLM (ASR, separate terminal):"
 echo "     ./start-vllm.sh"
 echo ""
-echo "  3. Start voxtral-server (another terminal):"
-echo "     cd $SCRIPT_DIR && ./start.sh"
-echo ""
-echo "  4. Open http://localhost:8090 in your browser"
+if [ "$INSTALL_TTS" = true ]; then
+    echo "  3. (optional) Start vllm-omni (TTS, another terminal):"
+    echo "     ./start-vllm-tts.sh"
+    echo ""
+    echo "     NOTE: ASR + TTS cannot both fit on a 24 GiB GPU. See"
+    echo "     apps/vllm-server/docs/tts_spike.md for the coexistence"
+    echo "     finding and workarounds."
+    echo ""
+    echo "  4. Start voxtral-server (another terminal):"
+    echo "     cd $SCRIPT_DIR && ./start.sh"
+    echo ""
+    echo "  5. Open http://localhost:8090 in your browser"
+else
+    echo "  3. Start voxtral-server (another terminal):"
+    echo "     cd $SCRIPT_DIR && ./start.sh"
+    echo ""
+    echo "  4. Open http://localhost:8090 in your browser"
+    echo ""
+    echo "  Tip: re-run with --tts to enable the TTS tab (Voxtral-4B-TTS)."
+fi
 echo ""

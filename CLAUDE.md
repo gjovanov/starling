@@ -1,6 +1,6 @@
 # Starling
 
-Multi-app monorepo for real-time ASR powered by Voxtral-Mini-4B-Realtime.
+Multi-app monorepo for real-time **ASR** (Voxtral-Mini-4B-Realtime) and **TTS** (Voxtral-4B-TTS, vllm-server only).
 
 ## Monorepo Structure
 ```
@@ -22,23 +22,37 @@ starling/
 
 ## Apps
 
-### vllm-server (Python/FastAPI + vLLM)
-- **Port**: 8090 (server) + 8001 (vLLM GPU backend)
-- **Quantization**: BF16 only (~9 GB VRAM)
-- **Architecture**: FastAPI + aiortc (WebRTC) + websockets (vLLM client)
-- vLLM serves Voxtral via OpenAI Realtime API on port 8001
-- Starling proxies audio to vLLM via WebSocket, returns live subtitles
-- Frontend is a pure pass-through display
+### vllm-server (Python/FastAPI + vLLM, ASR + TTS)
+- **Ports**: 8090 (FastAPI), 8001 (ASR vLLM), 8002 (TTS vllm-omni — optional, lazy-spawned)
+- **Models**: Voxtral-Mini-4B-Realtime (ASR, BF16, ~9 GB VRAM), Voxtral-4B-TTS-2603 (TTS, BF16, ~12 GB VRAM)
+- **Architecture**: FastAPI + aiortc (WebRTC) + websockets (vLLM realtime client) + httpx (vllm-omni HTTP client)
+- ASR: vLLM serves Voxtral via OpenAI Realtime API on port 8001; Starling proxies audio over WebSocket and returns live subtitles.
+- TTS: vllm-omni serves Voxtral-4B-TTS via OpenAI-compatible HTTP on port 8002; Starling proxies `/api/tts/*` and wraps the upstream PCM stream with a streaming WAV header for browser playback.
+- **GPU coexistence: ASR + TTS DO NOT both fit on a 24 GiB GPU.** The TTS lifecycle (`voxtral_server/tts/lifecycle.py`) auto-spawns the TTS subprocess on first use and unloads after 10 min idle, so a single GPU can host both workflows at different times. Full math + workarounds in `apps/vllm-server/docs/tts_spike.md`.
 
 #### Setup & Run
+
 ```bash
 cd apps/vllm-server
-./init.sh           # Creates venv, installs vLLM + deps, downloads model
-./start-vllm.sh     # Terminal 1: vLLM GPU server (port 8001)
-./start.sh           # Terminal 2: Starling server (port 8090)
+
+# ASR-only (default — lighter venv, ~9 GB model)
+./init.sh                  # Creates venv, installs vLLM + deps, downloads ASR model
+./start-vllm.sh            # Terminal 1: ASR GPU server (port 8001)
+./start.sh                 # Terminal 2: FastAPI web server (port 8090)
+
+# ASR + TTS (adds vllm-omni + Voxtral-4B-TTS)
+./init.sh --tts            # Adds vllm-omni install + 8 GB TTS model download.
+                           # IMPORTANT: vllm MUST be installed before vllm-omni;
+                           # init.sh enforces the order. Never use --upgrade
+                           # (pulls torch 2.11 → breaks vllm).
+./start-vllm.sh            # Terminal 1: ASR (port 8001)
+./start.sh                 # Terminal 2: FastAPI (port 8090)
+                           # The TTS server (port 8002) auto-spawns on first
+                           # /api/tts/* request and unloads after 10 min idle.
+                           # Run ./start-vllm-tts.sh for manual control.
 ```
 
-#### Key Implementation Notes
+#### Key Implementation Notes (ASR)
 - vLLM requires `--enforce-eager` flag (torch.compile has FakeTensorMode bug)
 - vLLM requires `session.update` message before accepting audio (OpenAI Realtime API)
 - Background WebSocket reader task (not polling) to avoid dropping deltas
@@ -46,24 +60,86 @@ cd apps/vllm-server
 - Session runner waits for `client_ready` event before starting FFmpeg
 - CPU mode NOT viable: encoder takes 2-3s per second of audio on CPU
 - Context rotation every 200 commits (~100s) to prevent KV cache overflow
+- ASR vLLM is started with `--gpu-memory-utilization 0.45` and `--max-model-len 4096` (defaults, env-overridable). Lowered from the originals (`0.90` / `16384`) to leave room for TTS to coexist on a 24 GiB GPU. ASR sessions rotate context every ~100 s, so 4096 tokens is plenty.
+
+#### Key Implementation Notes (TTS)
+- TTS uses `vllm-omni`, a separate package from `vllm`. **Install order matters: `pip install vllm` BEFORE `pip install vllm-omni`.** Never use `--upgrade` (pulls torch 2.11 → breaks vllm). `./init.sh --tts` enforces both rules; `scripts/check_tts_install.py` verifies post-install integrity (vllm + vllm-omni + torch in `[2.8, 2.11)`).
+- TTS upstream is launched via `start-vllm-tts.sh` with these required flags:
+  ```
+  vllm-omni serve <tts-model-path> \
+    --omni \
+    --task-type CustomVoice \    # or Base for voice cloning
+    --tokenizer-mode mistral \
+    --config-format mistral \
+    --load-format mistral \
+    --stage-configs-path configs/voxtral_tts.yaml
+  ```
+  `--task-type` is set per-launch via `VOXTRAL_TTS_TASK_TYPE` env var (the lifecycle manager sets this when reloading for voice cloning). The Mistral flags are required because the TTS repo has no `config.json` (only `params.json`); the stage-configs YAML overrides vllm-omni's default `gpu_memory_utilization: 0.8` (which OOMs on 24 GiB GPUs).
+- vllm-omni 0.18 has TWO known quirks the route handles:
+  1. `response_format=wav` + `stream=true` asserts on missing sample-rate metadata in the first chunk → broken. Workaround: use `response_format=pcm`, prepend our own streaming WAV header (`voxtral_server/tts/wav.py`).
+  2. The HTTP chunked stream sometimes drops the terminal chunk → `httpx.RemoteProtocolError`. The client treats this as clean EOF if any audio bytes already landed (`voxtral_server/tts/client.py::synthesize_stream`).
+- Voice cloning requires the upstream to run with `--task-type Base`. Switching `CustomVoice` ↔ `Base` requires a full subprocess restart (~75 s on RTX 5090 Laptop). The lifecycle manager handles this transparently: `ensure_started(task_type='Base')` stops + restarts when needed.
+- Frontend playback uses the **Web Audio API**, not MSE — Chrome doesn't support `audio/wav` MSE. `frontend/js/modules/tts-player.js` schedules `AudioBufferSourceNode`s back-to-back for sample-accurate stitching. State machine: `idle → buffering → playing → paused/ended`. State exposed via `window.__ttsPlayerState` for Playwright assertions.
+- Long-form sentence splitter (`voxtral_server/tts/text.py`) handles `Dr.`, `19. November`, `3.14`, ellipses, German punctuation. Soft-splits anything over 1500 chars on the nearest comma. `tts_max_chars=20000` default.
+- Voice-cloning audit log at `voice_refs/_audit.log` records id/name/timestamp/permission flag — never the audio bytes or transcript. Permission checkbox is server-side enforced (a Playwright test bypasses the client gate to verify).
 
 #### vllm-server Structure
 ```
 apps/vllm-server/
+  init.sh                         # Setup — supports --tts, --no-model, --dry-run
+  start-vllm.sh                   # ASR launcher (port 8001, util 0.45 + mml 4096)
+  start-vllm-tts.sh               # TTS launcher (port 8002, --task-type from env)
+  start.sh                        # FastAPI launcher (port 8090)
+  configs/voxtral_tts.yaml        # vllm-omni stage-config override (stage-0 util 0.8 → 0.40,
+                                  # max_num_seqs 32 → 4, max_model_len 4096 → 1024)
+  scripts/
+    check_tts_install.py          # Verifies vllm + vllm-omni + torch in [2.8, 2.11)
+    spike_tts.py                  # Smoke test against the running TTS server
+  docs/tts_spike.md               # TTS Phase 0–7 memo (VRAM, decisions, deliverables)
   voxtral_server/
-    main.py                     # FastAPI app entry point
-    config.py                   # Settings (VOXTRAL_ prefix env vars)
-    models.py                   # Pydantic API models
-    state.py                    # AppState (sessions, broadcast)
-    api/                        # REST endpoints
-    ws/handler.py               # WebSocket + WebRTC signaling
+    main.py                       # FastAPI entry; on_event("shutdown") tears down TTS
+    config.py                     # Settings — adds tts_* knobs (Phase 1, 5, 6, 7)
+    models.py                     # Pydantic + TtsSynthesizeRequest with voice_ref_id
+    state.py                      # AppState (sessions, broadcast)
+    api/
+      session_routes.py           # ASR sessions
+      media_routes.py             # Media files
+      model_routes.py             # ASR models endpoint
+      config_routes.py            # /api/config
+      tts_routes.py               # GET /api/tts/voices|config|status|output[/{name}]
+                                  # POST /api/tts/synthesize (stream OR save)
+                                  # POST /api/tts/voices/upload (multipart)
+                                  # DELETE /api/tts/voices/{ref_id}
+    ws/handler.py                 # WebSocket + WebRTC signaling
+    tts/
+      voices.py                   # 20-voice canonical catalog (matches params.json)
+      client.py                   # TtsClient — synthesize, synthesize_stream,
+                                  # synthesize_stream_concat, upload_voice, delete_voice
+      storage.py                  # safe_join, sanitize_filename, write_wav, list_outputs
+      wav.py                      # streaming_header() — 44-byte RIFF/WAVE/PCM
+                                  # with 0xFFFFFFFF size placeholders
+      text.py                     # split_sentences() — handles Dr., 19. November, …
+      lifecycle.py                # Async state machine: idle → starting → ready → idle
+                                  # supports task_type switching (CustomVoice ↔ Base)
+      refs.py                     # save_ref, list_refs, get_ref, delete_ref + audit log
     transcription/
-      vllm_client.py            # vLLM /v1/realtime WebSocket client
-      session_runner.py         # FFmpeg + vLLM + subtitle orchestrator
+      vllm_client.py              # vLLM /v1/realtime WebSocket client (ASR)
+      session_runner.py           # FFmpeg + vLLM + subtitle orchestrator
     audio/
-      ffmpeg_source.py          # FFmpeg -> PCM 16kHz
-      webrtc_track.py           # aiortc AudioStreamTrack
-    media/manager.py            # Media file listing/upload
+      ffmpeg_source.py            # FFmpeg -> PCM 16kHz
+      webrtc_track.py             # aiortc AudioStreamTrack
+    media/manager.py              # Media file listing/upload
+  tests/
+    test_speakers_api.py          # WebRTC uplink path (system audio capture)
+    test_tts_api.py               # 30+ cases — voices, config, synth, save, stream,
+                                  # long-form, voice-clone upload/delete
+    test_tts_storage.py           # 30 cases — sanitizer + write/list/delete
+    test_tts_text.py              # 24 cases — sentence splitter
+    test_tts_wav.py               # 5 cases — streaming WAV header
+    test_tts_lifecycle.py         # 10 cases — state machine, idle unload, blocked-by-ASR
+    test_tts_install.py           # 4 cases — install verifier
+    test_tts_refs.py              # 25 cases — voice-ref storage + audit log
+    scripts/test_init_tts_flag.sh # Bash test — installer order + dry-run
 ```
 
 ### burn-server (Rust/Candle-Native + Burn)
