@@ -44,6 +44,15 @@ const HEADER_BYTES = 44;
 const TARGET_BUFFER_AHEAD_SECS = 0.3;   // before flipping to "playing"
 const STARVE_THRESHOLD_SECS = 0.05;     // schedule head this close to now → buffering
 
+// Aggregate incoming chunks into blocks of at least this many seconds before
+// scheduling them as one AudioBufferSourceNode. Reduces the number of source
+// boundaries (and hence the number of resampler-startup transients that
+// otherwise stack into a sub-bass amplitude tremolo perceived as "fading").
+//
+// The first chunk is always scheduled immediately so TTFB stays low; the
+// aggregation only applies to subsequent chunks.
+const AGGREGATE_TARGET_SECS = 0.5;
+
 export class TtsPlayer extends EventTarget {
   constructor({ onStateChange, playbackRate = 1.0 } = {}) {
     super();
@@ -69,6 +78,14 @@ export class TtsPlayer extends EventTarget {
     this._pcmTail = new Uint8Array(0);
     /** When the next AudioBufferSourceNode should start (in ctx.currentTime). */
     this._nextStartAt = 0;
+    /**
+     * Aggregation buffer: list of Float32Array fragments waiting to be
+     * scheduled as one AudioBufferSourceNode. Flushed once `_aggFrames`
+     * exceeds the target.
+     */
+    this._aggFragments = [];
+    this._aggFrames = 0;
+    this._firstChunkScheduled = false;
     /** Sources scheduled but not yet ended. We disconnect+null them on stop. */
     this._liveSources = new Set();
     this._sampleRate = 24000;
@@ -167,9 +184,11 @@ export class TtsPlayer extends EventTarget {
       const blockAlign = 2 * this._channels;
       if (this._pcmTail.length >= blockAlign) {
         const aligned = Math.floor(this._pcmTail.length / blockAlign) * blockAlign;
-        this._scheduleChunk(this._pcmTail.slice(0, aligned));
+        this._scheduleChunk(this._pcmTail.subarray(0, aligned));
         this._pcmTail = new Uint8Array(0);
       }
+      // Flush any aggregated samples that haven't reached the target yet.
+      this._flushAggregated();
 
       // Wait for the last scheduled source to finish, then transition to ended.
       await this._waitForDrain();
@@ -253,20 +272,75 @@ export class TtsPlayer extends EventTarget {
 
   _scheduleChunk(byteArray) {
     if (!this._ctx) return;
-    const ctx = this._ctx;
-
     // 16-bit signed little-endian → Float32 in [-1, 1].
     const sampleCount = Math.floor(byteArray.length / 2 / this._channels);
     if (sampleCount === 0) return;
-    const buffer = ctx.createBuffer(this._channels, sampleCount, this._sampleRate);
-    for (let ch = 0; ch < this._channels; ch++) {
-      const out = buffer.getChannelData(ch);
-      const view = new DataView(byteArray.buffer, byteArray.byteOffset, byteArray.byteLength);
-      const stride = 2 * this._channels;
-      for (let i = 0; i < sampleCount; i++) {
-        const offset = i * stride + ch * 2;
-        const s16 = view.getInt16(offset, true);
-        out[i] = s16 / 32768;
+    const samples = this._channels === 1
+      ? _decodeMonoInt16(byteArray, sampleCount)
+      : _decodeMultichannelInt16(byteArray, sampleCount, this._channels);
+
+    // First chunk always schedules immediately so the listener hears
+    // audio at TTFB, not after `AGGREGATE_TARGET_SECS` of buffering.
+    if (!this._firstChunkScheduled) {
+      this._firstChunkScheduled = true;
+      this._scheduleSamples(samples);
+      return;
+    }
+
+    // Aggregate into ~AGGREGATE_TARGET_SECS blocks. Fewer source-boundaries
+    // → fewer Web Audio resampler-startup transients to stack into a
+    // perceptible amplitude tremolo on long sentences.
+    this._aggFragments.push(samples);
+    this._aggFrames += sampleCount;
+    if (this._aggFrames >= this._sampleRate * AGGREGATE_TARGET_SECS) {
+      this._flushAggregated();
+    }
+  }
+
+  _flushAggregated() {
+    if (this._aggFrames === 0) return;
+    let combined;
+    if (this._channels === 1) {
+      combined = new Float32Array(this._aggFrames);
+      let offset = 0;
+      for (const f of this._aggFragments) {
+        combined.set(f, offset);
+        offset += f.length;
+      }
+    } else {
+      // Per-channel concatenation — each fragment is itself a list of
+      // per-channel Float32Arrays (see _decodeMultichannelInt16).
+      combined = new Array(this._channels);
+      for (let ch = 0; ch < this._channels; ch++) {
+        combined[ch] = new Float32Array(this._aggFrames);
+        let offset = 0;
+        for (const f of this._aggFragments) {
+          combined[ch].set(f[ch], offset);
+          offset += f[ch].length;
+        }
+      }
+    }
+    this._aggFragments = [];
+    this._aggFrames = 0;
+    this._scheduleSamples(combined);
+  }
+
+  /**
+   * Schedule a Float32Array (mono) or array-of-Float32Arrays (multichannel)
+   * as one AudioBufferSourceNode. The block can be any length; this is the
+   * step that actually creates a Web Audio source.
+   */
+  _scheduleSamples(samples) {
+    if (!this._ctx) return;
+    const ctx = this._ctx;
+    const length = this._channels === 1 ? samples.length : samples[0].length;
+    if (length === 0) return;
+    const buffer = ctx.createBuffer(this._channels, length, this._sampleRate);
+    if (this._channels === 1) {
+      buffer.copyToChannel(samples, 0);
+    } else {
+      for (let ch = 0; ch < this._channels; ch++) {
+        buffer.copyToChannel(samples[ch], ch);
       }
     }
 
@@ -368,6 +442,32 @@ function _concat(a, b) {
   const out = new Uint8Array(a.length + b.length);
   out.set(a, 0);
   out.set(b, a.length);
+  return out;
+}
+
+/** Decode a packed mono int16 LE byte buffer into a Float32Array in [-1, 1). */
+function _decodeMonoInt16(byteArray, sampleCount) {
+  const view = new DataView(byteArray.buffer, byteArray.byteOffset, byteArray.byteLength);
+  const out = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    out[i] = view.getInt16(i * 2, true) / 32768;
+  }
+  return out;
+}
+
+/** Decode an interleaved multichannel int16 LE byte buffer into one
+ * Float32Array per channel. Currently used only as a fallback — Voxtral
+ * outputs mono, so `_decodeMonoInt16` is the hot path. */
+function _decodeMultichannelInt16(byteArray, sampleCount, channels) {
+  const view = new DataView(byteArray.buffer, byteArray.byteOffset, byteArray.byteLength);
+  const stride = 2 * channels;
+  const out = new Array(channels);
+  for (let ch = 0; ch < channels; ch++) out[ch] = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    for (let ch = 0; ch < channels; ch++) {
+      out[ch][i] = view.getInt16(i * stride + ch * 2, true) / 32768;
+    }
+  }
   return out;
 }
 
