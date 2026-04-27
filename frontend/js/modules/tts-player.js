@@ -53,6 +53,19 @@ const STARVE_THRESHOLD_SECS = 0.05;     // schedule head this close to now → b
 // aggregation only applies to subsequent chunks.
 const AGGREGATE_TARGET_SECS = 0.5;
 
+// Per-block loudness normalisation. The Voxtral TTS model auto-normalises
+// per-sentence: a long sentence is dramatically quieter than a short one
+// (measured 30 dB difference between a 53-char sentence and a 335-char
+// sentence at ~5 s vs 18 s of audio). Without this normalisation, long
+// sentences sound distant. We measure RMS per aggregated block, target
+// `LOUDNESS_TARGET_RMS`, exponentially smooth the gain to avoid pumping at
+// block boundaries, and soft-clip in case a boosted peak would overshoot.
+const LOUDNESS_TARGET_RMS = 0.12;     // ~-18 dBFS — comfortable speech level
+const LOUDNESS_MAX_GAIN = 8.0;        // cap boost at ~+18 dB
+const LOUDNESS_SMOOTH = 0.45;         // weight on the new block's gain (lower = slower response)
+const LOUDNESS_SILENCE_RMS = 0.003;   // below this, treat as silence and don't change the smoothed gain
+const SOFT_CLIP_THRESHOLD = 0.97;     // start tanh-ing samples that would exceed this
+
 export class TtsPlayer extends EventTarget {
   constructor({ onStateChange, playbackRate = 1.0 } = {}) {
     super();
@@ -86,6 +99,8 @@ export class TtsPlayer extends EventTarget {
     this._aggFragments = [];
     this._aggFrames = 0;
     this._firstChunkScheduled = false;
+    /** Smoothed loudness-normalisation gain. 1.0 means "no change". */
+    this._smoothedGain = 1.0;
     /** Sources scheduled but not yet ended. We disconnect+null them on stop. */
     this._liveSources = new Set();
     this._sampleRate = 24000;
@@ -281,9 +296,11 @@ export class TtsPlayer extends EventTarget {
 
     // First chunk always schedules immediately so the listener hears
     // audio at TTFB, not after `AGGREGATE_TARGET_SECS` of buffering.
+    // Still goes through normalisation so the very first half-second
+    // matches the rest of the stream.
     if (!this._firstChunkScheduled) {
       this._firstChunkScheduled = true;
-      this._scheduleSamples(samples);
+      this._normalizeAndScheduleSamples(samples);
       return;
     }
 
@@ -322,7 +339,55 @@ export class TtsPlayer extends EventTarget {
     }
     this._aggFragments = [];
     this._aggFrames = 0;
-    this._scheduleSamples(combined);
+    this._normalizeAndScheduleSamples(combined);
+  }
+
+  /**
+   * Apply per-block loudness normalisation, then schedule. The Voxtral
+   * model produces wildly different absolute amplitudes for short vs long
+   * sentences (~30 dB delta in our measurements). Without this, long
+   * sentences sound distant.
+   */
+  _normalizeAndScheduleSamples(samples) {
+    if (!this._ctx) return;
+    const isMono = this._channels === 1;
+    const length = isMono ? samples.length : samples[0].length;
+    if (length === 0) return;
+
+    // Mean-square, averaged across channels for multichannel input.
+    let sumSq = 0;
+    if (isMono) {
+      const a = samples;
+      for (let i = 0; i < length; i++) sumSq += a[i] * a[i];
+    } else {
+      for (let ch = 0; ch < this._channels; ch++) {
+        const a = samples[ch];
+        for (let i = 0; i < length; i++) sumSq += a[i] * a[i];
+      }
+      sumSq /= this._channels;
+    }
+    const rms = Math.sqrt(sumSq / length);
+
+    // Skip silence so we don't boost background noise during pauses.
+    if (rms >= LOUDNESS_SILENCE_RMS) {
+      const target = Math.min(LOUDNESS_MAX_GAIN, LOUDNESS_TARGET_RMS / rms);
+      this._smoothedGain =
+        this._smoothedGain * (1 - LOUDNESS_SMOOTH) + target * LOUDNESS_SMOOTH;
+    }
+    const gain = this._smoothedGain;
+
+    // Apply gain in-place. Soft-clip with tanh-ish curve so any boosted
+    // peak that would exceed full-scale rolls off smoothly instead of
+    // hard-clipping to a square wave.
+    if (isMono) {
+      _applyGainSoftClip(samples, gain);
+    } else {
+      for (let ch = 0; ch < this._channels; ch++) {
+        _applyGainSoftClip(samples[ch], gain);
+      }
+    }
+
+    this._scheduleSamples(samples);
   }
 
   /**
@@ -469,6 +534,29 @@ function _decodeMultichannelInt16(byteArray, sampleCount, channels) {
     }
   }
   return out;
+}
+
+/** In-place: multiply each sample by `gain`, soft-clipping anything that
+ * would overshoot ±1.0 with a piecewise-linear-then-tanh curve.
+ *
+ *   |s| < threshold      → s * gain        (linear region)
+ *   threshold ≤ |s| ≤ 1  → tanh-shaped roll-off, asymptote at ±1.0
+ *
+ * Cheaper than full tanh on every sample because the linear branch is
+ * the common case once gain is settled.
+ */
+function _applyGainSoftClip(samples, gain) {
+  const t = SOFT_CLIP_THRESHOLD;
+  const oneMinusT = 1 - t;
+  for (let i = 0; i < samples.length; i++) {
+    let s = samples[i] * gain;
+    if (s > t) {
+      s = t + oneMinusT * Math.tanh((s - t) / oneMinusT);
+    } else if (s < -t) {
+      s = -t + oneMinusT * Math.tanh((s + t) / oneMinusT);
+    }
+    samples[i] = s;
+  }
 }
 
 /**
