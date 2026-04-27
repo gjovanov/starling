@@ -69,6 +69,10 @@ class _FakeTtsClient:
         for c in self.pcm_chunks:
             yield c
 
+    async def _model_id(self) -> str:
+        # Real client discovers via /v1/models; fake just returns a stub.
+        return "fake-model"
+
     async def synthesize_stream_concat(self, *, text_parts, voice, chunk_size=None):
         for part in text_parts:
             async for c in self.synthesize_stream(text=part, voice=voice, chunk_size=chunk_size):
@@ -690,3 +694,62 @@ async def test_delete_rejects_bad_filename(client) -> None:
     body = r.json()
     assert body["success"] is False
     assert "filename" in body["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Model-id discovery (fix for the relative-path 404)
+# ---------------------------------------------------------------------------
+
+import httpx as _httpx_mod
+from voxtral_server.tts.client import TtsClient
+
+
+class _MockTransport(_httpx_mod.AsyncBaseTransport):
+    """Tiny in-memory httpx transport for unit-testing the real TtsClient."""
+
+    def __init__(self, *, models_response: dict | None = None,
+                 audio_response: bytes = b"\x00" * 100,
+                 audio_status: int = 200) -> None:
+        self.models_response = models_response
+        self.audio_response = audio_response
+        self.audio_status = audio_status
+        self.synth_calls: list[dict] = []
+
+    async def handle_async_request(self, request: _httpx_mod.Request) -> _httpx_mod.Response:
+        path = request.url.path
+        if path.endswith("/models") and request.method == "GET":
+            if self.models_response is None:
+                return _httpx_mod.Response(500, text="upstream down")
+            return _httpx_mod.Response(200, json=self.models_response)
+        if path.endswith("/audio/speech") and request.method == "POST":
+            import json as _json
+            self.synth_calls.append(_json.loads(request.content))
+            return _httpx_mod.Response(self.audio_status, content=self.audio_response,
+                                       headers={"content-type": "audio/wav"})
+        return _httpx_mod.Response(404, text=f"unhandled: {request.method} {path}")
+
+
+async def test_client_discovers_model_id_from_upstream() -> None:
+    """The first synth call queries /v1/models and uses the returned id —
+    handles the relative-vs-absolute path mismatch the user hit."""
+    transport = _MockTransport(models_response={
+        "object": "list",
+        "data": [{"id": "/abs/path/to/tts", "object": "model"}],
+    })
+    client = TtsClient(base_url="http://localhost:8002/v1", model="./relative/path")
+    client._client = _httpx_mod.AsyncClient(transport=transport)
+
+    await client.synthesize(text="hi", voice="casual_male", response_format="wav")
+    assert client.cached_model_id == "/abs/path/to/tts"
+    assert transport.synth_calls[0]["model"] == "/abs/path/to/tts"
+
+
+async def test_client_falls_back_when_models_endpoint_unreachable() -> None:
+    """If /v1/models is broken, the client uses the configured fallback."""
+    transport = _MockTransport(models_response=None)  # 500
+    client = TtsClient(base_url="http://localhost:8002/v1", model="/configured/path")
+    client._client = _httpx_mod.AsyncClient(transport=transport)
+
+    await client.synthesize(text="hi", voice="casual_male", response_format="wav")
+    assert client.cached_model_id == "/configured/path"
+    assert transport.synth_calls[0]["model"] == "/configured/path"

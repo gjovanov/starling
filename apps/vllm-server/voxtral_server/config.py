@@ -42,8 +42,13 @@ class Settings(BaseSettings):
     # Path-suffix `/v1` is appended to match the OpenAI-compatible endpoint.
     tts_vllm_url: str = "http://127.0.0.1:8002/v1"
 
-    # Model "name" sent in the synth payload. vllm-omni accepts the on-disk
-    # path it was started with (matches what `GET /v1/models` returns).
+    # Fallback model id sent in the synth payload IF /v1/models discovery
+    # fails. vllm-omni registers its model under the exact (absolute) path
+    # it was launched with, which `TtsClient._model_id` discovers at runtime
+    # — so this string is only used when the upstream is unreachable AND a
+    # synth request is somehow being attempted anyway. Kept as a relative
+    # path here so the value matches `start-vllm-tts.sh`'s `MODELS_DIR/tts`
+    # default when the FastAPI is launched with cwd=apps/vllm-server.
     tts_model_path: str = "./../../models/cache/tts"
 
     # Output directory for save-to-disk synthesis. Created on demand.

@@ -55,7 +55,13 @@ class TtsClient:
         timeout_secs: float = 300.0,
     ) -> None:
         self._base_url = base_url.rstrip("/")
-        self._model = model
+        # Configured fallback. vllm-omni registers its model under the
+        # exact path it was launched with (typically the absolute path
+        # via start-vllm-tts.sh), so a relative path here would 404 on
+        # synth. We always discover the real id via /v1/models on first
+        # use; this remains the fallback if discovery fails.
+        self._model_fallback = model
+        self._cached_model_id: str | None = None
         self._timeout = timeout_secs
         self._client: httpx.AsyncClient | None = None
         self._lock = asyncio.Lock()
@@ -66,6 +72,35 @@ class TtsClient:
                 if self._client is None:
                     self._client = httpx.AsyncClient(timeout=self._timeout)
         return self._client
+
+    async def _model_id(self) -> str:
+        """Return the model id vllm-omni expects in synth payloads.
+
+        Lazily queries `/v1/models` once and caches the first id —
+        whatever path vllm-omni was started with (absolute by default
+        per start-vllm-tts.sh). Falls back to the configured value if
+        discovery fails.
+        """
+        if self._cached_model_id is not None:
+            return self._cached_model_id
+        try:
+            client = await self._ensure_client()
+            resp = await client.get(f"{self._base_url}/models", timeout=5.0)
+            if resp.status_code == 200:
+                payload = resp.json()
+                data = payload.get("data") or []
+                if data and isinstance(data, list) and data[0].get("id"):
+                    self._cached_model_id = data[0]["id"]
+                    return self._cached_model_id
+        except httpx.HTTPError:
+            pass
+        self._cached_model_id = self._model_fallback
+        return self._cached_model_id
+
+    @property
+    def cached_model_id(self) -> str | None:
+        """Test-only accessor — returns the cached id without I/O."""
+        return self._cached_model_id
 
     async def synthesize(
         self,
@@ -85,7 +120,7 @@ class TtsClient:
 
         client = await self._ensure_client()
         payload = {
-            "model": self._model,
+            "model": await self._model_id(),
             "input": text,
             "voice": voice,
             "response_format": response_format,
@@ -167,7 +202,7 @@ class TtsClient:
         """
         client = await self._ensure_client()
         payload = {
-            "model": self._model,
+            "model": await self._model_id(),
             "input": text,
             "voice": voice,
             "response_format": "pcm",
