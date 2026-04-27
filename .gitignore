@@ -30,6 +30,11 @@ models/cache/
 *.pt
 *.gguf
 
+# Exempt regression-test fixtures from the media/model exclusions above.
+# These are small (~10 MB total), versioned, and load-bearing for the
+# Rust port's bit-exact regression tests.
+!apps/burn-server/test_data/**
+
 # Logs
 *.log
 crash.log

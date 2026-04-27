@@ -1,0 +1,18 @@
+{
+  "name": "en_long_cheerful_female",
+  "voice": "cheerful_female",
+  "text": "When in the course of human events it becomes necessary for one people to dissolve the political bands which have connected them with another, and to assume among the powers of the earth the separate and equal station to which the laws of nature entitle them.",
+  "request_payload": {
+    "model": "/home/gjovanov/gjovanov/starling/models/cache/tts",
+    "input": "When in the course of human events it becomes necessary for one people to dissolve the political bands which have connected them with another, and to assume among the powers of the earth the separate and equal station to which the laws of nature entitle them.",
+    "voice": "cheerful_female",
+    "response_format": "wav"
+  },
+  "elapsed_seconds": 4.110828795004636,
+  "wav_bytes": 737324,
+  "sample_rate": 24000,
+  "samples": 368640,
+  "duration_seconds": 15.36,
+  "rms_dbfs": -35.74491715780452,
+  "peak": 0.12890625
+}

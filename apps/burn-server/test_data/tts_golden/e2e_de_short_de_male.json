@@ -1,0 +1,18 @@
+{
+  "name": "de_short_de_male",
+  "voice": "de_male",
+  "text": "Hallo, das ist ein Test.",
+  "request_payload": {
+    "model": "/home/gjovanov/gjovanov/starling/models/cache/tts",
+    "input": "Hallo, das ist ein Test.",
+    "voice": "de_male",
+    "response_format": "wav"
+  },
+  "elapsed_seconds": 0.7722035369952209,
+  "wav_bytes": 126764,
+  "sample_rate": 24000,
+  "samples": 63360,
+  "duration_seconds": 2.64,
+  "rms_dbfs": -26.461397522247726,
+  "peak": 0.578125
+}

@@ -1,0 +1,18 @@
+{
+  "name": "en_short_neutral_female",
+  "voice": "neutral_female",
+  "text": "Hello, this is a test.",
+  "request_payload": {
+    "model": "/home/gjovanov/gjovanov/starling/models/cache/tts",
+    "input": "Hello, this is a test.",
+    "voice": "neutral_female",
+    "response_format": "wav"
+  },
+  "elapsed_seconds": 0.7887573180487379,
+  "wav_bytes": 119084,
+  "sample_rate": 24000,
+  "samples": 59520,
+  "duration_seconds": 2.48,
+  "rms_dbfs": -28.108810493112003,
+  "peak": 0.373046875
+}

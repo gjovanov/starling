@@ -1,0 +1,18 @@
+{
+  "name": "fr_short_fr_female",
+  "voice": "fr_female",
+  "text": "Bonjour, ceci est un test.",
+  "request_payload": {
+    "model": "/home/gjovanov/gjovanov/starling/models/cache/tts",
+    "input": "Bonjour, ceci est un test.",
+    "voice": "fr_female",
+    "response_format": "wav"
+  },
+  "elapsed_seconds": 0.6704182910034433,
+  "wav_bytes": 107564,
+  "sample_rate": 24000,
+  "samples": 53760,
+  "duration_seconds": 2.24,
+  "rms_dbfs": -26.48433938117838,
+  "peak": 0.369140625
+}
