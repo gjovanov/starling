@@ -14,6 +14,50 @@
       margin-bottom: 20px;
     }
 
+    .top-tabs {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 18px;
+      padding-bottom: 14px;
+      border-bottom: 1px solid #1f4068;
+    }
+
+    .top-tab {
+      padding: 10px 22px;
+      background: transparent;
+      border: 1px solid #1f4068;
+      border-radius: 999px;
+      color: #a0a0a0;
+      cursor: pointer;
+      font-size: 0.95em;
+      font-weight: 500;
+      letter-spacing: 0.4px;
+      transition: all 0.2s;
+    }
+
+    .top-tab:hover {
+      background: #16213e;
+      color: white;
+    }
+
+    .top-tab.active {
+      background: #667eea;
+      border-color: #667eea;
+      color: white;
+    }
+
+    .top-tab[hidden] {
+      display: none;
+    }
+
+    .top-pane {
+      display: none;
+    }
+
+    .top-pane.active {
+      display: block;
+    }
+
     .session-tabs {
       display: flex;
       gap: 10px;
@@ -390,11 +434,17 @@
 
     <!-- Session Management Panel -->
     <section id="session-panel">
+      <div class="top-tabs" role="tablist" aria-label="Mode">
+        <button class="top-tab active" data-top="stt" role="tab" aria-selected="true">STT</button>
+        <button class="top-tab" data-top="tts" role="tab" aria-selected="false">TTS</button>
+      </div>
+
+      <!-- STT pane: sessions, create, media -->
+      <div id="stt-pane" class="top-pane active" role="tabpanel" aria-labelledby="stt-tab">
       <div class="session-tabs">
         <button class="session-tab active" data-tab="sessions">Sessions</button>
         <button class="session-tab" data-tab="create">Create New</button>
         <button class="session-tab" data-tab="media">Media Files</button>
-        <button class="session-tab" data-tab="tts">TTS</button>
       </div>
 
       <!-- Sessions List -->
@@ -710,9 +760,12 @@
           <!-- Media files will be listed here -->
         </div>
       </div>
+      </div><!-- /#stt-pane -->
 
+      <!-- TTS pane -->
+      <div id="tts-pane" class="top-pane" role="tabpanel" aria-labelledby="tts-tab">
       <!-- Text-to-Speech (Voxtral-4B-TTS) -->
-      <div id="tts-content" class="session-content">
+      <div id="tts-content" class="session-content active">
         <div class="create-form">
           <div class="form-group" style="display:flex;justify-content:space-between;align-items:center;">
             <span style="color:#a0a0a0;font-size:0.9em;">TTS engine status:</span>
@@ -866,6 +919,7 @@
           </details>
         </div>
       </div>
+      </div><!-- /#tts-pane -->
     </section>
 
     <!-- Hidden audio element for WebRTC stream -->

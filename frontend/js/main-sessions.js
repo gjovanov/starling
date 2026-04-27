@@ -112,11 +112,15 @@ async function init() {
   }
 
   // Initialize the TTS tab. Failures here must NOT block the rest of the
-  // app — the TTS server is optional and may not be running.
+  // app — the TTS server is optional and may not be running. When the
+  // backend has no /api/tts/voices route (e.g. burn-server pre-Phase-2),
+  // we hide the TTS top-tab entirely and pin the user on STT.
   try {
     await setupTtsTab();
+    setTtsAvailable(true);
   } catch (err) {
     console.warn('TTS tab init failed (server may be down):', err);
+    setTtsAvailable(false);
   }
 
   console.log('Multi-session application initialized');
@@ -148,6 +152,8 @@ function cacheElements() {
   elements.modelSelectGroup = document.getElementById('model-select-group');
 
   // Session panel elements
+  elements.topTabs = document.querySelectorAll('.top-tab');
+  elements.topPanes = document.querySelectorAll('.top-pane');
   elements.sessionTabs = document.querySelectorAll('.session-tab');
   elements.sessionContents = document.querySelectorAll('.session-content');
   elements.sessionsList = document.getElementById('sessions-list');
@@ -252,6 +258,9 @@ function setupSessionManagerListeners() {
 }
 
 function setupEventListeners() {
+  // Top-tier tab switching (STT / TTS)
+  setupTopTabs();
+
   // Tab switching
   elements.sessionTabs.forEach(tab => {
     tab.addEventListener('click', () => {
@@ -1137,6 +1146,52 @@ function showTab(tabName) {
   elements.sessionContents.forEach(content => {
     content.classList.toggle('active', content.id === `${tabName}-content`);
   });
+}
+
+const TOP_TAB_STORAGE_KEY = 'starling.activeTopTab';
+
+function setupTopTabs() {
+  if (!elements.topTabs || elements.topTabs.length === 0) return;
+  elements.topTabs.forEach(tab => {
+    tab.addEventListener('click', () => setTopTab(tab.dataset.top));
+  });
+  let stored = null;
+  try {
+    stored = localStorage.getItem(TOP_TAB_STORAGE_KEY);
+  } catch {
+    // Some browsers refuse storage in private mode; safe to ignore.
+  }
+  if (stored === 'stt' || stored === 'tts') {
+    setTopTab(stored, { persist: false });
+  }
+}
+
+function setTopTab(name, { persist = true } = {}) {
+  if (name !== 'stt' && name !== 'tts') return;
+  if (!elements.topTabs) return;
+  const targetTab = Array.from(elements.topTabs).find(t => t.dataset.top === name);
+  if (targetTab && targetTab.hidden) return;
+  elements.topTabs.forEach(tab => {
+    const active = tab.dataset.top === name;
+    tab.classList.toggle('active', active);
+    tab.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
+  elements.topPanes.forEach(pane => {
+    pane.classList.toggle('active', pane.id === `${name}-pane`);
+  });
+  if (persist) {
+    try { localStorage.setItem(TOP_TAB_STORAGE_KEY, name); } catch {}
+  }
+}
+
+function setTtsAvailable(available) {
+  if (!elements.topTabs) return;
+  const ttsTab = Array.from(elements.topTabs).find(t => t.dataset.top === 'tts');
+  if (!ttsTab) return;
+  ttsTab.hidden = !available;
+  if (!available) {
+    setTopTab('stt', { persist: false });
+  }
 }
 
 // Language display names for the dropdown

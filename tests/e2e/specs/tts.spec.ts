@@ -32,7 +32,7 @@ test.beforeEach(() => {
 async function gotoTtsTab(page: Page) {
   await page.goto(mock.url);
   await expect(page.locator('#session-panel')).toBeVisible();
-  await page.click('.session-tab[data-tab="tts"]');
+  await page.click('.top-tab[data-top="tts"]');
   await expect(page.locator('#tts-content')).toBeVisible();
   // Wait until voices are populated (Generate becomes enabled)
   await expect(page.locator('#tts-generate-btn')).toBeEnabled();
@@ -42,7 +42,7 @@ test('TTS tab is present and reveals its content', async ({ page }) => {
   await page.goto(mock.url);
   await expect(page.locator('#session-panel')).toBeVisible();
 
-  const ttsTab = page.locator('.session-tab[data-tab="tts"]');
+  const ttsTab = page.locator('.top-tab[data-top="tts"]');
   await expect(ttsTab).toBeVisible();
   await expect(ttsTab).toHaveText('TTS');
 
@@ -196,9 +196,9 @@ test('Play mode does NOT add anything to the saved-files list', async ({ page })
   await expect(page.locator('#tts-saved-files-group')).toBeHidden();
 });
 
-test('Switching back to Sessions hides TTS content', async ({ page }) => {
+test('Switching back to STT hides TTS content', async ({ page }) => {
   await gotoTtsTab(page);
-  await page.click('.session-tab[data-tab="sessions"]');
+  await page.click('.top-tab[data-top="stt"]');
   await expect(page.locator('#tts-content')).toBeHidden();
   await expect(page.locator('#sessions-content')).toBeVisible();
 });
