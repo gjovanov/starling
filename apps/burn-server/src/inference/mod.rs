@@ -11,6 +11,8 @@ pub mod candle_native_flash;
 pub mod candle_cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda_engine;
+#[cfg(feature = "voxtral-tts")]
+pub mod voxtral_tts;
 pub mod engine;
 pub mod q4;
 pub mod tokenizer;

@@ -17,6 +17,11 @@ path = "src/main.rs"
 name = "benchmark"
 path = "src/bin/benchmark.rs"
 
+[[bin]]
+name = "dump-tts-weights"
+path = "src/bin/dump_tts_weights.rs"
+required-features = ["voxtral-tts"]
+
 [dependencies]
 # ML framework
 burn = { version = "0.20", features = ["wgpu", "default", "template"] }
@@ -87,6 +92,9 @@ candle-native = ["dep:candle-core-native", "dep:candle-nn-native"]
 candle-native-flash = ["dep:candle-core", "dep:candle-nn", "dep:candle-flash-attn"]
 candle-cpu = ["dep:candle-core-cpu", "dep:candle-nn-cpu"]
 candle-cpu-ggml = ["candle-cpu", "dep:ggml-matmul"]
+# Native Rust/Candle Voxtral-4B-TTS port (Phase 2 — scaffolding only;
+# weight-loader + key-presence validation, no forward pass yet).
+voxtral-tts = []
 
 # [patch.crates-io] moved to workspace root Cargo.toml
 
