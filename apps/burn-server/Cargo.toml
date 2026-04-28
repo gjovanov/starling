@@ -92,9 +92,12 @@ candle-native = ["dep:candle-core-native", "dep:candle-nn-native"]
 candle-native-flash = ["dep:candle-core", "dep:candle-nn", "dep:candle-flash-attn"]
 candle-cpu = ["dep:candle-core-cpu", "dep:candle-nn-cpu"]
 candle-cpu-ggml = ["candle-cpu", "dep:ggml-matmul"]
-# Native Rust/Candle Voxtral-4B-TTS port (Phase 2 — scaffolding only;
-# weight-loader + key-presence validation, no forward pass yet).
-voxtral-tts = []
+# Native Rust/Candle Voxtral-4B-TTS port. Pulls in candle 0.10 (matching
+# `candle-native-flash`) for the flow-matching velocity field and the
+# acoustic transformer. The codec decoder + AR LLM bring more deps in
+# later phases; for now this gate covers Phase 2-B (weight inventory)
+# + Phase 2-C (flow-matching forward pass).
+voxtral-tts = ["dep:candle-core", "dep:candle-nn"]
 
 # [patch.crates-io] moved to workspace root Cargo.toml
 
