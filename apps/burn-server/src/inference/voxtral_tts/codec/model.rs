@@ -8,6 +8,7 @@
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
+use std::collections::BTreeMap;
 
 use super::args::AudioTokenizerArgs;
 use super::conv::{CausalConv1d, CausalConvTranspose1d, PadMode};
@@ -184,5 +185,65 @@ impl VoxtralTTSAudioTokenizer {
         let h = h.transpose(1, 2)?.contiguous()?; // [B, c, T', h]
         let out = h.reshape((b, channels, t_out * h_per_c))?;
         Ok(out)
+    }
+
+    /// Diagnostic variant of [`Self::decode`] that captures the boundary
+    /// tensors named exactly as in the
+    /// `apps/burn-server/test_data/tts_golden/codec_*.safetensors`
+    /// fixtures, for per-block regression testing:
+    ///
+    /// - `quantizer_emb` `[B, 292, T]`
+    /// - `decoder_block_NN_out` per block `0..n_blocks`. Layout matches
+    ///   the upstream forward-hook capture: BDT for conv-style blocks,
+    ///   BTD for transformer blocks.
+    /// - `output_proj_pre_rearrange` `[B, 240, T_after_upsamples]`.
+    ///
+    /// Returns `(intermediates_map, final_pcm)`.
+    pub fn decode_with_intermediates(
+        &self,
+        codes: &Tensor,
+        dtype: DType,
+    ) -> Result<(BTreeMap<String, Tensor>, Tensor)> {
+        let mut store: BTreeMap<String, Tensor> = BTreeMap::new();
+
+        let emb = self.quantizer.decode(codes, dtype)?;
+        store.insert("quantizer_emb".to_string(), emb.clone());
+
+        let mut h = emb.transpose(1, 2)?.contiguous()?; // BTD
+        for (idx, block) in self.blocks.iter().enumerate() {
+            let key = format!("decoder_block_{idx:02}_out");
+            h = match block {
+                DecoderBlock::InputConv(c) => {
+                    let h_dt = h.transpose(1, 2)?.contiguous()?;
+                    let out = c.forward(&h_dt)?; // BDT
+                    store.insert(key, out.clone());
+                    out.transpose(1, 2)?.contiguous()?
+                }
+                DecoderBlock::Upsample(c) => {
+                    let h_dt = h.transpose(1, 2)?.contiguous()?;
+                    let out = c.forward(&h_dt)?; // BDT
+                    store.insert(key, out.clone());
+                    out.transpose(1, 2)?.contiguous()?
+                }
+                DecoderBlock::Transformer(t) => {
+                    let out = t.forward(&h)?; // BTD
+                    store.insert(key, out.clone());
+                    out
+                }
+            };
+        }
+
+        let h_dt = h.transpose(1, 2)?.contiguous()?; // BDT for output_proj
+        let proj = self.output_proj.forward(&h_dt)?; // [B, 240, T']
+        store.insert("output_proj_pre_rearrange".to_string(), proj.clone());
+
+        let (b, p, t_out) = proj.dims3()?;
+        let channels = self.args.channels;
+        let h_per_c = p / channels;
+        let h = proj.transpose(1, 2)?.contiguous()?;
+        let h = h.reshape((b, t_out, channels, h_per_c))?;
+        let h = h.transpose(1, 2)?.contiguous()?;
+        let pcm = h.reshape((b, channels, t_out * h_per_c))?;
+        Ok((store, pcm))
     }
 }
