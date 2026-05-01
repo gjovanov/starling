@@ -21,11 +21,17 @@
 //! ground truth.
 
 pub mod ar_llm;
+pub mod autoregressor;
 pub mod codec;
 pub mod flow_matching;
+pub mod pipeline;
+pub mod voice;
 pub mod weights;
 
 pub use ar_llm::ArLlmArgs;
+pub use autoregressor::TtsAutoregressor;
 pub use codec::AudioTokenizerArgs;
 pub use flow_matching::{AcousticTransformerArgs, MultimodalAudioModelArgs};
+pub use pipeline::TtsPipeline;
+pub use voice::{default_voice_dir, VoiceEmbedding};
 pub use weights::{ExpectedGroup, ModuleGroup, WeightInventory, EXPECTED_GROUPS, EXPECTED_TOTAL};
