@@ -20,8 +20,10 @@
 //! `project_voxtral_tts_model_inventory` memory note for tensor-level
 //! ground truth.
 
+pub mod codec;
 pub mod flow_matching;
 pub mod weights;
 
+pub use codec::AudioTokenizerArgs;
 pub use flow_matching::{AcousticTransformerArgs, MultimodalAudioModelArgs};
 pub use weights::{ExpectedGroup, ModuleGroup, WeightInventory, EXPECTED_GROUPS, EXPECTED_TOTAL};
