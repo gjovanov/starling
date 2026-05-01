@@ -26,7 +26,9 @@
 //! tensors are all present. No forward pass yet — that's Phase 2-F.2.
 
 pub mod args;
+pub mod forward;
 pub mod model;
 
 pub use args::ArLlmArgs;
+pub use forward::{ArLlmKvCache, LayerKvCache, RopeCache};
 pub use model::{ArLlmAttention, ArLlmBlock, ArLlmFeedForward, ArLlmModel};
