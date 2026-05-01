@@ -1,6 +1,8 @@
 # Starling
 
-Multi-app monorepo for real-time **ASR** (Voxtral-Mini-4B-Realtime) and **TTS** (Voxtral-4B-TTS, vllm-server only).
+Multi-app monorepo for real-time **ASR** (Voxtral-Mini-4B-Realtime) and **TTS** (Voxtral-4B-TTS-2603). TTS runs on **both** apps:
+- **vllm-server**: Python/vllm-omni reference implementation (production-stable, full HTTP API + chat-template integration).
+- **burn-server**: Native Rust/Candle port (Phase 2 — end-to-end pipeline shipped 2026-05-02). FMA + codec architecture validated bit-exact against upstream; AR LLM forward pass validated on real 4B-param weights. Pre-tokenized HTTP API at `/api/tts/synthesize-codes`. Tokenizer/chat-template integration is the gating follow-up.
 
 ## Monorepo Structure
 ```
@@ -369,13 +371,75 @@ apps/burn-server/
       ws.rs                              # WebSocket + WebRTC signaling
       state.rs                           # AppState, sessions
     web/                                 # WebRTC utilities
-  Cargo.toml                             # Features: candle-native, candle-native-flash, candle-cpu, candle-cpu-ggml, cuda, candle
+  Cargo.toml                             # Features: candle-native, candle-native-flash, candle-cpu, candle-cpu-ggml, cuda, candle, voxtral-tts
 libs/
   ggml-matmul/                           # FFI wrapper for ggml's AVX-512 Q4 matmul
     csrc/ggml_matmul_wrapper.c           # C wrapper using ggml graph compute API
     src/lib.rs                           # Rust FFI bindings
     build.rs                             # Links pre-built llama.cpp ggml static libs
 ```
+
+#### Native Rust Voxtral-4B-TTS port (`voxtral-tts` feature)
+
+Phase 2 (2026-04-26 → 2026-05-02): full Voxtral-4B-TTS-2603 port from
+the upstream `vllm-omni` Python reference to native Rust + candle 0.10.
+End-to-end pipeline runs on the real 4B-param checkpoint.
+
+**Build:**
+```bash
+cd apps/burn-server
+cargo build --release --features voxtral-tts            # production
+cargo test  --release --features voxtral-tts --lib voxtral_tts::
+cargo run   --release --features voxtral-tts --bin dump-tts-weights
+```
+
+**Code layout** (`apps/burn-server/src/inference/voxtral_tts/`):
+```
+weights.rs            # Inventory + safetensors validator (386 tensors)
+voice.rs              # Voice embedding loader (.safetensors, 20 voices)
+flow_matching/
+  args.rs / model.rs / golden_tests.rs
+                      # FMA velocity field — F32 BIT-EXACT vs upstream
+codec/
+  args.rs / conv.rs / attention.rs / transformer.rs / quantizer.rs
+  model.rs / golden_tests.rs
+                      # 8-block decoder — single-frame BIT-EXACT through
+                      # every block; multi-frame matches within bf16
+                      # autocast precision
+ar_llm/
+  args.rs / model.rs / forward.rs / embed.rs
+                      # 26-layer GQA + interleaved RoPE + KV cache;
+                      # tied embeddings; voice-prefix injection;
+                      # multi-codebook step-input embedding
+autoregressor.rs      # AR LLM ↔ FMA loop with END_AUDIO halt
+pipeline.rs           # TtsPipeline::load + ::synthesize end-to-end
+```
+
+**HTTP routes** (gated on `voxtral-tts` feature, served on burn-server's port 8091):
+- `GET  /api/tts/voices`         → list 20 voices + on-disk availability
+- `GET  /api/tts/config`         → 24 kHz, 12.5 fps, 1920 samples/frame, 37 codebooks
+- `GET  /api/tts/status`         → lifecycle snapshot (loaded + uptime)
+- `POST /api/tts/synthesize-codes` → pre-tokenized synthesis (returns 24 kHz mono WAV)
+
+**Golden references** (committed under `apps/burn-server/test_data/tts_golden/`):
+- 6 FMA fixtures (3 inputs × 2 dtypes) — synthetic `llm_hidden` → audio_codes
+- 6 codec fixtures — synthetic codes → 24 kHz PCM with per-block intermediates
+- 6 e2e WAV/JSON pairs — real text → audio via the running vllm-omni HTTP API
+- Capture scripts under `apps/vllm-server/scripts/dump_tts_*.py`
+- `convert_npz_to_safetensors.py` produces parallel `.safetensors` (Rust loads via existing safetensors crate; no `npy` dep)
+- `convert_voice_embeddings_to_safetensors.py` parallels each `voice_embedding/*.pt` with a `.safetensors`
+
+**What's deferred** (each tractable in 1-2 days):
+1. Mistral tokenizer + chat template → text input on `/api/tts/synthesize`. Largest single piece.
+2. Frontend wiring → port 8091 detection + tab activation. Gated on (1).
+3. Bit-exact e2e WAV match → replay upstream's `torch.randn` per generation step.
+4. Idle-unload + voice-clone (`--task-type Base`) parity with vllm-server's lifecycle.
+
+**Architecture notes** (re-derive from `project_voxtral_tts_model_inventory` memory):
+- 386 BF16 tensors across 4 modules: AR LLM (234), audio_tokenizer/codec (116), acoustic_transformer/FMA (33), mm_audio_embeddings (2), final norm (1).
+- AR LLM = ASR-Mini decoder shape minus ADA (no audio-feature conditioning); reuses 90% of `candle_native_flash` patterns. RoPE θ=1M (interleaved), GQA 32h/8kv, dim=3072, hidden=9216, vocab=131072, tied embeddings.
+- FMA: 3 layers, RoPE θ=10k (unused — bidirectional over a 3-token window of `[x, t_emb, llm_hidden]`), 8-step Euler integration with CFG α=1.2.
+- Codec: weight-norm parametrised convs + ALiBi/qk_norm/layer-scale transformer blocks; sliding window 16→32→64→128 doubling per ×2 upsample.
 
 #### Q4 Padding Workaround
 The upstream left-pads audio with 32 silence tokens. After mel/conv/reshape, this covers only 16 of 38 decoder prefix positions. BF16 handles this fine, but Q4_0 makes the decoder sensitive to speech content in the prefix. Left padding is increased to 76 tokens → exactly 38 decoder positions of silence, covering the full streaming prefix.

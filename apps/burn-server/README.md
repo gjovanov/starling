@@ -1,11 +1,12 @@
 # Burn Server
 
-Real-time ASR server powered by [Voxtral-Mini-4B-Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602) using the [Burn](https://burn.dev/) ML framework with WebGPU/Vulkan/Metal backend.
+Real-time **ASR + TTS** server. ASR is [Voxtral-Mini-4B-Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602) running on the [Burn](https://burn.dev/) ML framework with WebGPU/Vulkan/Metal backend; TTS is a native Rust/[candle](https://github.com/huggingface/candle) port of [Voxtral-4B-TTS-2603](https://huggingface.co/mistralai/Voxtral-4B-TTS-2603).
 
 Unlike vllm-server, burn-server runs the model directly in the same process (no separate model server). Supports both Q4 quantized inference (~700 MB VRAM) and full BF16 (~9 GB VRAM). Can also run entirely in the browser via WASM + WebGPU.
 
 ## Features
 
+### ASR
 - **CPU streaming (candle-cpu-ggml)**: Q4 GGUF + ggml AVX-512, **1.68× realtime** on AMD Ryzen 9 9955HX3D with correct German transcription. Periodic KV cache resets (vllm-style) for stable long-audio processing.
 - **GPU BF16 (candle-native-flash)**: FlashAttention v2, ~0.3× realtime on RTX 5090, highest accuracy
 - **Q4 GPU inference**: Fused dequant+matmul WGSL shaders, ~700 MB VRAM
@@ -13,6 +14,13 @@ Unlike vllm-server, burn-server runs the model directly in the same process (no 
 - **Same API contract**: Drop-in replacement for vllm-server (shared frontend works with both)
 - **Single process**: No separate model server needed
 - **13 languages**: Same Voxtral-Mini-4B language support
+
+### TTS (`voxtral-tts` Cargo feature, shipped 2026-05-02)
+- **Native Rust port** of Voxtral-4B-TTS-2603. End-to-end pipeline: 26-layer AR LLM → flow-matching velocity field → 8-block codec → 24 kHz PCM. F32 bit-exact match against the upstream Python reference for the FMA and codec single-frame paths; multi-frame within bf16-autocast drift bounds.
+- **20 voices** loaded from `models/cache/tts/voice_embedding/<name>.safetensors` (variable row counts, 67–218).
+- **HTTP routes** (port 8091): `GET /api/tts/voices`, `GET /api/tts/config`, `GET /api/tts/status`, `POST /api/tts/synthesize-codes`. The synthesis route accepts pre-tokenized prompt IDs today; mistral tokenizer + chat-template integration is the gating follow-up.
+- **Lazy lifecycle**: `TtsPipeline` loads on first `/api/tts/*` hit and holds for the process lifetime. ~32 s to load the 8 GB checkpoint on CPU + first-frame generation; subsequent frames stream.
+- **Test data**: 21 golden-reference fixtures committed under `test_data/tts_golden/`; capture scripts in `../vllm-server/scripts/dump_tts_*.py`.
 
 ## Requirements
 
