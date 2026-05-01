@@ -32,9 +32,20 @@
 //!   `ffn_scale` parameter vectors multiply each residual branch.
 
 pub mod args;
+pub mod attention;
 pub mod conv;
+pub mod model;
+pub mod quantizer;
+pub mod transformer;
+
+#[cfg(test)]
+mod golden_tests;
 
 pub use args::AudioTokenizerArgs;
+pub use attention::{alibi_slopes, CodecAttention};
 pub use conv::{
     materialize_weight_norm, pad1d_reflect, CausalConv1d, CausalConvTranspose1d, PadMode,
 };
+pub use model::VoxtralTTSAudioTokenizer;
+pub use quantizer::{AcousticCodebook, MistralAudioCodebook, SemanticCodebook};
+pub use transformer::{CodecFeedForward, CodecTransformer, CodecTransformerBlock};
