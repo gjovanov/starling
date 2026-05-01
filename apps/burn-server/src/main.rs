@@ -209,7 +209,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(server::routes::start_session),
         )
         // WebSocket
-        .route("/ws/:session_id", get(server::ws::ws_handler))
+        .route("/ws/:session_id", get(server::ws::ws_handler));
+
+    // TTS routes (gated on the voxtral-tts Cargo feature)
+    #[cfg(feature = "voxtral-tts")]
+    let app = app
+        .route("/api/tts/voices", get(server::tts_routes::list_voices))
+        .route("/api/tts/config", get(server::tts_routes::get_tts_config))
+        .route("/api/tts/status", get(server::tts_routes::get_tts_status))
+        .route(
+            "/api/tts/synthesize-codes",
+            post(server::tts_routes::synthesize_codes),
+        );
+
+    let app = app
         // Static frontend (models served via symlink: frontend/models → ../models/cache)
         .fallback_service(ServeDir::new(&frontend_path))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)) // 2GB upload

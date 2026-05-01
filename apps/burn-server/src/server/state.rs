@@ -94,6 +94,12 @@ pub struct AppState {
     pub client_count: AtomicU64,
     /// Shared inference engine (Q4 or BF16, loaded at startup)
     pub engine: Option<Arc<dyn InferenceEngine>>,
+    /// Lazy-loaded TTS pipeline. Initialised on the first
+    /// `/api/tts/*` HTTP call. Always present even when the
+    /// `voxtral-tts` Cargo feature isn't enabled — the routes that
+    /// need it are gated separately.
+    #[cfg(feature = "voxtral-tts")]
+    pub tts: Arc<crate::server::tts_routes::TtsLifecycleState>,
 }
 
 impl AppState {
@@ -105,6 +111,8 @@ impl AppState {
             clients: Mutex::new(HashMap::new()),
             client_count: AtomicU64::new(0),
             engine: None,
+            #[cfg(feature = "voxtral-tts")]
+            tts: Arc::new(crate::server::tts_routes::TtsLifecycleState::new()),
         }
     }
 
