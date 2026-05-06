@@ -1,15 +1,26 @@
-//! TTS HTTP routes for burn-server. Phase 2-G + 2-H.
+//! TTS HTTP routes for burn-server. Phase 2-G + 2-H + 2-I.
+//!
+//! Contract: shape-compatible with `apps/vllm-server/voxtral_server/
+//! api/tts_routes.py` so the shared frontend works against either
+//! backend without branching. Cloning paths are accepted but stubbed
+//! with 501 — burn-server doesn't yet implement the
+//! `--task-type Base` upstream variant.
 //!
 //! Exposes:
-//! - `GET  /api/tts/voices`: list the 20 shipped voices (filename-derived).
-//! - `GET  /api/tts/config`: return Voxtral-4B-TTS knobs (frame rate, etc.).
+//! - `GET  /api/tts/voices`: catalog (id, display_name, language,
+//!   language_code, gender, kind="builtin"). Cloned voices not yet.
+//! - `GET  /api/tts/config`: output_dir, max_chars, default_voice,
+//!   sample_rate, supported_formats, long_max_secs, plus burn extras.
 //! - `GET  /api/tts/status`: pipeline lifecycle snapshot for the badge.
-//! - `POST /api/tts/synthesize`: text-input synthesis. Tokenizes via the
-//!   embedded Tekken BPE + Voxtral-TTS chat template (Phase 2-H), runs
-//!   the AR LLM ↔ FMA ↔ codec pipeline, returns 24 kHz mono WAV.
-//! - `POST /api/tts/synthesize-codes`: pre-tokenized escape hatch. The
-//!   client supplies prompt token-IDs + voice + a noise stream and gets
-//!   24 kHz mono WAV back. Useful for upstream-fixture replays and tests.
+//! - `POST /api/tts/synthesize`: text→speech. `save=true` writes to
+//!   `tts_output_dir` and returns JSON metadata; `save=false` returns
+//!   the WAV directly. `voice_ref_id` → 501.
+//! - `POST /api/tts/synthesize-codes`: pre-tokenized escape hatch.
+//! - `GET  /api/tts/output`: list saved WAVs.
+//! - `GET  /api/tts/output/{name}`: download a saved WAV.
+//! - `DELETE /api/tts/output/{name}`: remove a saved WAV.
+//! - `POST /api/tts/voices/upload`: 501 (cloning not implemented).
+//! - `DELETE /api/tts/voices/{ref_id}`: 501.
 //!
 //! Pipeline lifecycle: load lazily on the first /api/tts/* call, then
 //! hold for the process lifetime (no idle-unload yet — that's the
@@ -21,7 +32,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::State,
+    extract::{Path as PathParam, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -136,78 +147,107 @@ const AUDIO_TOKEN_ID: u32 = 24;
 
 // ── Voice catalog ───────────────────────────────────────────────────
 
-/// Canonical voice list (matches the upstream `voice` map in
-/// `params.json` and the file-system layout under
-/// `models/cache/tts/voice_embedding/`).
-pub const CANONICAL_VOICES: &[(&str, &str)] = &[
-    ("ar_male", "ar"),
-    ("casual_female", "en"),
-    ("casual_male", "en"),
-    ("cheerful_female", "en"),
-    ("de_female", "de"),
-    ("de_male", "de"),
-    ("es_female", "es"),
-    ("es_male", "es"),
-    ("fr_female", "fr"),
-    ("fr_male", "fr"),
-    ("hi_female", "hi"),
-    ("hi_male", "hi"),
-    ("it_female", "it"),
-    ("it_male", "it"),
-    ("neutral_female", "en"),
-    ("neutral_male", "en"),
-    ("nl_female", "nl"),
-    ("nl_male", "nl"),
-    ("pt_female", "pt"),
-    ("pt_male", "pt"),
+/// Canonical voice catalog. Mirrors `apps/vllm-server/voxtral_server/
+/// tts/voices.py::VOICES` so the burn-server's `/api/tts/voices`
+/// response is shape-compatible with the frontend's expectations.
+struct CanonicalVoice {
+    id: &'static str,
+    display_name: &'static str,
+    language: &'static str,
+    language_code: &'static str,
+    gender: &'static str,
+}
+
+const CANONICAL_VOICES: &[CanonicalVoice] = &[
+    CanonicalVoice { id: "casual_female",   display_name: "Casual (Female)",     language: "English",    language_code: "en", gender: "female" },
+    CanonicalVoice { id: "casual_male",     display_name: "Casual (Male)",       language: "English",    language_code: "en", gender: "male"   },
+    CanonicalVoice { id: "cheerful_female", display_name: "Cheerful (Female)",   language: "English",    language_code: "en", gender: "female" },
+    CanonicalVoice { id: "neutral_female",  display_name: "Neutral (Female)",    language: "English",    language_code: "en", gender: "female" },
+    CanonicalVoice { id: "neutral_male",    display_name: "Neutral (Male)",      language: "English",    language_code: "en", gender: "male"   },
+    CanonicalVoice { id: "de_female",       display_name: "German (Female)",     language: "German",     language_code: "de", gender: "female" },
+    CanonicalVoice { id: "de_male",         display_name: "German (Male)",       language: "German",     language_code: "de", gender: "male"   },
+    CanonicalVoice { id: "es_female",       display_name: "Spanish (Female)",    language: "Spanish",    language_code: "es", gender: "female" },
+    CanonicalVoice { id: "es_male",         display_name: "Spanish (Male)",      language: "Spanish",    language_code: "es", gender: "male"   },
+    CanonicalVoice { id: "fr_female",       display_name: "French (Female)",     language: "French",     language_code: "fr", gender: "female" },
+    CanonicalVoice { id: "fr_male",         display_name: "French (Male)",       language: "French",     language_code: "fr", gender: "male"   },
+    CanonicalVoice { id: "it_female",       display_name: "Italian (Female)",    language: "Italian",    language_code: "it", gender: "female" },
+    CanonicalVoice { id: "it_male",         display_name: "Italian (Male)",      language: "Italian",    language_code: "it", gender: "male"   },
+    CanonicalVoice { id: "nl_female",       display_name: "Dutch (Female)",      language: "Dutch",      language_code: "nl", gender: "female" },
+    CanonicalVoice { id: "nl_male",         display_name: "Dutch (Male)",        language: "Dutch",      language_code: "nl", gender: "male"   },
+    CanonicalVoice { id: "pt_female",       display_name: "Portuguese (Female)", language: "Portuguese", language_code: "pt", gender: "female" },
+    CanonicalVoice { id: "pt_male",         display_name: "Portuguese (Male)",   language: "Portuguese", language_code: "pt", gender: "male"   },
+    CanonicalVoice { id: "ar_male",         display_name: "Arabic (Male)",       language: "Arabic",     language_code: "ar", gender: "male"   },
+    CanonicalVoice { id: "hi_female",       display_name: "Hindi (Female)",      language: "Hindi",      language_code: "hi", gender: "female" },
+    CanonicalVoice { id: "hi_male",         display_name: "Hindi (Male)",        language: "Hindi",      language_code: "hi", gender: "male"   },
 ];
+
+const DEFAULT_VOICE: &str = "casual_male";
+const TTS_MAX_CHARS: usize = 20_000;
+const TTS_LONG_MAX_SECS: u64 = 180;
+
+fn is_known_voice(voice_id: &str) -> bool {
+    CANONICAL_VOICES.iter().any(|v| v.id == voice_id)
+}
 
 #[derive(Serialize)]
 pub struct VoiceEntry {
     pub id: String,
+    pub display_name: String,
     pub language: String,
-    pub available: bool,
+    pub language_code: String,
+    pub gender: String,
+    pub kind: &'static str,
 }
 
-#[derive(Serialize)]
-pub struct VoicesResponse {
-    pub voices: Vec<VoiceEntry>,
-    pub voice_dir: String,
-}
-
-pub async fn list_voices(State(state): State<Arc<AppState>>) -> Response {
-    let voice_dir = state.config.models_dir.join("tts").join("voice_embedding");
+pub async fn list_voices(State(_state): State<Arc<AppState>>) -> Response {
+    // Frontend expects a flat list (the voice catalog is a separate
+    // "data" array, not nested inside `{voices: [...]}`).
     let voices: Vec<VoiceEntry> = CANONICAL_VOICES
         .iter()
-        .map(|(id, lang)| VoiceEntry {
-            id: (*id).to_string(),
-            language: (*lang).to_string(),
-            available: voice_dir.join(format!("{id}.safetensors")).exists(),
+        .map(|v| VoiceEntry {
+            id: v.id.to_string(),
+            display_name: v.display_name.to_string(),
+            language: v.language.to_string(),
+            language_code: v.language_code.to_string(),
+            gender: v.gender.to_string(),
+            kind: "builtin",
         })
         .collect();
-    let resp = VoicesResponse {
-        voices,
-        voice_dir: voice_dir.display().to_string(),
-    };
-    ApiResponse::ok(resp).into_response()
+    // (No cloned voices yet on burn-server — Phase 2-J.)
+    ApiResponse::ok(voices).into_response()
 }
 
 // ── Config ──────────────────────────────────────────────────────────
 
+/// Frontend-facing TTS configuration. Field names match
+/// `apps/vllm-server/voxtral_server/models.py::TtsConfig` so the
+/// shared frontend reads burn-server and vllm-server identically. The
+/// burn-specific Voxtral knobs (`frame_rate`, `samples_per_frame`,
+/// `num_codebooks`, `audio_token_id`) are kept for tooling/diagnostics.
 #[derive(Serialize)]
 pub struct TtsConfig {
-    pub sampling_rate: u32,
+    pub output_dir: String,
+    pub max_chars: usize,
+    pub default_voice: String,
+    pub sample_rate: u32,
+    pub supported_formats: Vec<String>,
+    pub long_max_secs: u64,
+    // Burn-specific extras (no equivalent in vllm-server). Kept for
+    // diagnostic/probing purposes; the frontend ignores them.
     pub frame_rate: f32,
     pub samples_per_frame: u32,
     pub num_codebooks: u32,
     pub audio_token_id: u32,
 }
 
-pub async fn get_tts_config(State(_state): State<Arc<AppState>>) -> Response {
-    // Constants from Voxtral-4B-TTS-2603. Static — no need to load
-    // the pipeline.
+pub async fn get_tts_config(State(state): State<Arc<AppState>>) -> Response {
     let cfg = TtsConfig {
-        sampling_rate: 24000,
+        output_dir: state.config.tts_output_dir.display().to_string(),
+        max_chars: TTS_MAX_CHARS,
+        default_voice: DEFAULT_VOICE.to_string(),
+        sample_rate: 24000,
+        supported_formats: vec!["wav".to_string()],
+        long_max_secs: TTS_LONG_MAX_SECS,
         frame_rate: 12.5,
         samples_per_frame: 1920,
         num_codebooks: 37,
@@ -406,7 +446,7 @@ pub async fn synthesize_codes(
     if req.max_frames == 0 || req.max_frames > 1000 {
         return error_response("max_frames must be in [1, 1000]").into_response();
     }
-    if !CANONICAL_VOICES.iter().any(|(id, _)| *id == req.voice) {
+    if !is_known_voice(&req.voice) {
         return error_response(&format!("unknown voice {:?}", req.voice)).into_response();
     }
     match synthesize_to_wav(&state, req.prompt_ids, &req.voice, req.max_frames, req.seed).await {
@@ -415,19 +455,58 @@ pub async fn synthesize_codes(
     }
 }
 
-// ── Synthesize (text input — Phase 2-H) ─────────────────────────────
+// ── Synthesize (text input — Phase 2-H + 2-I) ───────────────────────
+//
+// Request shape mirrors `apps/vllm-server/voxtral_server/models.py::
+// TtsSynthesizeRequest` so the shared frontend works against either
+// backend without branching. The `max_frames`/`seed` knobs are
+// burn-server-specific extras the frontend doesn't send; they default
+// safely.
 
 #[derive(Deserialize)]
 pub struct SynthesizeRequest {
     /// UTF-8 text to synthesize. Tokenized via the embedded Tekken BPE
     /// + Voxtral-TTS chat template (Phase 2-H).
     pub text: String,
-    /// One of [`CANONICAL_VOICES`].
+    /// One of [`CANONICAL_VOICES`]. Empty defaults to [`DEFAULT_VOICE`].
+    #[serde(default)]
     pub voice: String,
+    /// Voice cloning reference id — burn-server does not yet support
+    /// the `--task-type Base` upstream variant. Returns 501 when set.
+    #[serde(default)]
+    pub voice_ref_id: Option<String>,
+    /// Persist the result under `Config::tts_output_dir` and return
+    /// `TtsSynthesizeResponse` JSON. Defaults to `true` for parity
+    /// with vllm-server.
+    #[serde(default = "default_save")]
+    pub save: bool,
+    /// Optional filename (must end in .wav, sanitized).
+    #[serde(default)]
+    pub save_filename: Option<String>,
+    /// Allow replacing an existing file with the same name.
+    #[serde(default)]
+    pub overwrite: bool,
+    /// Burn-specific safety bound on AR generation (frames). Default 250.
     #[serde(default = "default_max_frames")]
     pub max_frames: u32,
+    /// Burn-specific RNG seed for the FMA noise stream. Default 42.
     #[serde(default = "default_seed")]
     pub seed: u64,
+}
+
+fn default_save() -> bool {
+    true
+}
+
+#[derive(Serialize)]
+pub struct TtsSynthesizeResponse {
+    pub filename: String,
+    pub path: String,
+    pub bytes: usize,
+    pub voice: String,
+    pub sample_rate: u32,
+    pub duration_secs: Option<f64>,
+    pub elapsed_secs: f64,
 }
 
 pub async fn synthesize(
@@ -435,19 +514,43 @@ pub async fn synthesize(
     Json(req): Json<SynthesizeRequest>,
 ) -> Response {
     if req.text.trim().is_empty() {
-        return error_response("text must not be empty").into_response();
+        return error_response("text is empty").into_response();
+    }
+    if req.text.len() > TTS_MAX_CHARS {
+        return error_response(&format!(
+            "text exceeds max length ({} > {})",
+            req.text.len(),
+            TTS_MAX_CHARS
+        ))
+        .into_response();
     }
     if req.max_frames == 0 || req.max_frames > 1000 {
         return error_response("max_frames must be in [1, 1000]").into_response();
     }
-    if !CANONICAL_VOICES.iter().any(|(id, _)| *id == req.voice) {
-        return error_response(&format!("unknown voice {:?}", req.voice)).into_response();
+
+    if req.voice_ref_id.is_some() {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(crate::server::routes::ApiResponse::<()> {
+                success: false,
+                data: None,
+                error: Some(
+                    "voice cloning (voice_ref_id) is not supported on burn-server yet"
+                        .to_string(),
+                ),
+            }),
+        )
+            .into_response();
+    }
+    let voice_id = if req.voice.is_empty() {
+        DEFAULT_VOICE.to_string()
+    } else {
+        req.voice.clone()
+    };
+    if !is_known_voice(&voice_id) {
+        return error_response(&format!("unknown voice {voice_id:?}")).into_response();
     }
 
-    // Lazy-load tokenizer + voice. Voice is loaded twice (once here for
-    // n_rows, once inside synthesize_to_wav for the actual tensor) —
-    // safetensors mmap makes the second load nearly free, and keeping
-    // the helper signature voice-id-only avoids a leaky parameter.
     let tk = match state
         .tts
         .get_or_load_tokenizer(&state.config.models_dir)
@@ -460,9 +563,7 @@ pub async fn synthesize(
     let voice_dir = state.config.models_dir.join("tts").join("voice_embedding");
     let voice_n_rows = match crate::inference::voxtral_tts::VoiceEmbedding::load_from_dir(
         &voice_dir,
-        &req.voice,
-        // Use any nonzero dim — VoiceEmbedding rejects shape mismatches
-        // but we only need n_rows here, so pass the canonical 3072.
+        &voice_id,
         3072,
         &Device::Cpu,
         DType::F32,
@@ -485,10 +586,123 @@ pub async fn synthesize(
         }
     };
 
-    match synthesize_to_wav(&state, prompt_ids, &req.voice, req.max_frames, req.seed).await {
-        Ok(r) => wav_response(r),
-        Err(e) => error_response(&e).into_response(),
+    let synth = match synthesize_to_wav(&state, prompt_ids, &voice_id, req.max_frames, req.seed)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return error_response(&e).into_response(),
+    };
+
+    if !req.save {
+        return wav_response(synth);
     }
+
+    // ── Save-to-disk branch ─────────────────────────────────────────
+    let out_dir = &state.config.tts_output_dir;
+    if let Err(e) = std::fs::create_dir_all(out_dir) {
+        return error_response(&format!("could not create output dir: {e}"))
+            .into_response();
+    }
+    let filename = match req.save_filename.as_deref() {
+        Some(name) if !name.is_empty() => match sanitize_filename(name) {
+            Ok(n) => n,
+            Err(e) => return error_response(&e).into_response(),
+        },
+        _ => auto_filename(&voice_id),
+    };
+    let target = match safe_join(out_dir, &filename) {
+        Ok(p) => p,
+        Err(e) => return error_response(&e).into_response(),
+    };
+    if target.exists() && !req.overwrite {
+        return error_response(&format!(
+            "file already exists: {} (pass overwrite=true to replace)",
+            filename
+        ))
+        .into_response();
+    }
+    let bytes_written = match std::fs::write(&target, &synth.wav) {
+        Ok(()) => synth.wav.len(),
+        Err(e) => return error_response(&format!("could not write file: {e}")).into_response(),
+    };
+
+    let elapsed_secs = synth
+        .meta
+        .get("elapsed_secs")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let n_samples = synth
+        .meta
+        .get("samples")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let duration_secs = if n_samples > 0 {
+        Some(n_samples as f64 / 24000.0)
+    } else {
+        None
+    };
+
+    ApiResponse::ok(TtsSynthesizeResponse {
+        filename,
+        path: target.display().to_string(),
+        bytes: bytes_written,
+        voice: voice_id,
+        sample_rate: 24000,
+        duration_secs,
+        elapsed_secs,
+    })
+    .into_response()
+}
+
+fn sanitize_filename(name: &str) -> Result<String, String> {
+    let basename = std::path::Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("invalid filename: {name:?}"))?;
+    let mut out = String::with_capacity(basename.len());
+    for c in basename.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        return Err("filename is empty after sanitization".to_string());
+    }
+    if !out.to_lowercase().ends_with(".wav") {
+        out.push_str(".wav");
+    }
+    if out.len() > 128 {
+        return Err(format!(
+            "filename too long after sanitization ({} > 128)",
+            out.len()
+        ));
+    }
+    Ok(out)
+}
+
+fn auto_filename(voice: &str) -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{voice}_{ts}.wav")
+}
+
+fn safe_join(dir: &std::path::Path, filename: &str) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir).ok();
+    let dir_canon = dir
+        .canonicalize()
+        .map_err(|e| format!("resolving output dir: {e}"))?;
+    let candidate = dir_canon.join(filename);
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| "join produced no parent".to_string())?;
+    if parent != dir_canon {
+        return Err("filename escapes output directory".to_string());
+    }
+    Ok(candidate)
 }
 
 /// Encode a `f32 [-1, 1]` PCM stream as a 24 kHz mono 16-bit WAV.
@@ -520,4 +734,155 @@ fn pcm_f32_to_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
         out.extend_from_slice(&v.to_le_bytes());
     }
     out
+}
+
+// ── Saved files (save=true outputs) ─────────────────────────────────
+
+#[derive(Serialize)]
+pub struct TtsOutputFile {
+    pub name: String,
+    pub bytes: u64,
+    pub created_at: f64,
+}
+
+pub async fn list_outputs(State(state): State<Arc<AppState>>) -> Response {
+    let dir = &state.config.tts_output_dir;
+    let mut files: Vec<TtsOutputFile> = Vec::new();
+    if dir.exists() {
+        match std::fs::read_dir(dir) {
+            Ok(rd) => {
+                for entry in rd.flatten() {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    if !name.to_lowercase().ends_with(".wav") {
+                        continue;
+                    }
+                    let meta = match entry.metadata() {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    let created_at = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs_f64())
+                        .unwrap_or(0.0);
+                    files.push(TtsOutputFile {
+                        name: name.to_string(),
+                        bytes: meta.len(),
+                        created_at,
+                    });
+                }
+            }
+            Err(_) => {} // Empty list when the dir is unreadable.
+        }
+    }
+    // Newest first (matches vllm-server behaviour).
+    files.sort_by(|a, b| b.created_at.partial_cmp(&a.created_at).unwrap_or(std::cmp::Ordering::Equal));
+    ApiResponse::ok(files).into_response()
+}
+
+pub async fn get_output(
+    State(state): State<Arc<AppState>>,
+    PathParam(name): PathParam<String>,
+) -> Response {
+    let sanitized = match sanitize_filename(&name) {
+        Ok(n) => n,
+        Err(e) => return error_response(&e).into_response(),
+    };
+    let target = match safe_join(&state.config.tts_output_dir, &sanitized) {
+        Ok(p) => p,
+        Err(e) => return error_response(&e).into_response(),
+    };
+    if !target.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(crate::server::routes::ApiResponse::<()> {
+                success: false,
+                data: None,
+                error: Some(format!("file not found: {sanitized}")),
+            }),
+        )
+            .into_response();
+    }
+    let bytes = match std::fs::read(&target) {
+        Ok(b) => b,
+        Err(e) => return error_response(&format!("could not read file: {e}")).into_response(),
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "audio/wav")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{sanitized}\""),
+        )
+        .body(axum::body::Body::from(bytes))
+        .unwrap()
+        .into_response()
+}
+
+pub async fn delete_output(
+    State(state): State<Arc<AppState>>,
+    PathParam(name): PathParam<String>,
+) -> Response {
+    let sanitized = match sanitize_filename(&name) {
+        Ok(n) => n,
+        Err(e) => return error_response(&e).into_response(),
+    };
+    let target = match safe_join(&state.config.tts_output_dir, &sanitized) {
+        Ok(p) => p,
+        Err(e) => return error_response(&e).into_response(),
+    };
+    if !target.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(crate::server::routes::ApiResponse::<()> {
+                success: false,
+                data: None,
+                error: Some(format!("file not found: {sanitized}")),
+            }),
+        )
+            .into_response();
+    }
+    match std::fs::remove_file(&target) {
+        Ok(()) => ApiResponse::ok(serde_json::json!({"deleted": sanitized})).into_response(),
+        Err(e) => error_response(&format!("could not delete file: {e}")).into_response(),
+    }
+}
+
+// ── Voice cloning stubs (501 until burn-server implements --task-type Base)
+
+pub async fn upload_voice_ref_stub() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(crate::server::routes::ApiResponse::<()> {
+            success: false,
+            data: None,
+            error: Some(
+                "voice cloning is not supported on burn-server yet — use vllm-server for cloning"
+                    .to_string(),
+            ),
+        }),
+    )
+        .into_response()
+}
+
+pub async fn delete_voice_ref_stub(PathParam(_ref_id): PathParam<String>) -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(crate::server::routes::ApiResponse::<()> {
+            success: false,
+            data: None,
+            error: Some(
+                "voice cloning is not supported on burn-server yet — use vllm-server for cloning"
+                    .to_string(),
+            ),
+        }),
+    )
+        .into_response()
 }

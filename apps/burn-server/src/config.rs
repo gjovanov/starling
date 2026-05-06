@@ -104,6 +104,11 @@ pub struct Config {
     /// Force TURN relay mode
     #[arg(long, env = "FORCE_RELAY", default_value = "false")]
     pub force_relay: bool,
+
+    /// Directory where saved TTS WAV files are written.
+    /// Used by the `voxtral-tts` feature's save-to-disk path.
+    #[arg(long, env = "STARLING_TTS_OUTPUT_DIR", default_value = "./tts_output")]
+    pub tts_output_dir: PathBuf,
 }
 
 impl Config {
