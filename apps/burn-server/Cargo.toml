@@ -61,6 +61,10 @@ candle-flash-attn = { version = "0.10", optional = true }
 # ggml AVX-512 quantized matmul (CPU-only, no CUDA dependency)
 ggml-matmul = { path = "../../libs/ggml-matmul", optional = true }
 
+# HF tokenizers (used by the Tekken loader for the TTS chat template).
+# Optional — only pulled in when the `voxtral-tts` feature is enabled.
+tokenizers = { version = "0.20", default-features = false, features = ["onig"], optional = true }
+
 # WebRTC
 webrtc = "0.11"
 audiopus = "0.3.0-rc.0"
@@ -97,7 +101,7 @@ candle-cpu-ggml = ["candle-cpu", "dep:ggml-matmul"]
 # acoustic transformer. The codec decoder + AR LLM bring more deps in
 # later phases; for now this gate covers Phase 2-B (weight inventory)
 # + Phase 2-C (flow-matching forward pass).
-voxtral-tts = ["dep:candle-core", "dep:candle-nn"]
+voxtral-tts = ["dep:candle-core", "dep:candle-nn", "dep:tokenizers"]
 
 # [patch.crates-io] moved to workspace root Cargo.toml
 

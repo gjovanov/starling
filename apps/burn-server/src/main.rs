@@ -220,6 +220,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/tts/synthesize-codes",
             post(server::tts_routes::synthesize_codes),
+        )
+        .route(
+            "/api/tts/synthesize",
+            post(server::tts_routes::synthesize),
         );
 
     let app = app

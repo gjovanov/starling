@@ -22,9 +22,11 @@
 
 pub mod ar_llm;
 pub mod autoregressor;
+pub mod chat_template;
 pub mod codec;
 pub mod flow_matching;
 pub mod pipeline;
+pub mod tokenizer;
 pub mod voice;
 pub mod weights;
 
@@ -32,6 +34,8 @@ pub use ar_llm::ArLlmArgs;
 pub use autoregressor::TtsAutoregressor;
 pub use codec::AudioTokenizerArgs;
 pub use flow_matching::{AcousticTransformerArgs, MultimodalAudioModelArgs};
+pub use chat_template::build_voice_prompt;
 pub use pipeline::TtsPipeline;
+pub use tokenizer::{SpecialTokenIds, TekkenTokenizer};
 pub use voice::{default_voice_dir, VoiceEmbedding};
 pub use weights::{ExpectedGroup, ModuleGroup, WeightInventory, EXPECTED_GROUPS, EXPECTED_TOTAL};
