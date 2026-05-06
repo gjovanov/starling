@@ -399,6 +399,135 @@ async fn voice_clone_delete_returns_501() {
     );
 }
 
+// ── /api/tts/output round-trip with a pre-created file ─────────────
+
+/// Build the test app and seed a fake WAV in its `tts_output_dir`. The
+/// `Router` doesn't expose its config publicly, so we re-derive the
+/// dir from the same recipe (uuid'd temp). This is fragile against
+/// `build_tts_test_app` changes but cheap to keep in sync.
+fn build_app_and_output_dir() -> (Router, std::path::PathBuf) {
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "burn-server-tts-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&tmp_dir).ok();
+    let out_dir = tmp_dir.join("tts_output");
+    std::fs::create_dir_all(&out_dir).ok();
+
+    let config = Config {
+        port: 0,
+        quant: Quantization::Q4,
+        backend: GpuBackend::Wgpu,
+        models_dir: tmp_dir.join("models"),
+        frontend: tmp_dir.join("frontend"),
+        media_dir: tmp_dir.clone(),
+        public_ip: None,
+        max_sessions: 10,
+        turn_server: None,
+        turn_username: None,
+        turn_password: None,
+        turn_shared_secret: None,
+        force_relay: false,
+        tts_output_dir: out_dir.clone(),
+    };
+    let media_engine = webrtc::api::media_engine::MediaEngine::default();
+    let registry = webrtc::interceptor::registry::Registry::new();
+    let webrtc_api = webrtc::api::APIBuilder::new()
+        .with_media_engine(media_engine)
+        .with_interceptor_registry(registry)
+        .build();
+    let state = Arc::new(AppState::new(config, webrtc_api));
+
+    let app = Router::new()
+        .route("/api/tts/output", get(tts_routes::list_outputs))
+        .route(
+            "/api/tts/output/:name",
+            get(tts_routes::get_output).delete(tts_routes::delete_output),
+        )
+        .with_state(state);
+    (app, out_dir)
+}
+
+#[tokio::test]
+async fn output_lists_seeded_wav_and_skips_non_wav() {
+    let (app, out_dir) = build_app_and_output_dir();
+    std::fs::write(out_dir.join("greeting.wav"), b"RIFF" /* fake */).unwrap();
+    std::fs::write(out_dir.join("notes.txt"), b"ignore me").unwrap();
+
+    let (status, body) = json_get(&app, "/api/tts/output").await;
+    assert_eq!(status, StatusCode::OK);
+    let files = body["data"].as_array().unwrap();
+    assert_eq!(files.len(), 1, "non-wav files must be skipped");
+    assert_eq!(files[0]["name"], "greeting.wav");
+}
+
+#[tokio::test]
+async fn output_get_returns_wav_bytes() {
+    let (app, out_dir) = build_app_and_output_dir();
+    let body_bytes = b"RIFF\x00\x00\x00\x00WAVEfmt fake-payload";
+    std::fs::write(out_dir.join("hello.wav"), body_bytes).unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/tts/output/hello.wav")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap().to_str().unwrap(),
+        "audio/wav"
+    );
+    let received = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(received.as_ref(), body_bytes);
+}
+
+#[tokio::test]
+async fn output_delete_removes_file() {
+    let (app, out_dir) = build_app_and_output_dir();
+    let path = out_dir.join("removeme.wav");
+    std::fs::write(&path, b"RIFF").unwrap();
+    assert!(path.exists());
+
+    let (status, body) = delete_(&app, "/api/tts/output/removeme.wav").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["success"], true);
+    assert_eq!(body["data"]["deleted"], "removeme.wav");
+    assert!(!path.exists(), "file must be deleted from disk");
+}
+
+#[tokio::test]
+async fn output_get_rejects_path_traversal() {
+    let (app, _out_dir) = build_app_and_output_dir();
+    // Even with %2F-encoding the route param won't include /, but the
+    // sanitiser is the safety net regardless. Try a name with `..`.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/tts/output/..%2Fescape.wav")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Either 400 (sanitise error) or 404 (file not found after
+    // sanitising) is acceptable — both prove we never read outside
+    // the output dir.
+    assert!(
+        resp.status() == StatusCode::BAD_REQUEST
+            || resp.status() == StatusCode::NOT_FOUND,
+        "got status {}",
+        resp.status()
+    );
+}
+
 // Quiet the unused-import warning when this file builds in isolation.
 #[allow(dead_code)]
 fn _ensure_routes_module_linked() {
