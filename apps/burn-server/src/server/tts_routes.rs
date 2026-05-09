@@ -344,17 +344,22 @@ fn inv_erf(x: f32) -> f32 {
     inner.sqrt() * x.signum()
 }
 
-/// Outcome of a successful pipeline run — WAV bytes plus a meta blob
-/// suitable for the `X-TTS-Meta` response header.
+/// Outcome of a successful pipeline run — raw 16-bit LE PCM payload
+/// (no WAV header) plus a meta blob suitable for the `X-TTS-Meta`
+/// response header. Callers wrap this in either:
+/// - a streaming WAV response (header-with-placeholder + PCM chunks)
+///   for the `save=false` path, or
+/// - a complete WAV file (header-with-real-sizes + PCM) for the
+///   `save=true` save-to-disk path.
 struct SynthesisResult {
-    wav: Vec<u8>,
+    pcm16: Vec<u8>,
     meta: serde_json::Value,
 }
 
 /// Shared core for the two TTS routes: validate inputs, lazy-load the
 /// pipeline, load the voice, build the prompt tensor, generate the
 /// noise stream, run the AR LLM ↔ FMA ↔ codec pipeline, and produce
-/// 24 kHz mono 16-bit WAV bytes.
+/// raw 16-bit LE PCM bytes (24 kHz mono).
 ///
 /// Returns Err with a human-readable message on any failure; callers
 /// translate that into an `error_response` HTTP body.
@@ -407,8 +412,8 @@ async fn synthesize_to_wav(
         .flatten_all()
         .and_then(|t| t.to_vec1::<f32>())
         .map_err(|e| format!("pcm extract: {e}"))?;
+    let pcm16 = pcm_f32_to_pcm16_bytes(&samples_f32);
     let n_samples = samples_f32.len();
-    let wav = pcm_f32_to_wav(&samples_f32, 24000);
     let elapsed = start.elapsed().as_secs_f64();
 
     let meta = serde_json::json!({
@@ -418,11 +423,41 @@ async fn synthesize_to_wav(
         "voice": voice_id,
         "seed": seed,
     });
-    Ok(SynthesisResult { wav, meta })
+    Ok(SynthesisResult { pcm16, meta })
 }
 
+/// Default chunk size for streaming the PCM body (~64 KB ≈ 700 ms of
+/// 24 kHz mono 16-bit). Lower means more chunks/syscalls; higher means
+/// less responsive to backpressure. 64 KB is a common sweet spot.
+const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Build a chunked `audio/wav` streaming response: 44-byte streaming
+/// header (placeholder sizes) + PCM payload split into ~64 KB chunks.
+/// Wire format matches `apps/vllm-server/voxtral_server/tts/wav.py::
+/// streaming_header` exactly so the shared `frontend/js/modules/
+/// tts-player.js` decodes either backend identically.
+///
+/// NOTE: The current burn-server pipeline produces the entire PCM
+/// buffer in one shot before this helper runs, so chunked transfer
+/// here is purely for wire-format parity — no real TTFB win until the
+/// codec supports incremental decoding (Phase 2-K).
 fn wav_response(result: SynthesisResult) -> Response {
     let meta_str = result.meta.to_string();
+    let header = streaming_wav_header(24000, 1, 16);
+    let pcm = result.pcm16;
+
+    let mut chunks: Vec<Result<axum::body::Bytes, std::io::Error>> = Vec::new();
+    chunks.push(Ok(axum::body::Bytes::from(header)));
+    let mut offset = 0;
+    while offset < pcm.len() {
+        let end = (offset + STREAM_CHUNK_BYTES).min(pcm.len());
+        chunks.push(Ok(axum::body::Bytes::copy_from_slice(&pcm[offset..end])));
+        offset = end;
+    }
+
+    let stream = futures_util::stream::iter(chunks);
+    let body = axum::body::Body::from_stream(stream);
+
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "audio/wav")
@@ -431,9 +466,45 @@ fn wav_response(result: SynthesisResult) -> Response {
             "attachment; filename=\"synth.wav\"",
         )
         .header("X-TTS-Meta", meta_str)
-        .body(axum::body::Body::from(result.wav))
+        .body(body)
         .unwrap()
         .into_response()
+}
+
+/// 44-byte RIFF/WAVE header with `0xFFFFFFFF` placeholders for the
+/// two unknown-size fields. Matches `vllm-server`'s wav.py exactly.
+fn streaming_wav_header(sample_rate: u32, channels: u16, bits_per_sample: u16) -> Vec<u8> {
+    assert!(bits_per_sample % 8 == 0, "bits_per_sample must be multiple of 8");
+    let byte_rate = sample_rate * (channels as u32) * (bits_per_sample as u32) / 8;
+    let block_align = channels * bits_per_sample / 8;
+    const PLACEHOLDER: u32 = 0xFFFF_FFFF;
+
+    let mut out = Vec::with_capacity(44);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&PLACEHOLDER.to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&bits_per_sample.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&PLACEHOLDER.to_le_bytes());
+    out
+}
+
+/// Convert `f32 [-1, 1]` PCM to 16-bit signed-LE bytes (no header).
+fn pcm_f32_to_pcm16_bytes(samples: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(samples.len() * 2);
+    for s in samples {
+        let clipped = s.clamp(-1.0, 1.0);
+        let v = (clipped * (i16::MAX as f32)) as i16;
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
 }
 
 pub async fn synthesize_codes(
@@ -621,8 +692,12 @@ pub async fn synthesize(
         ))
         .into_response();
     }
-    let bytes_written = match std::fs::write(&target, &synth.wav) {
-        Ok(()) => synth.wav.len(),
+    // Save-to-disk wants a real WAV file (proper RIFF size fields, not
+    // the streaming `0xFFFFFFFF` placeholders). Assemble from PCM
+    // bytes here using the per-file header encoder.
+    let wav_bytes = wrap_pcm16_in_wav_file(&synth.pcm16, 24000, 1, 16);
+    let bytes_written = match std::fs::write(&target, &wav_bytes) {
+        Ok(()) => wav_bytes.len(),
         Err(e) => return error_response(&format!("could not write file: {e}")).into_response(),
     };
 
@@ -705,34 +780,36 @@ fn safe_join(dir: &std::path::Path, filename: &str) -> Result<PathBuf, String> {
     Ok(candidate)
 }
 
-/// Encode a `f32 [-1, 1]` PCM stream as a 24 kHz mono 16-bit WAV.
-fn pcm_f32_to_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
-    let n_samples = samples.len() as u32;
-    let bits_per_sample = 16u16;
-    let byte_rate = sample_rate * (bits_per_sample as u32) / 8;
-    let block_align = bits_per_sample / 8;
-    let data_size = n_samples * (block_align as u32);
+/// Wrap pre-computed 16-bit LE PCM bytes in a complete (non-streaming)
+/// WAV file with proper RIFF + data size fields. Used by the
+/// save-to-disk path so the resulting `.wav` file plays correctly in
+/// any downstream tool that validates header sizes.
+fn wrap_pcm16_in_wav_file(
+    pcm: &[u8],
+    sample_rate: u32,
+    channels: u16,
+    bits_per_sample: u16,
+) -> Vec<u8> {
+    let byte_rate = sample_rate * (channels as u32) * (bits_per_sample as u32) / 8;
+    let block_align = channels * bits_per_sample / 8;
+    let data_size = pcm.len() as u32;
     let chunk_size = 36 + data_size;
 
-    let mut out = Vec::with_capacity(44 + data_size as usize);
+    let mut out = Vec::with_capacity(44 + pcm.len());
     out.extend_from_slice(b"RIFF");
     out.extend_from_slice(&chunk_size.to_le_bytes());
     out.extend_from_slice(b"WAVE");
     out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+    out.extend_from_slice(&16u32.to_le_bytes());
     out.extend_from_slice(&1u16.to_le_bytes()); // PCM format
-    out.extend_from_slice(&1u16.to_le_bytes()); // mono
+    out.extend_from_slice(&channels.to_le_bytes());
     out.extend_from_slice(&sample_rate.to_le_bytes());
     out.extend_from_slice(&byte_rate.to_le_bytes());
     out.extend_from_slice(&block_align.to_le_bytes());
     out.extend_from_slice(&bits_per_sample.to_le_bytes());
     out.extend_from_slice(b"data");
     out.extend_from_slice(&data_size.to_le_bytes());
-    for s in samples {
-        let clipped = s.clamp(-1.0, 1.0);
-        let v = (clipped * (i16::MAX as f32)) as i16;
-        out.extend_from_slice(&v.to_le_bytes());
-    }
+    out.extend_from_slice(pcm);
     out
 }
 
@@ -885,4 +962,77 @@ pub async fn delete_voice_ref_stub(PathParam(_ref_id): PathParam<String>) -> Res
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Anchors the streaming-WAV header byte layout against the
+    /// upstream Python helper in
+    /// `apps/vllm-server/voxtral_server/tts/wav.py::streaming_header`.
+    ///
+    /// Re-derive the expected bytes with:
+    ///
+    /// ```
+    /// cd apps/vllm-server && source .venv/bin/activate && python3 -c \
+    ///   "from voxtral_server.tts.wav import streaming_header; \
+    ///    import sys; sys.stdout.buffer.write(streaming_header())"
+    /// ```
+    #[test]
+    fn streaming_wav_header_matches_upstream_python_output() {
+        // 24 kHz mono 16-bit PCM (Voxtral-4B-TTS defaults).
+        let got = streaming_wav_header(24000, 1, 16);
+        assert_eq!(got.len(), 44);
+        // Field-by-field assertion makes regression failures
+        // pinpoint the offset rather than dumping the whole buffer.
+        assert_eq!(&got[0..4], b"RIFF");
+        assert_eq!(&got[4..8], &[0xFF; 4], "RIFF chunk-size placeholder");
+        assert_eq!(&got[8..12], b"WAVE");
+        assert_eq!(&got[12..16], b"fmt ");
+        assert_eq!(&got[16..20], &16u32.to_le_bytes(), "fmt chunk size");
+        assert_eq!(&got[20..22], &1u16.to_le_bytes(), "PCM format");
+        assert_eq!(&got[22..24], &1u16.to_le_bytes(), "channels");
+        assert_eq!(&got[24..28], &24000u32.to_le_bytes(), "sample rate");
+        assert_eq!(&got[28..32], &48000u32.to_le_bytes(), "byte rate");
+        assert_eq!(&got[32..34], &2u16.to_le_bytes(), "block align");
+        assert_eq!(&got[34..36], &16u16.to_le_bytes(), "bits per sample");
+        assert_eq!(&got[36..40], b"data");
+        assert_eq!(&got[40..44], &[0xFF; 4], "data chunk-size placeholder");
+    }
+
+    #[test]
+    fn pcm_f32_to_pcm16_clips_and_packs_le() {
+        // Values at, beyond, and inside the [-1, 1] range.
+        let samples = vec![0.0f32, 1.0, -1.0, 0.5, -0.5, 2.0, -2.0];
+        let bytes = pcm_f32_to_pcm16_bytes(&samples);
+        assert_eq!(bytes.len(), samples.len() * 2);
+        // 0.0 → 0
+        assert_eq!(&bytes[0..2], &0i16.to_le_bytes());
+        // 1.0 → 32767
+        assert_eq!(&bytes[2..4], &i16::MAX.to_le_bytes());
+        // -1.0 → -32767 (since i16::MAX is 32767 and we multiply, not -32768)
+        assert_eq!(&bytes[4..6], &(-i16::MAX).to_le_bytes());
+        // 2.0 clipped → 32767
+        assert_eq!(&bytes[10..12], &i16::MAX.to_le_bytes());
+        // -2.0 clipped → -32767
+        assert_eq!(&bytes[12..14], &(-i16::MAX).to_le_bytes());
+    }
+
+    #[test]
+    fn wrap_pcm16_in_wav_file_has_real_sizes() {
+        // 100 samples × 2 bytes = 200 PCM bytes.
+        let pcm = vec![0u8; 200];
+        let wav = wrap_pcm16_in_wav_file(&pcm, 24000, 1, 16);
+        assert_eq!(wav.len(), 244, "44-byte header + 200 PCM bytes");
+        // RIFF chunk size = 36 + data_size = 36 + 200 = 236
+        assert_eq!(&wav[4..8], &236u32.to_le_bytes(), "RIFF chunk size");
+        // data chunk size = 200
+        assert_eq!(&wav[40..44], &200u32.to_le_bytes(), "data chunk size");
+        // Same field offsets as streaming header for the rest.
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[12..16], b"fmt ");
+        assert_eq!(&wav[36..40], b"data");
+    }
 }
