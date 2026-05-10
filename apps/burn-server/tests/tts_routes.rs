@@ -217,7 +217,11 @@ async fn status_reports_unloaded_before_any_synthesis() {
     assert!(data["blocked_reason"].is_null());
     assert!(data["error"].is_null());
     assert_eq!(data["autostart"], true);
-    assert_eq!(data["engine"], "voxtral-4b-tts via burn-server-native");
+    let engine_str = data["engine"].as_str().unwrap_or("");
+    assert!(
+        engine_str.starts_with("voxtral-4b-tts via burn-server-native ("),
+        "unexpected engine: {engine_str:?}"
+    );
     // Phase 3-D test config sets `tts_idle_unload_secs: 0` (disabled).
     assert_eq!(data["idle_unload_secs"], 0);
 }

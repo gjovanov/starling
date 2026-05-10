@@ -94,8 +94,10 @@ pub struct TtsStatusInfo {
     pub error: Option<String>,
     /// We always autostart on first `/api/tts/*` hit.
     pub autostart: bool,
-    /// Stable identifier for the frontend backend badge.
-    pub engine: &'static str,
+    /// Stable identifier for the frontend backend badge — includes the
+    /// device label (`cuda+bf16` or `cpu+f32`) so users can verify the
+    /// fast path is engaged.
+    pub engine: String,
     /// Configured idle-unload threshold in seconds (`0` = disabled).
     pub idle_unload_secs: u64,
     /// Backward-compat field (Phase 2-G→2-J shape): seconds since load.
@@ -104,8 +106,10 @@ pub struct TtsStatusInfo {
 
 /// Stable backend identifier surfaced in `/api/tts/status::engine` and
 /// available for analytics/log correlation. Frontend's status badge
-/// reads this to render "via burn-server-native" alongside the colour.
-const ENGINE_ID: &str = "voxtral-4b-tts via burn-server-native";
+/// reads this to render the device-suffixed string in the tooltip.
+fn engine_id(device_label: &'static str) -> String {
+    format!("voxtral-4b-tts via burn-server-native ({device_label})")
+}
 
 struct LifecycleInner {
     pipeline: Option<Arc<crate::inference::voxtral_tts::TtsPipeline>>,
@@ -120,7 +124,11 @@ struct LifecycleInner {
 }
 
 impl LifecycleInner {
-    fn snapshot(&self, idle_unload_secs: u64) -> TtsStatusInfo {
+    fn snapshot(
+        &self,
+        idle_unload_secs: u64,
+        device_label: &'static str,
+    ) -> TtsStatusInfo {
         let inflight = self
             .pipeline
             .as_ref()
@@ -149,7 +157,7 @@ impl LifecycleInner {
             blocked_reason: None,
             error: None,
             autostart: true,
-            engine: ENGINE_ID,
+            engine: engine_id(device_label),
             idle_unload_secs,
             uptime_secs,
         }
@@ -161,12 +169,50 @@ pub struct TtsLifecycleState {
     inner: Arc<tokio::sync::Mutex<LifecycleInner>>,
     tokenizer: OnceCell<Arc<crate::inference::voxtral_tts::TekkenTokenizer>>,
     idle_unload_secs: u64,
+    /// Device the pipeline runs on. Auto-selected at construction:
+    /// prefers `Device::cuda(0)` when a CUDA-capable GPU is present
+    /// (≥10× faster TTS), falls back to `Device::Cpu`.
+    device: Device,
+    /// Dtype paired with `device`. BF16 on CUDA, F32 on CPU (candle
+    /// CPU matmul has no BF16 path).
+    dtype: DType,
+    /// Human-readable label of the device choice — surfaced in
+    /// `/api/tts/status::engine` so the frontend tooltip distinguishes
+    /// the GPU and CPU build of burn-server.
+    device_label: &'static str,
+}
+
+/// Auto-select the best (device, dtype, label) combination for TTS
+/// inference. The probe is cheap (constructing a `Device::cuda(0)`
+/// only checks driver/runtime availability, doesn't allocate). We do
+/// this once at `TtsLifecycleState::new` and cache the result.
+fn select_tts_device() -> (Device, DType, &'static str) {
+    match Device::new_cuda(0) {
+        Ok(dev) => {
+            eprintln!(
+                "[TTS lifecycle] selected CUDA device 0 + BF16 (~10× faster than CPU/F32)"
+            );
+            (dev, DType::BF16, "cuda+bf16")
+        }
+        Err(e) => {
+            eprintln!(
+                "[TTS lifecycle] CUDA unavailable ({e}); falling back to CPU + F32 (slow — ~50 s/sentence)"
+            );
+            (Device::Cpu, DType::F32, "cpu+f32")
+        }
+    }
 }
 
 impl TtsLifecycleState {
     /// `idle_unload_secs == 0` disables idle-unload entirely (the
     /// pipeline stays loaded once first hit). Tests use this.
+    ///
+    /// Device + dtype are auto-selected here and cached for the
+    /// lifetime of the struct: every reload reuses the same target so
+    /// loaded weights are always in the right precision for the
+    /// runtime device.
     pub fn new(idle_unload_secs: u64) -> Self {
+        let (device, dtype, device_label) = select_tts_device();
         Self {
             inner: Arc::new(tokio::sync::Mutex::new(LifecycleInner {
                 pipeline: None,
@@ -179,7 +225,25 @@ impl TtsLifecycleState {
             })),
             tokenizer: OnceCell::new(),
             idle_unload_secs,
+            device,
+            dtype,
+            device_label,
         }
+    }
+
+    /// Cached device choice (CUDA when available, else CPU).
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Cached dtype choice (BF16 on CUDA, F32 on CPU).
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    /// Short label of the device choice for diagnostics.
+    pub fn device_label(&self) -> &'static str {
+        self.device_label
     }
 
     /// Get a fresh `Arc<TtsPipeline>` — loading on demand, blocking
@@ -188,8 +252,6 @@ impl TtsLifecycleState {
     pub async fn get_or_load(
         &self,
         models_dir: &std::path::Path,
-        device: &Device,
-        dtype: DType,
         max_seq_len: usize,
     ) -> Result<Arc<crate::inference::voxtral_tts::TtsPipeline>, String> {
         loop {
@@ -205,7 +267,7 @@ impl TtsLifecycleState {
                     inner.is_loading = true;
                     inner.load_started_at = Some(Instant::now());
                     drop(inner);
-                    return self.do_load(models_dir, device, dtype, max_seq_len).await;
+                    return self.do_load(models_dir, max_seq_len).await;
                 }
             };
             // Wait for the in-flight load to complete, then loop.
@@ -218,12 +280,11 @@ impl TtsLifecycleState {
     async fn do_load(
         &self,
         models_dir: &std::path::Path,
-        device: &Device,
-        dtype: DType,
         max_seq_len: usize,
     ) -> Result<Arc<crate::inference::voxtral_tts::TtsPipeline>, String> {
         let models_dir_owned = models_dir.to_path_buf();
-        let device_owned = device.clone();
+        let device_owned = self.device.clone();
+        let dtype = self.dtype;
         let load_result = tokio::task::spawn_blocking(move || {
             let ckpt = models_dir_owned
                 .join("tts")
@@ -348,7 +409,7 @@ impl TtsLifecycleState {
     /// Frontend-facing status snapshot. Cheap (single mutex lock).
     pub async fn status_snapshot(&self) -> TtsStatusInfo {
         let inner = self.inner.lock().await;
-        inner.snapshot(self.idle_unload_secs)
+        inner.snapshot(self.idle_unload_secs, self.device_label)
     }
 
     /// Refresh `last_activity` after a synth completes so the idle
@@ -595,13 +656,16 @@ async fn synthesize_to_wav(
     seed: u64,
 ) -> Result<SynthesisResult, String> {
     let start = Instant::now();
-    let device = Device::Cpu;
-    let dtype = DType::F32;
+    // Device + dtype are cached on the lifecycle (CUDA+BF16 when
+    // available, else CPU+F32). The cache is set once at server
+    // startup so reloaded weights always match the runtime device.
+    let device = state.tts.device().clone();
+    let dtype = state.tts.dtype();
     let max_seq_len = (prompt_ids_vec.len() + max_frames as usize + 8).max(2048);
 
     let pipeline = state
         .tts
-        .get_or_load(&state.config.models_dir, &device, dtype, max_seq_len)
+        .get_or_load(&state.config.models_dir, max_seq_len)
         .await
         .map_err(|e| format!("pipeline load failed: {e}"))?;
 
@@ -620,7 +684,12 @@ async fn synthesize_to_wav(
 
     let n_acoustic = pipeline.fma_args.n_acoustic_codebook;
     let noise_v = deterministic_noise(seed, max_frames as usize, n_acoustic);
+    // Noise is constructed as F32 and cast to the pipeline's dtype.
+    // The autoregressor's `forward_with_noise` re-casts internally, but
+    // building it in the target dtype on-device avoids one extra
+    // host→device copy per request.
     let noise = Tensor::from_vec(noise_v, (max_frames as usize, n_acoustic), &device)
+        .and_then(|t| t.to_dtype(dtype))
         .map_err(|e| format!("noise tensor: {e}"))?;
 
     let pipeline_for_blocking = pipeline.clone();
@@ -635,7 +704,13 @@ async fn synthesize_to_wav(
     // idle-unload watcher counts from synth-end, not synth-start.
     state.tts.note_activity().await;
 
-    let samples_f32: Vec<f32> = pcm
+    // PCM may come back as BF16 on the CUDA path; cast to F32 on the
+    // host before int16 packing.
+    let pcm_f32 = pcm
+        .to_dtype(DType::F32)
+        .and_then(|t| t.to_device(&Device::Cpu))
+        .map_err(|e| format!("pcm cast: {e}"))?;
+    let samples_f32: Vec<f32> = pcm_f32
         .flatten_all()
         .and_then(|t| t.to_vec1::<f32>())
         .map_err(|e| format!("pcm extract: {e}"))?;
@@ -1593,7 +1668,12 @@ mod tests {
         assert!(info.last_activity_secs.is_none());
         assert!(info.boot_elapsed_secs.is_none());
         assert!(info.uptime_secs.is_none());
-        assert_eq!(info.engine, "voxtral-4b-tts via burn-server-native");
+        // Engine string carries a device-label suffix (cuda+bf16 / cpu+f32).
+        assert!(
+            info.engine.starts_with("voxtral-4b-tts via burn-server-native ("),
+            "unexpected engine: {}",
+            info.engine
+        );
         assert_eq!(info.idle_unload_secs, 0);
         assert!(info.autostart);
     }
