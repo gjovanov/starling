@@ -414,27 +414,45 @@ ar_llm/
                       # multi-codebook step-input embedding
 autoregressor.rs      # AR LLM ↔ FMA loop with END_AUDIO halt
 pipeline.rs           # TtsPipeline::load + ::synthesize end-to-end
+tokenizer.rs          # Tekken BPE loader (Phase 2-H)
+chat_template.rs      # Voxtral-TTS prompt builder (Phase 2-H)
+text.rs               # Long-form sentence splitter (Phase 3-A)
+refs.rs               # Voice-ref storage + audit log (Phase 3-E1)
 ```
 
 **HTTP routes** (gated on `voxtral-tts` feature, served on burn-server's port 8091):
-- `GET  /api/tts/voices`         → list 20 voices + on-disk availability
-- `GET  /api/tts/config`         → 24 kHz, 12.5 fps, 1920 samples/frame, 37 codebooks
-- `GET  /api/tts/status`         → lifecycle snapshot (loaded + uptime)
-- `POST /api/tts/synthesize-codes` → pre-tokenized synthesis (returns 24 kHz mono WAV)
+- `GET    /api/tts/voices`              → 20 built-in voices + cloned voices (Phase 3-E1)
+- `GET    /api/tts/config`              → 24 kHz, 12.5 fps, 1920 samples/frame, 37 codebooks
+- `GET    /api/tts/status`              → lifecycle snapshot — `state` (idle/starting/ready), `loaded`, `inflight_synths`, `last_activity_secs`, `engine`, `idle_unload_secs`, ... (Phase 3-D + 3-B)
+- `POST   /api/tts/synthesize`          → text-input synthesis (Phase 2-H, long-form/per-sentence streaming Phase 3-A); `voice_ref_id` field returns 501 (see voice-cloning constraint above)
+- `POST   /api/tts/synthesize-codes`    → pre-tokenized synthesis escape hatch
+- `GET    /api/tts/output[/{name}]`     → list / fetch saved WAV files
+- `DELETE /api/tts/output/{name}`       → delete a saved WAV
+- `POST   /api/tts/voices/upload`       → multipart voice-ref upload (Phase 3-E1)
+- `DELETE /api/tts/voices/{ref_id}`     → delete a cloned voice ref (Phase 3-E1)
+
+**Lifecycle** (Phase 3-D): pipeline loads on the first `/api/tts/*` hit; auto-unloads after `BURN_TTS_IDLE_UNLOAD_SECS` (default 600 s) of no activity; reloads on the next call. In-flight synth count is tracked implicitly via `Arc::strong_count` on the stored pipeline `Arc` (no separate counter; the watcher only unloads when no caller holds a reference). See `tts_routes.rs::TtsLifecycleState`.
+
+**Long-form** (Phase 3-A): `POST /api/tts/synthesize` runs the upstream sentence splitter, synthesizes one sentence at a time, and streams per-sentence PCM through an `mpsc::Sender` → `Body::from_stream`. `BURN_TTS_LONG_MAX_SECS` (default 180 s) caps the total wall-clock; client disconnect closes the receiver and aborts the synth task.
+
+**Voice cloning** (Phase 3-E1 + 3-E2): storage half is shipped — uploaded refs round-trip through `/api/tts/voices/upload` and `DELETE /api/tts/voices/{ref_id}`, audit-logged, listed alongside builtins via `/api/tts/voices`. Synthesis half (`voice_ref_id` on `/synthesize`) returns 501 because the open-source Voxtral-4B-TTS-2603 checkpoint omits `audio_tokenizer.input_proj.*` + `audio_tokenizer.encoder_blocks.*` (the codec encoder needed to tokenise reference audio). `cargo run --release --features voxtral-tts --bin dump-tts-weights` reports cloning capability at the bottom of its output.
 
 **Golden references** (committed under `apps/burn-server/test_data/tts_golden/`):
-- 6 FMA fixtures (3 inputs × 2 dtypes) — synthetic `llm_hidden` → audio_codes
-- 6 codec fixtures — synthetic codes → 24 kHz PCM with per-block intermediates
-- 6 e2e WAV/JSON pairs — real text → audio via the running vllm-omni HTTP API
+- 6 FMA fixtures (3 inputs × 2 dtypes) — synthetic `llm_hidden` → audio_codes (F32 bit-exact)
+- 6 codec fixtures — synthetic codes → 24 kHz PCM with per-block intermediates (single-frame bit-exact)
+- 6 e2e WAV/JSON pairs — real text → audio via the running vllm-omni HTTP API (seed-dependent, audible-only sanity)
+- 6 prompt_ids fixtures — chat-template byte-exact regression
 - Capture scripts under `apps/vllm-server/scripts/dump_tts_*.py`
-- `convert_npz_to_safetensors.py` produces parallel `.safetensors` (Rust loads via existing safetensors crate; no `npy` dep)
-- `convert_voice_embeddings_to_safetensors.py` parallels each `voice_embedding/*.pt` with a `.safetensors`
+- `convert_npz_to_safetensors.py` + `convert_voice_embeddings_to_safetensors.py`
 
-**What's deferred** (each tractable in 1-2 days):
-1. Mistral tokenizer + chat template → text input on `/api/tts/synthesize`. Largest single piece.
-2. Frontend wiring → port 8091 detection + tab activation. Gated on (1).
-3. Bit-exact e2e WAV match → replay upstream's `torch.randn` per generation step.
-4. Idle-unload + voice-clone (`--task-type Base`) parity with vllm-server's lifecycle.
+**Phase 3 status (2026-05-10):**
+- ✅ Phase 3-A: sentence splitter + long-form synthesize route
+- ✅ Phase 3-B: frontend backend identity badge (`engine` field on `/api/tts/status`)
+- ✅ Phase 3-D: idle-unload lifecycle (default 600 s)
+- ✅ Phase 3-E1: voice-ref storage + upload/delete routes
+- ✅ Phase 3-E2: documented upstream constraint — synthesis blocked until Mistral ships encoder weights
+- 🔜 Phase 3-C: F32 bit-exact e2e regression — needs upstream-side per-step `torch.randn` capture script (~½ day Python). FMA single-step bit-exactness anchor is already shipped; only the AR-loop noise replay sidecar is missing. `pipeline.synthesize` already accepts a replay-able `noise: &Tensor`, so the Rust-side path is in place.
+- 🔜 Phase 3-F: per-frame streaming via codec windowed-decode (~2-3 days). Per-sentence streaming is in place from Phase 3-A; this is the additional within-sentence latency improvement. High-risk because the codec is stateful (sliding-window transformers + ConvTranspose1d right-trim). Recommended approach: K=10 frame windows with explicit carry-state across calls.
 
 **Architecture notes** (re-derive from `project_voxtral_tts_model_inventory` memory):
 - 386 BF16 tensors across 4 modules: AR LLM (234), audio_tokenizer/codec (116), acoustic_transformer/FMA (33), mm_audio_embeddings (2), final norm (1).
