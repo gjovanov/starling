@@ -978,15 +978,27 @@ async function refreshTtsEngineStatus(els) {
   };
   const p = presets[info.state] ?? presets.idle;
   let label = p.label;
-  if (info.state === 'starting' && info.boot_elapsed_secs != null && info.boot_timeout_secs) {
-    const remaining = Math.max(0, info.boot_timeout_secs - info.boot_elapsed_secs);
-    label = `warming up · ${remaining.toFixed(0)}s left`;
+  if (info.state === 'starting' && info.boot_elapsed_secs != null) {
+    if (info.boot_timeout_secs) {
+      const remaining = Math.max(0, info.boot_timeout_secs - info.boot_elapsed_secs);
+      label = `warming up · ${remaining.toFixed(0)}s left`;
+    } else {
+      // No hard timeout (e.g. burn-server-native) — show elapsed time.
+      label = `warming up · ${info.boot_elapsed_secs.toFixed(0)}s`;
+    }
   } else if (info.state === 'blocked' && info.blocked_reason) {
     label = info.blocked_reason;
   }
   els.engineBadge.textContent = label;
   els.engineBadge.style.background = p.bg;
   els.engineBadge.style.color = p.fg;
+  // Surface backend identity in the tooltip so users can tell which
+  // backend is serving TTS without inspecting the page source. Field
+  // is populated by both vllm-server (added in Phase 3-B's matching
+  // patch) and burn-server.
+  if (info.engine) {
+    els.engineBadge.title = info.engine;
+  }
 
   // Disable Generate while blocked.
   if (info.state === 'blocked') {

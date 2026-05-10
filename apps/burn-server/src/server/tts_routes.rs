@@ -45,28 +45,146 @@ use tokio::sync::{mpsc, OnceCell};
 use crate::server::routes::{error_response, ApiResponse};
 use crate::server::state::AppState;
 
-// ── Lazy pipeline holder ────────────────────────────────────────────
+// ── Lifecycle state machine ─────────────────────────────────────────
+//
+// The TTS pipeline is ~12 GiB resident; we want it loaded lazily on
+// first use, kept warm while the user is interacting, and dropped after
+// `idle_unload_secs` of inactivity. Architecture mirrors
+// `apps/vllm-server/voxtral_server/tts/lifecycle.py` minus the
+// subprocess machinery (burn-server runs the model in-process).
+//
+// Concurrency model:
+// - `inner` holds the actual state behind a Mutex. Brief locks for
+//   read/update; the heavy load runs OUTSIDE the lock via
+//   `tokio::task::spawn_blocking`.
+// - `is_loading` flag + `load_done` `Notify` let concurrent `get_or_load`
+//   callers wait for a single in-flight load instead of double-loading.
+// - In-flight synths are counted implicitly via `Arc::strong_count` on
+//   the stored pipeline `Arc`. The idle watcher only unloads when
+//   `strong_count == 1` (only the lifecycle's own reference remains).
+//   This avoids a separate inflight counter and the synth_started/
+//   synth_finished call pair on every code path.
 
-/// Holds the loaded `TtsPipeline` and `TekkenTokenizer` once they've
-/// been initialised. Stored inside an `Arc<OnceCell>` on the AppState
-/// so all routes share a single instance.
+/// Snapshot of the lifecycle state for the `/api/tts/status` route.
+/// Field names match `voxtral_server/api/tts_routes.py::get_tts_status`
+/// where they overlap so the frontend's `renderTtsEngineBadge` works
+/// against either backend.
+#[derive(Serialize, Clone)]
+pub struct TtsStatusInfo {
+    /// `"idle"` (no pipeline), `"starting"` (load in flight), or
+    /// `"ready"` (loaded). Frontend's `engineBadge` colour palette
+    /// reads from this.
+    pub state: &'static str,
+    pub loaded: bool,
+    /// How many seconds the load has been running. Only set during
+    /// `state == "starting"`.
+    pub boot_elapsed_secs: Option<f64>,
+    /// burn-server has no hard load timeout — surfaced as `null` so the
+    /// frontend skips the "warming up · Xs left" countdown.
+    pub boot_timeout_secs: Option<u64>,
+    /// Seconds since the last `get_or_load` (or last synth completion)
+    /// at status-call time. `None` when the pipeline has never been
+    /// loaded.
+    pub last_activity_secs: Option<f64>,
+    /// Concurrent in-flight synth calls (= `Arc::strong_count - 1`).
+    pub inflight_synths: u32,
+    /// burn-server is never blocked by ASR (single-process pipeline).
+    pub blocked_reason: Option<String>,
+    /// burn-server doesn't surface load errors here yet — reserved.
+    pub error: Option<String>,
+    /// We always autostart on first `/api/tts/*` hit.
+    pub autostart: bool,
+    /// Stable identifier for the frontend backend badge.
+    pub engine: &'static str,
+    /// Configured idle-unload threshold in seconds (`0` = disabled).
+    pub idle_unload_secs: u64,
+    /// Backward-compat field (Phase 2-G→2-J shape): seconds since load.
+    pub uptime_secs: Option<f64>,
+}
+
+/// Stable backend identifier surfaced in `/api/tts/status::engine` and
+/// available for analytics/log correlation. Frontend's status badge
+/// reads this to render "via burn-server-native" alongside the colour.
+const ENGINE_ID: &str = "voxtral-4b-tts via burn-server-native";
+
+struct LifecycleInner {
+    pipeline: Option<Arc<crate::inference::voxtral_tts::TtsPipeline>>,
+    loaded_at: Option<Instant>,
+    last_activity: Option<Instant>,
+    is_loading: bool,
+    load_started_at: Option<Instant>,
+    load_done: Arc<tokio::sync::Notify>,
+    /// Set to true while the idle watcher is alive. Prevents
+    /// double-spawning when a re-load happens after a previous unload.
+    watcher_running: bool,
+}
+
+impl LifecycleInner {
+    fn snapshot(&self, idle_unload_secs: u64) -> TtsStatusInfo {
+        let inflight = self
+            .pipeline
+            .as_ref()
+            .map(|p| Arc::strong_count(p).saturating_sub(1) as u32)
+            .unwrap_or(0);
+        let state = if self.is_loading {
+            "starting"
+        } else if self.pipeline.is_some() {
+            "ready"
+        } else {
+            "idle"
+        };
+        let boot_elapsed_secs = if self.is_loading {
+            self.load_started_at.map(|t| t.elapsed().as_secs_f64())
+        } else {
+            None
+        };
+        let uptime_secs = self.loaded_at.map(|t| t.elapsed().as_secs_f64());
+        TtsStatusInfo {
+            state,
+            loaded: self.pipeline.is_some(),
+            boot_elapsed_secs,
+            boot_timeout_secs: None,
+            last_activity_secs: self.last_activity.map(|t| t.elapsed().as_secs_f64()),
+            inflight_synths: inflight,
+            blocked_reason: None,
+            error: None,
+            autostart: true,
+            engine: ENGINE_ID,
+            idle_unload_secs,
+            uptime_secs,
+        }
+    }
+}
+
+/// Lifecycle state shared across routes via `AppState::tts`.
 pub struct TtsLifecycleState {
-    pipeline: OnceCell<Arc<crate::inference::voxtral_tts::TtsPipeline>>,
+    inner: Arc<tokio::sync::Mutex<LifecycleInner>>,
     tokenizer: OnceCell<Arc<crate::inference::voxtral_tts::TekkenTokenizer>>,
-    /// Track when the pipeline was first loaded for the /status
-    /// endpoint and (eventually) idle-unload.
-    loaded_at: tokio::sync::Mutex<Option<Instant>>,
+    idle_unload_secs: u64,
 }
 
 impl TtsLifecycleState {
-    pub fn new() -> Self {
+    /// `idle_unload_secs == 0` disables idle-unload entirely (the
+    /// pipeline stays loaded once first hit). Tests use this.
+    pub fn new(idle_unload_secs: u64) -> Self {
         Self {
-            pipeline: OnceCell::new(),
+            inner: Arc::new(tokio::sync::Mutex::new(LifecycleInner {
+                pipeline: None,
+                loaded_at: None,
+                last_activity: None,
+                is_loading: false,
+                load_started_at: None,
+                load_done: Arc::new(tokio::sync::Notify::new()),
+                watcher_running: false,
+            })),
             tokenizer: OnceCell::new(),
-            loaded_at: tokio::sync::Mutex::new(None),
+            idle_unload_secs,
         }
     }
 
+    /// Get a fresh `Arc<TtsPipeline>` — loading on demand, blocking
+    /// concurrent callers behind a single in-flight load. Each call
+    /// refreshes `last_activity` to extend the idle-unload window.
     pub async fn get_or_load(
         &self,
         models_dir: &std::path::Path,
@@ -74,27 +192,124 @@ impl TtsLifecycleState {
         dtype: DType,
         max_seq_len: usize,
     ) -> Result<Arc<crate::inference::voxtral_tts::TtsPipeline>, String> {
-        let pipeline = self
-            .pipeline
-            .get_or_try_init(|| async {
-                let ckpt = models_dir.join("tts").join("consolidated.safetensors");
-                let params = models_dir.join("tts").join("params.json");
-                let pipeline =
-                    crate::inference::voxtral_tts::TtsPipeline::load(
-                        &ckpt,
-                        &params,
-                        max_seq_len,
-                        AUDIO_TOKEN_ID,
-                        device,
-                        dtype,
-                    )
-                    .map_err(|e| format!("loading TTS pipeline: {e}"))?;
-                let mut at = self.loaded_at.lock().await;
-                *at = Some(Instant::now());
-                Ok::<_, String>(Arc::new(pipeline))
-            })
-            .await?;
-        Ok(pipeline.clone())
+        loop {
+            let notify = {
+                let mut inner = self.inner.lock().await;
+                if let Some(p) = inner.pipeline.as_ref().cloned() {
+                    inner.last_activity = Some(Instant::now());
+                    return Ok(p);
+                }
+                if inner.is_loading {
+                    inner.load_done.clone()
+                } else {
+                    inner.is_loading = true;
+                    inner.load_started_at = Some(Instant::now());
+                    drop(inner);
+                    return self.do_load(models_dir, device, dtype, max_seq_len).await;
+                }
+            };
+            // Wait for the in-flight load to complete, then loop.
+            notify.notified().await;
+        }
+    }
+
+    /// Run the heavy load on a blocking task; install the result under
+    /// the lock; notify any waiters.
+    async fn do_load(
+        &self,
+        models_dir: &std::path::Path,
+        device: &Device,
+        dtype: DType,
+        max_seq_len: usize,
+    ) -> Result<Arc<crate::inference::voxtral_tts::TtsPipeline>, String> {
+        let models_dir_owned = models_dir.to_path_buf();
+        let device_owned = device.clone();
+        let load_result = tokio::task::spawn_blocking(move || {
+            let ckpt = models_dir_owned
+                .join("tts")
+                .join("consolidated.safetensors");
+            let params = models_dir_owned.join("tts").join("params.json");
+            crate::inference::voxtral_tts::TtsPipeline::load(
+                &ckpt,
+                &params,
+                max_seq_len,
+                AUDIO_TOKEN_ID,
+                &device_owned,
+                dtype,
+            )
+        })
+        .await
+        .map_err(|e| format!("blocking task: {e}"));
+
+        let mut inner = self.inner.lock().await;
+        inner.is_loading = false;
+        inner.load_started_at = None;
+        let notify = inner.load_done.clone();
+        let r = match load_result {
+            Ok(Ok(p)) => {
+                let arc = Arc::new(p);
+                inner.pipeline = Some(arc.clone());
+                inner.loaded_at = Some(Instant::now());
+                inner.last_activity = Some(Instant::now());
+                let need_watcher = self.idle_unload_secs > 0 && !inner.watcher_running;
+                if need_watcher {
+                    inner.watcher_running = true;
+                }
+                drop(inner);
+                if need_watcher {
+                    self.spawn_idle_watcher();
+                }
+                Ok(arc)
+            }
+            Ok(Err(e)) => {
+                drop(inner);
+                Err(format!("loading TTS pipeline: {e}"))
+            }
+            Err(e) => {
+                drop(inner);
+                Err(e)
+            }
+        };
+        notify.notify_waiters();
+        r
+    }
+
+    /// Background tick loop that drops the pipeline after
+    /// `idle_unload_secs` of no activity. Exits when it has unloaded
+    /// or when the pipeline was unloaded externally.
+    fn spawn_idle_watcher(&self) {
+        let inner = self.inner.clone();
+        let idle_secs = self.idle_unload_secs;
+        // Tick at most every 30 s; minimum 1 s so test configurations
+        // with short idle-unload windows actually fire promptly.
+        let tick = Duration::from_secs(idle_secs.min(30).max(1));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tick).await;
+                let mut g = inner.lock().await;
+                let strong = match g.pipeline.as_ref() {
+                    Some(arc) => Arc::strong_count(arc),
+                    None => {
+                        // Externally unloaded; we can exit. The flag is
+                        // cleared so a re-load can spawn a fresh watcher.
+                        g.watcher_running = false;
+                        return;
+                    }
+                };
+                let last = g.last_activity.unwrap_or_else(Instant::now);
+                if strong == 1 && last.elapsed() >= Duration::from_secs(idle_secs) {
+                    tracing::info!(
+                        "TTS lifecycle: idle-unloading pipeline after {}s of inactivity",
+                        last.elapsed().as_secs()
+                    );
+                    g.pipeline = None;
+                    g.loaded_at = None;
+                    g.last_activity = None;
+                    g.watcher_running = false;
+                    return;
+                }
+            }
+        });
     }
 
     pub async fn get_or_load_tokenizer(
@@ -130,17 +345,19 @@ impl TtsLifecycleState {
         Ok(tk.clone())
     }
 
-    pub async fn loaded_secs(&self) -> Option<f64> {
-        self.loaded_at
-            .lock()
-            .await
-            .map(|t| t.elapsed().as_secs_f64())
+    /// Frontend-facing status snapshot. Cheap (single mutex lock).
+    pub async fn status_snapshot(&self) -> TtsStatusInfo {
+        let inner = self.inner.lock().await;
+        inner.snapshot(self.idle_unload_secs)
     }
-}
 
-impl Default for TtsLifecycleState {
-    fn default() -> Self {
-        Self::new()
+    /// Refresh `last_activity` after a synth completes so the idle
+    /// watcher counts from the *end* of the synth, not the start.
+    /// `get_or_load` already refreshes on entry; this paired call
+    /// covers the post-synth window.
+    pub async fn note_activity(&self) {
+        let mut inner = self.inner.lock().await;
+        inner.last_activity = Some(Instant::now());
     }
 }
 
@@ -259,21 +476,9 @@ pub async fn get_tts_config(State(state): State<Arc<AppState>>) -> Response {
 
 // ── Status ──────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
-pub struct TtsStatus {
-    pub loaded: bool,
-    pub uptime_secs: Option<f64>,
-}
-
 pub async fn get_tts_status(State(state): State<Arc<AppState>>) -> Response {
-    let lifecycle = state.tts.clone();
-    let loaded = lifecycle.pipeline.initialized();
-    let uptime = lifecycle.loaded_secs().await;
-    ApiResponse::ok(TtsStatus {
-        loaded,
-        uptime_secs: uptime,
-    })
-    .into_response()
+    let info = state.tts.status_snapshot().await;
+    ApiResponse::ok(info).into_response()
 }
 
 // ── Synthesize (pre-tokenized) ──────────────────────────────────────
@@ -408,6 +613,9 @@ async fn synthesize_to_wav(
     .await
     .map_err(|e| format!("blocking task: {e}"))?
     .map_err(|e| format!("synthesis: {e}"))?;
+    // Refresh `last_activity` after the heavy work completes so the
+    // idle-unload watcher counts from synth-end, not synth-start.
+    state.tts.note_activity().await;
 
     let samples_f32: Vec<f32> = pcm
         .flatten_all()
@@ -1216,5 +1424,46 @@ mod tests {
         assert_eq!(&wav[8..12], b"WAVE");
         assert_eq!(&wav[12..16], b"fmt ");
         assert_eq!(&wav[36..40], b"data");
+    }
+
+    /// A freshly-constructed `TtsLifecycleState` is idle: no pipeline
+    /// loaded, no inflight synths, no last_activity timestamp. The
+    /// engine id and idle_unload_secs are surfaced regardless.
+    #[tokio::test]
+    async fn lifecycle_starts_idle() {
+        let life = TtsLifecycleState::new(0);
+        let info = life.status_snapshot().await;
+        assert_eq!(info.state, "idle");
+        assert!(!info.loaded);
+        assert_eq!(info.inflight_synths, 0);
+        assert!(info.last_activity_secs.is_none());
+        assert!(info.boot_elapsed_secs.is_none());
+        assert!(info.uptime_secs.is_none());
+        assert_eq!(info.engine, "voxtral-4b-tts via burn-server-native");
+        assert_eq!(info.idle_unload_secs, 0);
+        assert!(info.autostart);
+    }
+
+    /// `note_activity` refreshes `last_activity` even before the
+    /// pipeline is loaded — the field becomes Some(elapsed≈0).
+    #[tokio::test]
+    async fn lifecycle_note_activity_updates_last_activity() {
+        let life = TtsLifecycleState::new(0);
+        life.note_activity().await;
+        let info = life.status_snapshot().await;
+        assert!(
+            info.last_activity_secs.is_some(),
+            "last_activity should be set after note_activity()"
+        );
+        let secs = info.last_activity_secs.unwrap();
+        assert!(secs < 1.0, "last_activity should be very recent: {secs}");
+    }
+
+    /// Configured `idle_unload_secs` round-trips through the snapshot.
+    #[tokio::test]
+    async fn lifecycle_idle_unload_secs_round_trips() {
+        let life = TtsLifecycleState::new(900);
+        let info = life.status_snapshot().await;
+        assert_eq!(info.idle_unload_secs, 900);
     }
 }

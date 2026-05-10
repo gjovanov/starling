@@ -104,6 +104,10 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config, webrtc_api: webrtc::api::API) -> Self {
+        #[cfg(feature = "voxtral-tts")]
+        let tts = Arc::new(crate::server::tts_routes::TtsLifecycleState::new(
+            config.tts_idle_unload_secs,
+        ));
         Self {
             config,
             webrtc_api,
@@ -112,7 +116,7 @@ impl AppState {
             client_count: AtomicU64::new(0),
             engine: None,
             #[cfg(feature = "voxtral-tts")]
-            tts: Arc::new(crate::server::tts_routes::TtsLifecycleState::new()),
+            tts,
         }
     }
 

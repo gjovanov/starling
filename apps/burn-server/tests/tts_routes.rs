@@ -57,6 +57,7 @@ fn build_tts_test_app() -> Router {
         force_relay: false,
         tts_output_dir: tmp_dir.join("tts_output"),
         tts_long_max_secs: 180,
+        tts_idle_unload_secs: 0,
     };
 
     let media_engine = webrtc::api::media_engine::MediaEngine::default();
@@ -194,8 +195,25 @@ async fn status_reports_unloaded_before_any_synthesis() {
     let app = build_tts_test_app();
     let (status, body) = json_get(&app, "/api/tts/status").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["data"]["loaded"], false);
-    assert!(body["data"]["uptime_secs"].is_null());
+    let data = &body["data"];
+    // Backwards-compat fields (Phase 2-G shape) — frontend still reads
+    // these.
+    assert_eq!(data["loaded"], false);
+    assert!(data["uptime_secs"].is_null());
+    // Phase 3-D + 3-B fields (frontend renderTtsEngineBadge now reads
+    // these). Field names mirror vllm-server's status response so the
+    // shared frontend works against either backend.
+    assert_eq!(data["state"], "idle");
+    assert_eq!(data["inflight_synths"], 0);
+    assert!(data["boot_elapsed_secs"].is_null());
+    assert!(data["boot_timeout_secs"].is_null());
+    assert!(data["last_activity_secs"].is_null());
+    assert!(data["blocked_reason"].is_null());
+    assert!(data["error"].is_null());
+    assert_eq!(data["autostart"], true);
+    assert_eq!(data["engine"], "voxtral-4b-tts via burn-server-native");
+    // Phase 3-D test config sets `tts_idle_unload_secs: 0` (disabled).
+    assert_eq!(data["idle_unload_secs"], 0);
 }
 
 // ── /api/tts/synthesize validation ──────────────────────────────────
@@ -431,6 +449,7 @@ fn build_app_and_output_dir() -> (Router, std::path::PathBuf) {
         force_relay: false,
         tts_output_dir: out_dir.clone(),
         tts_long_max_secs: 180,
+        tts_idle_unload_secs: 0,
     };
     let media_engine = webrtc::api::media_engine::MediaEngine::default();
     let registry = webrtc::interceptor::registry::Registry::new();

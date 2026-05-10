@@ -193,6 +193,11 @@ async def get_tts_status() -> ApiResponse:
         "blocked_reason": info.blocked_reason,
         "error": info.error,
         "autostart": lifecycle.autostart,
+        # Phase 3-B: stable backend identifier surfaced in the
+        # frontend's TTS engine badge tooltip. burn-server reports
+        # "voxtral-4b-tts via burn-server-native"; we report the
+        # vllm-omni proxy variant.
+        "engine": "voxtral-4b-tts via vllm-omni",
     })
 
 

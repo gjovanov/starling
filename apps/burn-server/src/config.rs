@@ -115,6 +115,13 @@ pub struct Config {
     /// `tts_long_max_secs` (default 180 s).
     #[arg(long, env = "BURN_TTS_LONG_MAX_SECS", default_value = "180")]
     pub tts_long_max_secs: u64,
+
+    /// Drop the TTS pipeline after this many seconds of inactivity,
+    /// freeing ~12 GiB of resident weights. The next `/api/tts/*`
+    /// hit transparently re-loads. Set to `0` to disable. Mirrors
+    /// vllm-server's `tts_idle_unload_secs` (default 600 s).
+    #[arg(long, env = "BURN_TTS_IDLE_UNLOAD_SECS", default_value = "600")]
+    pub tts_idle_unload_secs: u64,
 }
 
 impl Config {
