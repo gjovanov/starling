@@ -122,6 +122,40 @@ pub struct Config {
     /// vllm-server's `tts_idle_unload_secs` (default 600 s).
     #[arg(long, env = "BURN_TTS_IDLE_UNLOAD_SECS", default_value = "600")]
     pub tts_idle_unload_secs: u64,
+
+    /// Directory where uploaded reference-audio voice clones live
+    /// (`<id>.wav` + `<id>.json` + `_audit.log`). Mirrors vllm-server's
+    /// `tts_voice_refs_dir`.
+    #[arg(long, env = "BURN_TTS_VOICE_REFS_DIR", default_value = "./tts_voice_refs")]
+    pub tts_voice_refs_dir: PathBuf,
+
+    /// Maximum number of voice clones a single server may host. New
+    /// uploads beyond this fail with a clear error directing the user
+    /// to delete an existing one first.
+    #[arg(long, env = "BURN_TTS_MAX_VOICE_REFS", default_value = "50")]
+    pub tts_max_voice_refs: usize,
+
+    /// Hard cap on the size of an uploaded reference audio file in
+    /// bytes. 5 MB ≈ 30 s of 24 kHz mono PCM16 + extension headroom.
+    #[arg(long, env = "BURN_TTS_MAX_REF_AUDIO_BYTES", default_value = "5000000")]
+    pub tts_max_ref_audio_bytes: usize,
+
+    /// Minimum reference audio duration in seconds. Below this Voxtral
+    /// can't extract a stable speaker embedding.
+    #[arg(long, env = "BURN_TTS_MIN_REF_DURATION_SECS", default_value = "5.0")]
+    pub tts_min_ref_duration_secs: f64,
+
+    /// Maximum reference audio duration in seconds. Above this is
+    /// wasteful and produces no quality gain.
+    #[arg(long, env = "BURN_TTS_MAX_REF_DURATION_SECS", default_value = "30.0")]
+    pub tts_max_ref_duration_secs: f64,
+
+    /// Require the multipart upload to include
+    /// `permission_confirmed=true`. Server-side enforced; the
+    /// frontend has its own checkbox but a Playwright test bypasses
+    /// the client gate to verify the server gate.
+    #[arg(long, env = "BURN_TTS_REQUIRE_PERMISSION", default_value = "true")]
+    pub tts_require_permission: bool,
 }
 
 impl Config {

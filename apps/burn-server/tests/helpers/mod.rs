@@ -44,6 +44,12 @@ pub async fn build_test_app() -> Router {
         tts_output_dir: tmp_dir.join("tts_output"),
         tts_long_max_secs: 180,
         tts_idle_unload_secs: 0, // tests: keep loaded
+        tts_voice_refs_dir: tmp_dir.join("voice_refs"),
+        tts_max_voice_refs: 50,
+        tts_max_ref_audio_bytes: 5_000_000,
+        tts_min_ref_duration_secs: 5.0,
+        tts_max_ref_duration_secs: 30.0,
+        tts_require_permission: true,
     };
 
     // Create a minimal WebRTC API (no media engine needed for API tests)

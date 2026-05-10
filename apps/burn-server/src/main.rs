@@ -217,11 +217,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/tts/voices", get(server::tts_routes::list_voices))
         .route(
             "/api/tts/voices/upload",
-            post(server::tts_routes::upload_voice_ref_stub),
+            post(server::tts_routes::upload_voice_ref),
         )
         .route(
             "/api/tts/voices/:ref_id",
-            axum::routing::delete(server::tts_routes::delete_voice_ref_stub),
+            axum::routing::delete(server::tts_routes::delete_voice_ref),
         )
         .route("/api/tts/config", get(server::tts_routes::get_tts_config))
         .route("/api/tts/status", get(server::tts_routes::get_tts_status))

@@ -58,6 +58,12 @@ fn build_tts_test_app() -> Router {
         tts_output_dir: tmp_dir.join("tts_output"),
         tts_long_max_secs: 180,
         tts_idle_unload_secs: 0,
+        tts_voice_refs_dir: tmp_dir.join("voice_refs"),
+        tts_max_voice_refs: 50,
+        tts_max_ref_audio_bytes: 5_000_000,
+        tts_min_ref_duration_secs: 5.0,
+        tts_max_ref_duration_secs: 30.0,
+        tts_require_permission: true,
     };
 
     let media_engine = webrtc::api::media_engine::MediaEngine::default();
@@ -71,10 +77,10 @@ fn build_tts_test_app() -> Router {
 
     Router::new()
         .route("/api/tts/voices", get(tts_routes::list_voices))
-        .route("/api/tts/voices/upload", post(tts_routes::upload_voice_ref_stub))
+        .route("/api/tts/voices/upload", post(tts_routes::upload_voice_ref))
         .route(
             "/api/tts/voices/:ref_id",
-            delete(tts_routes::delete_voice_ref_stub),
+            delete(tts_routes::delete_voice_ref),
         )
         .route("/api/tts/config", get(tts_routes::get_tts_config))
         .route("/api/tts/status", get(tts_routes::get_tts_status))
@@ -390,8 +396,11 @@ async fn output_delete_404s_for_missing_file() {
 
 // ── /api/tts/voices/* cloning stubs ─────────────────────────────────
 
+/// Phase 3-E1: upload route now exists; missing audio_sample yields a
+/// 200 envelope (per ApiResponse convention) with `success: false`.
+/// Body parse errors and validation errors share the same envelope.
 #[tokio::test]
-async fn voice_clone_upload_returns_501() {
+async fn voice_clone_upload_rejects_empty_body() {
     let app = build_tts_test_app();
     let resp = app
         .clone()
@@ -399,22 +408,40 @@ async fn voice_clone_upload_returns_501() {
             Request::builder()
                 .method("POST")
                 .uri("/api/tts/voices/upload")
-                .body(Body::empty())
+                .header("content-type", "multipart/form-data; boundary=----X")
+                .body(Body::from("------X--\r\n"))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    // Either an HTTP-level error (multipart parse failed) OR a
+    // success: false envelope. Either is acceptable shape — what we
+    // care about is that the request didn't 501 anymore.
+    assert_ne!(status, StatusCode::NOT_IMPLEMENTED);
+    if status == StatusCode::OK {
+        assert_eq!(body["success"], false, "got: {body}");
+    }
 }
 
+/// Phase 3-E1: delete route uses path validation. A bogus id yields a
+/// validation error envelope, not 501.
 #[tokio::test]
-async fn voice_clone_delete_returns_501() {
+async fn voice_clone_delete_validates_ref_id() {
     let app = build_tts_test_app();
-    let (status, body) = delete_(&app, "/api/tts/voices/some-uuid").await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    let (status, body) = delete_(&app, "/api/tts/voices/some-id-format").await;
+    assert_ne!(status, StatusCode::NOT_IMPLEMENTED);
+    // The message either says "invalid ref_id" (sanitiser rejected) or
+    // "voice ref not found" (passed sanitiser, file missing). Either
+    // is correct for an unknown id.
+    let err = body["error"].as_str().unwrap_or("");
     assert!(
-        body["error"].as_str().unwrap_or("").contains("voice cloning"),
-        "got: {body}"
+        err.contains("invalid ref_id") || err.contains("not found"),
+        "expected validation/not-found error, got: {body}"
     );
 }
 
@@ -450,6 +477,12 @@ fn build_app_and_output_dir() -> (Router, std::path::PathBuf) {
         tts_output_dir: out_dir.clone(),
         tts_long_max_secs: 180,
         tts_idle_unload_secs: 0,
+        tts_voice_refs_dir: tmp_dir.join("voice_refs"),
+        tts_max_voice_refs: 50,
+        tts_max_ref_audio_bytes: 5_000_000,
+        tts_min_ref_duration_secs: 5.0,
+        tts_max_ref_duration_secs: 30.0,
+        tts_require_permission: true,
     };
     let media_engine = webrtc::api::media_engine::MediaEngine::default();
     let registry = webrtc::interceptor::registry::Registry::new();

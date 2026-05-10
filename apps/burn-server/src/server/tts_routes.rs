@@ -417,10 +417,11 @@ pub struct VoiceEntry {
     pub kind: &'static str,
 }
 
-pub async fn list_voices(State(_state): State<Arc<AppState>>) -> Response {
-    // Frontend expects a flat list (the voice catalog is a separate
-    // "data" array, not nested inside `{voices: [...]}`).
-    let voices: Vec<VoiceEntry> = CANONICAL_VOICES
+pub async fn list_voices(State(state): State<Arc<AppState>>) -> Response {
+    // Frontend expects a flat list — built-in voices first, cloned
+    // voices appended. Both share the same `kind`-tagged shape so the
+    // tab can render them with one template.
+    let mut voices: Vec<VoiceEntry> = CANONICAL_VOICES
         .iter()
         .map(|v| VoiceEntry {
             id: v.id.to_string(),
@@ -431,7 +432,24 @@ pub async fn list_voices(State(_state): State<Arc<AppState>>) -> Response {
             kind: "builtin",
         })
         .collect();
-    // (No cloned voices yet on burn-server — Phase 2-J.)
+
+    // Cloned voices: enumerate `<tts_voice_refs_dir>/*.json`. Path is
+    // server-controlled (config knob) so it's safe to read directly;
+    // the per-ref sanitiser was applied at upload time and the loader
+    // skips corrupt sidecars without aborting the listing.
+    let refs_dir = &state.config.tts_voice_refs_dir;
+    for r in crate::inference::voxtral_tts::list_refs(refs_dir) {
+        voices.push(VoiceEntry {
+            // The voice's lookup id (from `voice_ref_id`) — frontend
+            // sends this as `voice_ref_id` on synth requests.
+            id: r.id,
+            display_name: r.name,
+            language: "Cloned".to_string(),
+            language_code: "xx".to_string(),
+            gender: "unknown".to_string(),
+            kind: "cloned",
+        });
+    }
     ApiResponse::ok(voices).into_response()
 }
 
@@ -1322,36 +1340,153 @@ pub async fn delete_output(
     }
 }
 
-// ── Voice cloning stubs (501 until burn-server implements --task-type Base)
+// ── Voice cloning — Phase 3-E1 (storage + upload + delete) ──────────
+//
+// The synthesis half (Phase 3-E2 — ref-encoder forward pass) is not
+// done yet, so `POST /api/tts/synthesize` with `voice_ref_id` still
+// returns 501. Upload+delete + listing under `/api/tts/voices` work
+// against burn-server today.
 
-pub async fn upload_voice_ref_stub() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(crate::server::routes::ApiResponse::<()> {
-            success: false,
-            data: None,
-            error: Some(
-                "voice cloning is not supported on burn-server yet — use vllm-server for cloning"
-                    .to_string(),
-            ),
-        }),
-    )
-        .into_response()
+#[derive(Serialize)]
+pub struct VoiceRefPublic {
+    pub id: String,
+    pub name: String,
+    pub ref_text: String,
+    pub permission_confirmed: bool,
+    pub sample_rate: u32,
+    pub duration_secs: f64,
+    pub created_at: f64,
+    pub kind: &'static str,
 }
 
-pub async fn delete_voice_ref_stub(PathParam(_ref_id): PathParam<String>) -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(crate::server::routes::ApiResponse::<()> {
-            success: false,
-            data: None,
-            error: Some(
-                "voice cloning is not supported on burn-server yet — use vllm-server for cloning"
-                    .to_string(),
-            ),
-        }),
-    )
-        .into_response()
+impl From<crate::inference::voxtral_tts::VoiceRef> for VoiceRefPublic {
+    fn from(v: crate::inference::voxtral_tts::VoiceRef) -> Self {
+        Self {
+            id: v.id,
+            name: v.name,
+            ref_text: v.ref_text,
+            permission_confirmed: v.permission_confirmed,
+            sample_rate: v.sample_rate,
+            duration_secs: v.duration_secs,
+            created_at: v.created_at,
+            kind: "cloned",
+        }
+    }
+}
+
+pub async fn upload_voice_ref(
+    State(state): State<Arc<AppState>>,
+    mut multipart: axum::extract::Multipart,
+) -> Response {
+    // First check the per-server limit so we fail fast before reading
+    // the (potentially large) audio body.
+    let existing = crate::inference::voxtral_tts::list_refs(&state.config.tts_voice_refs_dir);
+    if existing.len() >= state.config.tts_max_voice_refs {
+        return error_response(&format!(
+            "voice ref limit reached ({}); delete an existing one first",
+            state.config.tts_max_voice_refs
+        ))
+        .into_response();
+    }
+
+    let mut audio_bytes: Option<Vec<u8>> = None;
+    let mut audio_filename: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut ref_text: Option<String> = None;
+    let mut permission_confirmed: bool = false;
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => {
+                return error_response(&format!("multipart parse error: {e}"))
+                    .into_response()
+            }
+        };
+        match field.name().unwrap_or("") {
+            "audio_sample" => {
+                audio_filename = field.file_name().map(|s| s.to_string());
+                audio_bytes = match field.bytes().await {
+                    Ok(b) => Some(b.to_vec()),
+                    Err(e) => {
+                        return error_response(&format!("reading audio_sample: {e}"))
+                            .into_response()
+                    }
+                };
+            }
+            "name" => {
+                name = field.text().await.ok();
+            }
+            "ref_text" => {
+                ref_text = field.text().await.ok();
+            }
+            "permission_confirmed" => {
+                if let Ok(text) = field.text().await {
+                    permission_confirmed = text == "true" || text == "1";
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Some(audio_bytes) = audio_bytes else {
+        return error_response("missing audio_sample field").into_response();
+    };
+    let audio_filename = audio_filename.unwrap_or_else(|| "upload.wav".to_string());
+    let name = name.unwrap_or_default();
+    let ref_text = ref_text.unwrap_or_default();
+
+    // Take ownership of all the values for the blocking task. The
+    // config struct is small + Cloneable; we pass owned bytes for the
+    // audio.
+    let voice_refs_dir = state.config.tts_voice_refs_dir.clone();
+    let max_audio_bytes = state.config.tts_max_ref_audio_bytes;
+    let min_dur = state.config.tts_min_ref_duration_secs;
+    let max_dur = state.config.tts_max_ref_duration_secs;
+    let require_perm = state.config.tts_require_permission;
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::inference::voxtral_tts::save_ref(
+            crate::inference::voxtral_tts::SaveRefArgs {
+                audio_bytes: &audio_bytes,
+                audio_filename: &audio_filename,
+                name: &name,
+                ref_text: &ref_text,
+                permission_confirmed,
+                voice_refs_dir: &voice_refs_dir,
+                max_audio_bytes,
+                min_duration_secs: min_dur,
+                max_duration_secs: max_dur,
+                require_permission: require_perm,
+            },
+        )
+    })
+    .await;
+
+    match result {
+        Ok(Ok(info)) => ApiResponse::ok(VoiceRefPublic::from(info)).into_response(),
+        Ok(Err(e)) => error_response(&format!("upload rejected: {e}")).into_response(),
+        Err(e) => error_response(&format!("blocking task: {e}")).into_response(),
+    }
+}
+
+pub async fn delete_voice_ref(
+    State(state): State<Arc<AppState>>,
+    PathParam(ref_id): PathParam<String>,
+) -> Response {
+    let dir = state.config.tts_voice_refs_dir.clone();
+    let ref_id_cl = ref_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::inference::voxtral_tts::delete_ref(&dir, &ref_id_cl)
+    })
+    .await;
+    match result {
+        Ok(Ok(true)) => ApiResponse::ok(serde_json::json!({"deleted": ref_id})).into_response(),
+        Ok(Ok(false)) => error_response("voice ref not found").into_response(),
+        Ok(Err(e)) => error_response(&format!("invalid ref_id: {e}")).into_response(),
+        Err(e) => error_response(&format!("blocking task: {e}")).into_response(),
+    }
 }
 
 #[cfg(test)]
