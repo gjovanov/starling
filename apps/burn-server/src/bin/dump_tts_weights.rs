@@ -92,8 +92,40 @@ fn main() -> Result<()> {
     );
     println!("Path: {}", inv.path().display());
 
-    // Touch ModuleGroup so unused-import lint stays quiet on minimal CLIs.
-    let _ = ModuleGroup::ALL.len();
+    // Voice-cloning capability check (Phase 3-E2).
+    //
+    // Voxtral's voice-cloning path requires the codec ENCODER weights
+    // (`audio_tokenizer.input_proj.*` + `audio_tokenizer.encoder_blocks.*`).
+    // These are NOT in the public Voxtral-4B-TTS-2603 checkpoint;
+    // vllm-omni's own source confirms `encode_waveforms requires
+    // encoder weights which are not available in the open-source
+    // checkpoint`. The reference voice embeddings ship pre-computed
+    // under `voice_embedding/`, but the encoder you'd use to embed a
+    // user-uploaded clip is missing — for both burn-server and
+    // vllm-server.
+    println!();
+    println!("Voice-cloning capability:");
+    let raw_keys: Vec<&str> = ModuleGroup::ALL
+        .iter()
+        .flat_map(|g| inv.keys_in(*g).iter().map(|s| s.as_str()))
+        .collect();
+    let has_input_proj = raw_keys.iter().any(|k| k.starts_with("audio_tokenizer.input_proj."));
+    let has_encoder_blocks = raw_keys
+        .iter()
+        .any(|k| k.starts_with("audio_tokenizer.encoder_blocks."));
+    if has_input_proj && has_encoder_blocks {
+        println!("  [OK] codec encoder weights present — voice cloning synthesis works");
+    } else {
+        println!("  [---] codec encoder weights ABSENT — voice cloning synthesis blocked");
+        println!(
+            "        (input_proj present: {}, encoder_blocks present: {})",
+            has_input_proj, has_encoder_blocks
+        );
+        println!(
+            "        Storage + listing under /api/tts/voices/upload still work; only the"
+        );
+        println!("        synthesis half is blocked. Affects burn-server AND vllm-server.");
+    }
 
     Ok(())
 }

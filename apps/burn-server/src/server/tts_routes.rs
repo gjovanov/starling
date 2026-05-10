@@ -827,13 +827,32 @@ pub async fn synthesize(
     }
 
     if req.voice_ref_id.is_some() {
+        // Phase 3-E2 finding: the open-source Voxtral-4B-TTS-2603
+        // checkpoint does NOT include the codec encoder weights
+        // (`audio_tokenizer.input_proj.*` and
+        // `audio_tokenizer.encoder_blocks.*`). vllm-omni's own source
+        // confirms: "encode_waveforms requires encoder weights which
+        // are not available in the open-source checkpoint." Without
+        // those weights, the reference audio cannot be tokenised into
+        // codec frames, so voice cloning synthesis is impossible —
+        // for both burn-server and vllm-server. Storage + listing
+        // (Phase 3-E1) work; synthesis is blocked on Mistral
+        // releasing an extended checkpoint or on a third-party
+        // ref-encoder port.
         return (
             StatusCode::NOT_IMPLEMENTED,
             Json(crate::server::routes::ApiResponse::<()> {
                 success: false,
                 data: None,
                 error: Some(
-                    "voice cloning (voice_ref_id) is not supported on burn-server yet"
+                    "voice cloning synthesis is not supported by the \
+                     open-source Voxtral-4B-TTS-2603 checkpoint (the codec \
+                     encoder weights — `audio_tokenizer.input_proj.*` + \
+                     `audio_tokenizer.encoder_blocks.*` — are not in the \
+                     public release). Storage and listing of cloned voices \
+                     work via /api/tts/voices/upload and DELETE; synthesis \
+                     is upstream-blocked for both burn-server and \
+                     vllm-server. See CLAUDE.md for details."
                         .to_string(),
                 ),
             }),
