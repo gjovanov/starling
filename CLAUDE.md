@@ -278,11 +278,15 @@ cd apps/burn-server
 #   FORCE_RELAY=true
 
 # One-stop build (reads BURN_BACKEND from .env):
-./init.sh
+./init.sh                # ASR only (default)
+./init.sh --tts          # ASR + TTS routes (adds the voxtral-tts cargo feature)
+./init.sh --tts --no-model
+                         # Build only (skip the 17 GB model download)
 
 # Or build manually:
 # GPU BF16:    cargo build --release --features candle-native-flash
 # CPU Q4:      RUSTFLAGS="-C target-cpu=native" cargo build --release --features candle-cpu-ggml
+# With TTS:    append ,voxtral-tts to the --features list (or use `./init.sh --tts`).
 
 # Start the server (port 8091)
 ./start.sh
@@ -389,7 +393,10 @@ End-to-end pipeline runs on the real 4B-param checkpoint.
 **Build:**
 ```bash
 cd apps/burn-server
-cargo build --release --features voxtral-tts            # production
+./init.sh --tts                                          # production build (one-stop)
+# Equivalent manual invocation if `--tts` is composed with a non-default ASR backend:
+cargo build --release --features "candle-native-flash,voxtral-tts"
+
 cargo test  --release --features voxtral-tts --lib voxtral_tts::
 cargo run   --release --features voxtral-tts --bin dump-tts-weights
 ```
