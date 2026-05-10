@@ -56,6 +56,7 @@ fn build_tts_test_app() -> Router {
         turn_shared_secret: None,
         force_relay: false,
         tts_output_dir: tmp_dir.join("tts_output"),
+        tts_long_max_secs: 180,
     };
 
     let media_engine = webrtc::api::media_engine::MediaEngine::default();
@@ -429,6 +430,7 @@ fn build_app_and_output_dir() -> (Router, std::path::PathBuf) {
         turn_shared_secret: None,
         force_relay: false,
         tts_output_dir: out_dir.clone(),
+        tts_long_max_secs: 180,
     };
     let media_engine = webrtc::api::media_engine::MediaEngine::default();
     let registry = webrtc::interceptor::registry::Registry::new();

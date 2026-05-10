@@ -29,9 +29,10 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
+    body::Bytes,
     extract::{Path as PathParam, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
@@ -39,7 +40,7 @@ use axum::{
 };
 use candle_core::{DType, Device, Tensor};
 use serde::{Deserialize, Serialize};
-use tokio::sync::OnceCell;
+use tokio::sync::{mpsc, OnceCell};
 
 use crate::server::routes::{error_response, ApiResponse};
 use crate::server::state::AppState;
@@ -587,10 +588,10 @@ pub async fn synthesize(
     if req.text.trim().is_empty() {
         return error_response("text is empty").into_response();
     }
-    if req.text.len() > TTS_MAX_CHARS {
+    if req.text.chars().count() > TTS_MAX_CHARS {
         return error_response(&format!(
             "text exceeds max length ({} > {})",
-            req.text.len(),
+            req.text.chars().count(),
             TTS_MAX_CHARS
         ))
         .into_response();
@@ -646,29 +647,93 @@ pub async fn synthesize(
         Err(e) => return error_response(&format!("voice load failed: {e}")).into_response(),
     };
 
-    let prompt_ids = match crate::inference::voxtral_tts::build_voice_prompt(
-        &tk,
-        &req.text,
-        voice_n_rows,
-    ) {
-        Ok(ids) => ids,
-        Err(e) => {
-            return error_response(&format!("prompt build failed: {e}")).into_response();
+    // Long-form support: split into sentences. A single sentence
+    // without terminator yields one chunk, matching vllm-server's
+    // `parts = split_sentences(text) or [text]` fallback.
+    let parts: Vec<String> = {
+        let split = crate::inference::voxtral_tts::split_sentences(&req.text);
+        if split.is_empty() {
+            vec![req.text.clone()]
+        } else {
+            split
         }
     };
 
-    let synth = match synthesize_to_wav(&state, prompt_ids, &voice_id, req.max_frames, req.seed)
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return error_response(&e).into_response(),
-    };
-
     if !req.save {
-        return wav_response(synth);
+        return stream_synth_response(
+            state.clone(),
+            tk,
+            voice_id,
+            voice_n_rows,
+            parts,
+            req.max_frames,
+            req.seed,
+        );
     }
 
-    // ── Save-to-disk branch ─────────────────────────────────────────
+    // ── Save-to-disk branch (long-form: collect all PCM, wrap once) ─
+    let deadline = Instant::now() + Duration::from_secs(state.config.tts_long_max_secs);
+    let total_start = Instant::now();
+    let mut all_pcm16: Vec<u8> = Vec::new();
+    let mut hit_deadline = false;
+    let n_parts = parts.len();
+    for (idx, sentence) in parts.iter().enumerate() {
+        if Instant::now() > deadline {
+            tracing::warn!(
+                "TTS save: hit {}s wall-clock cap at sentence {}/{}",
+                state.config.tts_long_max_secs,
+                idx,
+                n_parts
+            );
+            hit_deadline = true;
+            break;
+        }
+        let prompt_ids = match crate::inference::voxtral_tts::build_voice_prompt(
+            &tk,
+            sentence,
+            voice_n_rows,
+        ) {
+            Ok(ids) => ids,
+            Err(e) => {
+                if idx == 0 {
+                    return error_response(&format!("prompt build failed: {e}")).into_response();
+                }
+                tracing::warn!(
+                    "TTS save: prompt build failed for sentence {}/{}: {e}",
+                    idx + 1,
+                    n_parts
+                );
+                continue;
+            }
+        };
+        let synth = match synthesize_to_wav(&state, prompt_ids, &voice_id, req.max_frames, req.seed)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                if idx == 0 {
+                    return error_response(&e).into_response();
+                }
+                tracing::warn!(
+                    "TTS save: synth failed for sentence {}/{}: {e}",
+                    idx + 1,
+                    n_parts
+                );
+                continue;
+            }
+        };
+        all_pcm16.extend(synth.pcm16);
+    }
+
+    if all_pcm16.is_empty() {
+        let msg = if hit_deadline {
+            "TTS synthesis exceeded wall-clock deadline before producing any audio"
+        } else {
+            "TTS synthesis produced no audio"
+        };
+        return error_response(msg).into_response();
+    }
+
     let out_dir = &state.config.tts_output_dir;
     if let Err(e) = std::fs::create_dir_all(out_dir) {
         return error_response(&format!("could not create output dir: {e}"))
@@ -692,30 +757,19 @@ pub async fn synthesize(
         ))
         .into_response();
     }
-    // Save-to-disk wants a real WAV file (proper RIFF size fields, not
-    // the streaming `0xFFFFFFFF` placeholders). Assemble from PCM
-    // bytes here using the per-file header encoder.
-    let wav_bytes = wrap_pcm16_in_wav_file(&synth.pcm16, 24000, 1, 16);
+    let wav_bytes = wrap_pcm16_in_wav_file(&all_pcm16, 24000, 1, 16);
     let bytes_written = match std::fs::write(&target, &wav_bytes) {
         Ok(()) => wav_bytes.len(),
         Err(e) => return error_response(&format!("could not write file: {e}")).into_response(),
     };
 
-    let elapsed_secs = synth
-        .meta
-        .get("elapsed_secs")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    let n_samples = synth
-        .meta
-        .get("samples")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let n_samples = all_pcm16.len() / 2;
     let duration_secs = if n_samples > 0 {
         Some(n_samples as f64 / 24000.0)
     } else {
         None
     };
+    let elapsed_secs = total_start.elapsed().as_secs_f64();
 
     ApiResponse::ok(TtsSynthesizeResponse {
         filename,
@@ -727,6 +781,134 @@ pub async fn synthesize(
         elapsed_secs,
     })
     .into_response()
+}
+
+/// Build a chunked `audio/wav` streaming response that synthesizes one
+/// sentence at a time, yielding the streaming WAV header up front and
+/// per-sentence PCM as each completes. Mirrors
+/// `apps/vllm-server/voxtral_server/api/tts_routes.py::_stream_response`
+/// without needing an upstream HTTP hop.
+///
+/// Disconnect handling: when the client drops the connection, axum drops
+/// the response body, which drops our `mpsc::Receiver`. The next
+/// `tx.send()` in the synth task errors, and we return early.
+///
+/// Wall-clock cap: `state.config.tts_long_max_secs` (default 180 s) —
+/// the synth task stops issuing new sentences past the deadline.
+///
+/// Failure handling: a first-sentence error yields an `Err` item to
+/// close the stream after the header (browser sees an aborted audio
+/// stream — harmless). Later-sentence errors are logged and skipped to
+/// keep partial output flowing.
+fn stream_synth_response(
+    state: Arc<AppState>,
+    tk: Arc<crate::inference::voxtral_tts::TekkenTokenizer>,
+    voice_id: String,
+    voice_n_rows: usize,
+    parts: Vec<String>,
+    max_frames: u32,
+    seed: u64,
+) -> Response {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    let deadline = Instant::now() + Duration::from_secs(state.config.tts_long_max_secs);
+
+    tokio::spawn(async move {
+        // 1. Header first — frontend parses it before any audio frames.
+        let header = streaming_wav_header(24000, 1, 16);
+        if tx.send(Ok(Bytes::from(header))).await.is_err() {
+            return;
+        }
+
+        let n_parts = parts.len();
+        for (idx, sentence) in parts.iter().enumerate() {
+            if Instant::now() > deadline {
+                tracing::warn!(
+                    "TTS stream: hit {}s wall-clock cap at sentence {}/{}",
+                    state.config.tts_long_max_secs,
+                    idx,
+                    n_parts
+                );
+                return;
+            }
+
+            let prompt_ids = match crate::inference::voxtral_tts::build_voice_prompt(
+                &tk,
+                sentence,
+                voice_n_rows,
+            ) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    if idx == 0 {
+                        let _ = tx
+                            .send(Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("prompt build failed: {e}"),
+                            )))
+                            .await;
+                        return;
+                    }
+                    tracing::warn!(
+                        "TTS stream: prompt build failed for sentence {}/{}: {e}",
+                        idx + 1,
+                        n_parts
+                    );
+                    continue;
+                }
+            };
+
+            let synth = match synthesize_to_wav(&state, prompt_ids, &voice_id, max_frames, seed)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    if idx == 0 {
+                        let _ = tx
+                            .send(Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                e.clone(),
+                            )))
+                            .await;
+                        return;
+                    }
+                    tracing::warn!(
+                        "TTS stream: synth failed for sentence {}/{}: {e}",
+                        idx + 1,
+                        n_parts
+                    );
+                    continue;
+                }
+            };
+
+            for chunk in synth.pcm16.chunks(STREAM_CHUNK_BYTES) {
+                if tx
+                    .send(Ok(Bytes::copy_from_slice(chunk)))
+                    .await
+                    .is_err()
+                {
+                    return; // client disconnected
+                }
+            }
+        }
+    });
+
+    // Wrap the mpsc receiver as a Stream via `unfold`. The receiver
+    // moves into the closure state and is polled on each tick.
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    let body = axum::body::Body::from_stream(stream);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "audio/wav")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "inline; filename=\"tts_synth.wav\"",
+        )
+        .header("Cache-Control", "no-store")
+        .body(body)
+        .unwrap()
+        .into_response()
 }
 
 fn sanitize_filename(name: &str) -> Result<String, String> {

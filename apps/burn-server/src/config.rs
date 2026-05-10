@@ -109,6 +109,12 @@ pub struct Config {
     /// Used by the `voxtral-tts` feature's save-to-disk path.
     #[arg(long, env = "STARLING_TTS_OUTPUT_DIR", default_value = "./tts_output")]
     pub tts_output_dir: PathBuf,
+
+    /// Maximum wall-clock seconds a single long-form synthesis may run
+    /// before the streaming response is closed. Mirrors vllm-server's
+    /// `tts_long_max_secs` (default 180 s).
+    #[arg(long, env = "BURN_TTS_LONG_MAX_SECS", default_value = "180")]
+    pub tts_long_max_secs: u64,
 }
 
 impl Config {

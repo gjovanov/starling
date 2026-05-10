@@ -42,6 +42,7 @@ pub async fn build_test_app() -> Router {
         turn_shared_secret: None,
         force_relay: false,
         tts_output_dir: tmp_dir.join("tts_output"),
+        tts_long_max_secs: 180,
     };
 
     // Create a minimal WebRTC API (no media engine needed for API tests)

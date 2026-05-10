@@ -65,6 +65,12 @@ ggml-matmul = { path = "../../libs/ggml-matmul", optional = true }
 # Optional — only pulled in when the `voxtral-tts` feature is enabled.
 tokenizers = { version = "0.20", default-features = false, features = ["onig"], optional = true }
 
+# Regex (used by the TTS sentence splitter for long-form input).
+# Optional — only pulled in when the `voxtral-tts` feature is enabled.
+# `regex` is already a transitive dep via `tokenizers`; declaring it here
+# pins the API surface we rely on.
+regex = { version = "1", optional = true }
+
 # WebRTC
 webrtc = "0.11"
 audiopus = "0.3.0-rc.0"
@@ -101,7 +107,7 @@ candle-cpu-ggml = ["candle-cpu", "dep:ggml-matmul"]
 # acoustic transformer. The codec decoder + AR LLM bring more deps in
 # later phases; for now this gate covers Phase 2-B (weight inventory)
 # + Phase 2-C (flow-matching forward pass).
-voxtral-tts = ["dep:candle-core", "dep:candle-nn", "dep:tokenizers"]
+voxtral-tts = ["dep:candle-core", "dep:candle-nn", "dep:tokenizers", "dep:regex"]
 
 # [patch.crates-io] moved to workspace root Cargo.toml
 

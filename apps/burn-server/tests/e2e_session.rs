@@ -89,6 +89,8 @@ async fn build_e2e_app() -> (Router, Arc<AppState>) {
         turn_password: None,
         turn_shared_secret: None,
         force_relay: false,
+        tts_output_dir: tmp_dir.join("tts_output"),
+        tts_long_max_secs: 180,
     };
 
     let media_engine = webrtc::api::media_engine::MediaEngine::default();
