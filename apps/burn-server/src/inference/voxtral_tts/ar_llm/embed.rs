@@ -141,8 +141,32 @@ pub fn embed_audio_codes(
     }
     // Add per-codebook offsets: [B, n] + [n] broadcast.
     let global = audio_codes.broadcast_add(&offsets.unsqueeze(0)?)?;
+    // Defensive clamp: the audio_codebook_embeddings table has `vocab_size`
+    // rows; an out-of-range global index would trigger CUDA's
+    // `ids[id_i] < src_dim_size` assertion in `index_select`, which kills
+    // the whole CUDA context. Clamping to `vocab_size - 1` keeps the kernel
+    // alive at the cost of a tiny per-step branch. We also log any clamp
+    // event so a real out-of-range bug isn't silenced.
+    let vocab_size = audio_codebook_embeddings.embeddings().dim(0)? as u32;
+    let global_safe = {
+        let max_val_t = global.max_keepdim(D::Minus1)?.max_keepdim(0)?;
+        let max_val = max_val_t.to_dtype(DType::U32)?.to_vec2::<u32>()?[0][0];
+        if max_val >= vocab_size {
+            tracing::warn!(
+                target: "voxtral_tts::embed",
+                "audio_codes saturated: max global index {max_val} >= vocab {vocab_size}; \
+                 clamping to keep CUDA alive (this masks an upstream FMA out-of-range bug)"
+            );
+            // Clamp via min(global, vocab_size-1) implemented as
+            // global - relu(global - (vocab_size-1)).
+            let limit = Tensor::full(vocab_size - 1, global.shape(), global.device())?;
+            global.minimum(&limit)?
+        } else {
+            global
+        }
+    };
     // Lookup → [B, n, dim]
-    let embeds = audio_codebook_embeddings.forward(&global)?;
+    let embeds = audio_codebook_embeddings.forward(&global_safe)?;
     // Sum across codebook dim → [B, dim], then unsqueeze to [B, 1, dim].
     Ok(embeds.sum(1)?.unsqueeze(1)?)
 }

@@ -110,8 +110,32 @@ impl TtsPipeline {
             return Tensor::zeros((1, 1, 0), self.dtype, &self.device)
                 .map_err(anyhow::Error::from);
         }
+        // The FMA + autoregressor emit codes in the AR LLM's address
+        // space — that is, the raw codebook index PLUS `AudioSpecialTokens::
+        // COUNT` (= 2) so that 0/1 are reserved for EMPTY_AUDIO / END_AUDIO.
+        // The codec's quantizer (semantic + acoustic) expects raw codebook
+        // indices in `[0, codebook_size)`, so we have to subtract the
+        // offset here. Matches upstream
+        // `vllm_omni…voxtral_tts_audio_tokenizer.py::decode_helper_batch_async`
+        // line `audio_tokens = codes[:cutting_point] - 2` exactly. Without
+        // this step, semantic codes of 8192-8193 (which are valid in the
+        // AR LLM space) overflow the codec's [8192, 256] semantic
+        // embedding and the CUDA `index_select` kernel fires the
+        // `ids[id_i] < src_dim_size` assertion, killing the CUDA context
+        // for any subsequent synth on the same process.
+        let count = super::flow_matching::args::AudioSpecialTokens::COUNT as u32;
+        let count_t = Tensor::full(count, codes.shape(), &self.device)?;
+        // Clamp first so we never produce a negative result on the subtract
+        // (which would silently wrap around in u32 to a huge value and
+        // re-trigger the same out-of-range CUDA assertion). Semantic codes
+        // 0 (EMPTY) and 1 (END) shouldn't reach this code path because the
+        // autoregressor breaks on END and EMPTY is masked out by the
+        // semantic logit mask — but if either does slip through, clamping
+        // to `count` (so subtract → 0) keeps the codec alive.
+        let codes_clamped = codes.maximum(&count_t)?;
+        let codes_raw = (codes_clamped - count_t)?;
         // Reshape codes [n, 37] → [1, 37, n] for the codec's BCT layout.
-        let codes_bct = codes.t()?.unsqueeze(0)?.contiguous()?;
+        let codes_bct = codes_raw.t()?.unsqueeze(0)?.contiguous()?;
         self.codec.decode(&codes_bct, self.dtype)
     }
 }
