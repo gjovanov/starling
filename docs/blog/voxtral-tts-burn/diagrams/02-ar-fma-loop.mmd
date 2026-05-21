@@ -1,0 +1,26 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#eee', 'lineColor': '#e94560', 'secondaryColor': '#0f3460'}}}%%
+graph LR
+    PROMPT["Prompt<br/>BOS + voice prefix + BEGIN_AUDIO<br/>+ AUDIO×N_voice + TEXT_TO_AUDIO<br/>+ BPE(text) + AUDIO_TO_TEXT + BEGIN_AUDIO"]
+    AR[AR LLM step<br/>predict next audio code<br/>multi-codebook embedding feedback]
+    FMA[Flow-matching autoregressor<br/>3 layers · 8 Euler steps · CFG α=1.2<br/>llm_hidden → audio frame embedding]
+    CODEC[Codec decode<br/>8 blocks · sliding window<br/>frame embedding → 1920 PCM samples]
+    PCM[24 kHz mono s16le PCM]
+    HALT{END_AUDIO?}
+
+    PROMPT --> AR
+    AR --> FMA
+    FMA --> CODEC
+    CODEC --> PCM
+    AR --> HALT
+    HALT -->|no| AR
+    HALT -->|yes| DONE[stream end]
+
+    classDef hotStyle fill:#e94560,stroke:#1a1a2e,stroke-width:2px,color:#fff
+    classDef warmStyle fill:#533483,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef coldStyle fill:#0f3460,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef outStyle fill:#16213e,stroke:#e94560,stroke-width:1px,color:#eee
+
+    class AR hotStyle
+    class FMA,CODEC warmStyle
+    class PROMPT coldStyle
+    class PCM,DONE outStyle

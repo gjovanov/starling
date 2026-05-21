@@ -1,0 +1,17 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#eee', 'lineColor': '#e94560', 'secondaryColor': '#0f3460'}}}%%
+graph TB
+    subgraph GPU["24 GiB GPU"]
+        direction LR
+        ASR["ASR<br/>Voxtral-Mini-4B<br/>~9 GB BF16<br/>util 0.45 / mml 4096"]
+        BUF[" "]
+        TTS["TTS (lazy)<br/>Voxtral-4B-TTS<br/>~12 GB BF16<br/>spawn/unload"]
+    end
+    note["Either ASR + idle headroom OR ASR + TTS during synthesis"]
+    GPU --- note
+
+    classDef asrStyle fill:#0f3460,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef ttsStyle fill:#533483,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef noteStyle fill:none,stroke:none,color:#a0a0a0
+    class ASR asrStyle
+    class TTS ttsStyle
+    class note noteStyle

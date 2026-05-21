@@ -1,0 +1,26 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#eee', 'lineColor': '#e94560', 'secondaryColor': '#0f3460'}}}%%
+graph LR
+    UP[vllm-omni Python<br/>upstream reference]
+    DUMP["dump_tts_*.py scripts<br/>captures inputs + per-block intermediates"]
+    SAFE["*.safetensors fixtures<br/>committed under<br/>apps/burn-server/test_data/tts_golden/"]
+    RUST[Rust pipeline<br/>candle 0.10]
+    DIFF{bit-exact<br/>or bf16-close?}
+    GREEN[✅ green]
+    RED[🔴 red — bisect]
+
+    UP --> DUMP --> SAFE --> RUST --> DIFF
+    DIFF -->|F32 single-frame| GREEN
+    DIFF -->|BF16 multi-frame within ε| GREEN
+    DIFF -->|otherwise| RED
+
+    classDef pyStyle fill:#0f3460,stroke:#e94560,stroke-width:1px,color:#eee
+    classDef goldStyle fill:#533483,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef rustStyle fill:#e94560,stroke:#1a1a2e,stroke-width:2px,color:#fff
+    classDef goodStyle fill:#16213e,stroke:#e94560,stroke-width:1px,color:#eee
+    classDef badStyle fill:#1a1a2e,stroke:#e94560,stroke-width:2px,color:#a0a0a0,stroke-dasharray: 5 5
+
+    class UP,DUMP pyStyle
+    class SAFE goldStyle
+    class RUST rustStyle
+    class GREEN goodStyle
+    class RED badStyle

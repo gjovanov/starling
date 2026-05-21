@@ -1,0 +1,12 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#eee', 'lineColor': '#e94560', 'secondaryColor': '#0f3460'}}}%%
+stateDiagram-v2
+    [*] --> Connecting
+    Connecting --> Greeting: ws open
+    Greeting --> Sending: session.update sent\n+ reader task spawned
+    Sending --> Sending: PCM frame (20 ms)\n+ delta events drained
+    Sending --> Committing: input_audio_buffer.commit\nevery N frames
+    Committing --> Sending: ack
+    Sending --> Rotating: 200 commits reached
+    Rotating --> Sending: new vLLM session
+    Sending --> Closing: client done / error
+    Closing --> [*]

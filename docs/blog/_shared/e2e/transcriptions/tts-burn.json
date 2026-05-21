@@ -1,0 +1,32 @@
+[
+  {
+    "scene": 1,
+    "text": "Voxtral-4B-TTS on burn-server. Native Rust port \u2014 no Python, no vllm-omni subprocess.",
+    "duration": 4500
+  },
+  {
+    "scene": 2,
+    "text": "386 BF16 tensors loaded into one Axum process. Engine badge says \u2018burn-tts\u2019.",
+    "duration": 4500
+  },
+  {
+    "scene": 3,
+    "text": "Same ~150-word excerpt as Post 3 \u2014 direct A/B against the Python reference.",
+    "duration": 4500
+  },
+  {
+    "scene": 4,
+    "text": "Generate. AR LLM \u2194 FMA loop \u2192 codec \u2192 24 kHz PCM \u2192 streaming WAV.",
+    "duration": 4500
+  },
+  {
+    "scene": 5,
+    "text": "FMA + codec are bit-exact against vllm-omni on F32. Same audio, fewer dependencies.",
+    "duration": 5000
+  },
+  {
+    "scene": 6,
+    "text": "Done. One binary, two models, four backends. Welcome to the Starling stack.",
+    "duration": 5000
+  }
+]

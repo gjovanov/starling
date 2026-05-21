@@ -1,0 +1,36 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#eee', 'primaryBorderColor': '#16213e', 'lineColor': '#e94560', 'secondaryColor': '#0f3460', 'tertiaryColor': '#533483'}}}%%
+graph LR
+    subgraph BROWSER["Browser (Chrome)"]
+        MIC[Mic / Tab Audio]
+        WRTC_OUT[aiortc client<br/>WebRTC Opus]
+        SUBS[Live subtitle div]
+    end
+
+    subgraph FASTAPI["FastAPI :8090"]
+        WS[WebSocket<br/>/ws/&lt;session_id&gt;]
+        AIORTC[aiortc server<br/>SDP + ICE]
+        FFMPEG[FFmpeg<br/>Opus → s16le 16 kHz]
+        RUNNER[session_runner<br/>asyncio task]
+        SPLIT[sentence splitter]
+    end
+
+    subgraph VLLM_SERVER["vLLM :8001"]
+        VLLM[vLLM realtime API<br/>/v1/realtime]
+        GPU[(GPU<br/>Voxtral-Mini-4B<br/>BF16)]
+    end
+
+    MIC --> WRTC_OUT -->|Opus / SRTP| AIORTC
+    AIORTC --> FFMPEG --> RUNNER
+    RUNNER <-->|WebSocket| VLLM
+    VLLM --- GPU
+    RUNNER --> SPLIT --> WS -->|delta JSON| SUBS
+
+    classDef browserStyle fill:#0f3460,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef apiStyle fill:#16213e,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef vllmStyle fill:#533483,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef gpuStyle fill:#e94560,stroke:#1a1a2e,stroke-width:2px,color:#fff
+
+    class MIC,WRTC_OUT,SUBS browserStyle
+    class WS,AIORTC,FFMPEG,RUNNER,SPLIT apiStyle
+    class VLLM vllmStyle
+    class GPU gpuStyle

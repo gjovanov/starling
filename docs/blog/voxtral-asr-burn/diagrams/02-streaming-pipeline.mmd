@@ -1,0 +1,22 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#eee', 'lineColor': '#e94560', 'secondaryColor': '#0f3460'}}}%%
+graph LR
+    A[Audio chunk<br/>0.5 s commit] --> M[Mel<br/>incremental]
+    M --> CN[CausalConv<br/>cached]
+    CN --> E[Encoder<br/>+ KV reset every 150 frames]
+    E --> R[Reshape ×4]
+    R --> AD[Adapter]
+    AD --> DR[DRAFT pass<br/>batched, wrong prev_token]
+    DR --> TR[Truncate KV<br/>tensor narrow, 0 ms]
+    TR --> VF[VERIFY pass<br/>batched, corrected prev_token]
+    VF --> AC{Accept up to<br/>first mismatch}
+    AC -->|tail rejected| FB[Sequential fallback<br/>120 ms × k]
+    AC --> EM[Emit tokens<br/>sentence splitter]
+    FB --> EM
+
+    classDef stepStyle fill:#0f3460,stroke:#e94560,stroke-width:1px,color:#eee
+    classDef hotStyle fill:#533483,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef coldStyle fill:#16213e,stroke:#e94560,stroke-width:1px,color:#eee
+
+    class A,M,CN,R,AD coldStyle
+    class E,DR,VF stepStyle
+    class TR,AC hotStyle

@@ -1,0 +1,15 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#eee', 'lineColor': '#e94560', 'secondaryColor': '#0f3460'}}}%%
+gantt
+    title 200-commit context rotation (~100 s window)
+    dateFormat HH:mm:ss
+    axisFormat %M:%S
+    section Session A
+    Commits 0–199 (decode + emit deltas) :a1, 00:00:00, 100s
+    section Rotation
+    Open new vLLM session                :crit, r1, after a1, 1s
+    section Session B
+    Commits 200–399                      :a2, after r1, 100s
+    section Rotation
+    Open new vLLM session                :crit, r2, after a2, 1s
+    section Session C
+    Commits 400–599                      :a3, after r2, 100s

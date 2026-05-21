@@ -1,0 +1,21 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#eee', 'lineColor': '#e94560', 'secondaryColor': '#0f3460'}}}%%
+graph LR
+    UI[Frontend tts-manager.js]
+    UI -->|same JSON| VLLM[vllm-server<br/>:8090<br/>engine=voxtral-vllm-omni]
+    UI -->|same JSON| BURN[burn-server<br/>:8091<br/>engine=burn-tts]
+
+    VLLM -->|spawns| OMNI[vllm-omni subprocess<br/>Python · 12 GB]
+    BURN -->|loads in-process| RUST[Rust pipeline<br/>candle 0.10 · 12 GB]
+
+    OMNI --> AUDIO1[(24 kHz PCM)]
+    RUST --> AUDIO2[(24 kHz PCM)]
+
+    classDef uiStyle fill:#0f3460,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef pyStyle fill:#533483,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef rsStyle fill:#e94560,stroke:#1a1a2e,stroke-width:2px,color:#fff
+    classDef outStyle fill:#16213e,stroke:#e94560,stroke-width:1px,color:#eee
+
+    class UI uiStyle
+    class VLLM,OMNI pyStyle
+    class BURN,RUST rsStyle
+    class AUDIO1,AUDIO2 outStyle

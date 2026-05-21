@@ -1,0 +1,19 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#eee', 'primaryBorderColor': '#16213e', 'lineColor': '#e94560', 'secondaryColor': '#0f3460', 'tertiaryColor': '#533483'}}}%%
+graph TB
+    ROOT["Voxtral-4B-TTS-2603<br/>386 BF16 tensors · ~12 GB"]
+
+    ROOT --> AR["AR LLM<br/>234 tensors<br/>26-layer decoder, GQA 32h/8kv<br/>dim 3072 · hidden 9216 · vocab 131072<br/>RoPE θ=1M (interleaved) · tied embeddings"]
+    ROOT --> CODEC["Audio Tokenizer (Codec)<br/>116 tensors<br/>8 blocks · ConvTranspose1d ↑×2 ladder<br/>ALiBi + qk_norm + layer-scale<br/>weight-norm parametrised convs<br/>sliding window 16 → 32 → 64 → 128"]
+    ROOT --> FMA["Acoustic Transformer (FMA)<br/>33 tensors<br/>3-layer transformer<br/>RoPE θ=10k (unused — bidirectional)<br/>8-step Euler · CFG α=1.2"]
+    ROOT --> EMB["mm_audio_embeddings<br/>2 tensors<br/>multi-codebook embedding"]
+    ROOT --> NORM["final_norm<br/>1 tensor"]
+
+    classDef rootStyle fill:#e94560,stroke:#1a1a2e,stroke-width:2px,color:#fff
+    classDef bigStyle fill:#533483,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef midStyle fill:#0f3460,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef smallStyle fill:#16213e,stroke:#e94560,stroke-width:1px,color:#eee
+
+    class ROOT rootStyle
+    class AR,CODEC bigStyle
+    class FMA midStyle
+    class EMB,NORM smallStyle

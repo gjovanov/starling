@@ -1,0 +1,23 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#eee', 'primaryBorderColor': '#16213e', 'lineColor': '#e94560', 'secondaryColor': '#0f3460', 'tertiaryColor': '#533483'}}}%%
+graph TB
+    subgraph BACKENDS["burn-server backends"]
+        direction LR
+        N["candle-native<br/>BF16 / CUDA<br/>candle 0.9<br/>~25.7 ms/step"]
+        F["candle-native-flash<br/>BF16 / CUDA<br/>candle 0.10 + FlashAttn v2<br/>14.6 ms/step"]
+        C["candle-cpu-ggml<br/>Q4 / AVX-512 + VNNI<br/>ggml graph API<br/>1.5× RT (speculative)"]
+        W["wgpu / Q4 / WASM<br/>browser WebGPU<br/>(broken — see Part 5)"]
+    end
+
+    USE["Same Voxtral-Mini-4B-Realtime architecture<br/>26-layer decoder · GQA · interleaved RoPE · sliding window"] --> BACKENDS
+
+    classDef goodStyle fill:#0f3460,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef bestStyle fill:#533483,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef cpuStyle fill:#16213e,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef brokenStyle fill:#1a1a2e,stroke:#e94560,stroke-width:2px,color:#a0a0a0,stroke-dasharray: 5 5
+    classDef topStyle fill:#16213e,stroke:#e94560,stroke-width:1px,color:#eee
+
+    class N goodStyle
+    class F bestStyle
+    class C cpuStyle
+    class W brokenStyle
+    class USE topStyle

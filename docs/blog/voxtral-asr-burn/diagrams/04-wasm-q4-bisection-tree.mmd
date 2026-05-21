@@ -1,0 +1,37 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#eee', 'lineColor': '#e94560', 'secondaryColor': '#0f3460'}}}%%
+graph TB
+    BUG[Q4-wgpu emits English-biased text<br/>candle-cpu emits correct German<br/>SAME audio, SAME code path]
+
+    BUG --> H1{Audio?}
+    H1 -->|server can transcribe browser PCM| OK1[✅ Innocent]
+
+    BUG --> H2{Mel?}
+    H2 -->|byte-identical to BF16 path| OK2[✅ Innocent]
+
+    BUG --> H3{Single Q4 kernel?}
+    H3 -->|max err 3e-6 vs reference| OK3[✅ Innocent]
+
+    BUG --> H4{Single Burn op?}
+    H4 -->|all ops bit-exact on dzn| OK4[✅ Innocent]
+
+    BUG --> H5{Burn version?}
+    H5 -->|0.20 = 0.21| OK5[❌ Same bug]
+
+    BUG --> H6{Softmax?}
+    H6 -->|gpu_softmax helps a bit| PARTIAL[⚠️ Partial fix]
+
+    BUG --> ROOT[⚠️ Cumulative fp32 drift<br/>across 26 layers]
+    ROOT --> SPEC[WGSL spec permits this.<br/>No portable fix.]
+    SPEC --> PIVOT[→ Pivot to ggml-WASM]
+
+    classDef bugStyle fill:#e94560,stroke:#1a1a2e,stroke-width:2px,color:#fff
+    classDef okStyle fill:#0f3460,stroke:#e94560,stroke-width:1px,color:#eee
+    classDef partialStyle fill:#533483,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef rootStyle fill:#16213e,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef pivotStyle fill:#1a1a2e,stroke:#e94560,stroke-width:2px,color:#eee
+
+    class BUG bugStyle
+    class OK1,OK2,OK3,OK4 okStyle
+    class OK5,PARTIAL partialStyle
+    class ROOT,SPEC rootStyle
+    class PIVOT pivotStyle

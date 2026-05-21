@@ -1,0 +1,15 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#eee', 'lineColor': '#e94560', 'secondaryColor': '#0f3460'}}}%%
+gantt
+    title ASR + TTS sharing one 24 GiB GPU
+    dateFormat HH:mm:ss
+    axisFormat %H:%M:%S
+    section ASR
+    Active transcription session                  :a1, 00:00:00, 5m
+    Idle                                          :a2, after a1, 12m
+    Active transcription session                  :a3, after a2, 7m
+    section TTS
+    Subprocess down                               :t1, 00:00:00, 5m
+    Spawn ~75 s :crit, t2, after a1, 75s
+    Synthesis bursts                              :t3, after t2, 7m
+    Idle (counting down 10 min)                   :t4, after t3, 10m
+    Auto-unload                                   :crit, t5, after t4, 5s

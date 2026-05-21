@@ -1,0 +1,37 @@
+[
+  {
+    "scene": 1,
+    "text": "Starling \u2014 the vllm-server frontend. Voxtral-Mini-4B-Realtime via vLLM's WebSocket realtime API.",
+    "duration": 4000
+  },
+  {
+    "scene": 2,
+    "text": "New session: pick a media file, a transcription mode, click Create.",
+    "duration": 3500
+  },
+  {
+    "scene": 3,
+    "text": "broadcast_1_90s.wav \u2014 90 seconds of Salzburg news, German, mixed speakers, real names.",
+    "duration": 4500
+  },
+  {
+    "scene": 4,
+    "text": "Audio streams via WebRTC \u2192 FFmpeg \u2192 vLLM. First caption arrives in well under a second.",
+    "duration": 4500
+  },
+  {
+    "scene": 5,
+    "text": "All eager-mode on the GPU. Background WebSocket reader so we never drop a delta.",
+    "duration": 4500
+  },
+  {
+    "scene": 6,
+    "text": "Sentence splitter handles \u201919. November\u2019 and \u2018Dr.\u2019 without breaking the line.",
+    "duration": 4500
+  },
+  {
+    "scene": 7,
+    "text": "Context rotates every ~100 s so the KV cache never runs out. Long-form transcription, no babysitting.",
+    "duration": 5000
+  }
+]

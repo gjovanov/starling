@@ -1,0 +1,12 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#eee', 'lineColor': '#e94560', 'secondaryColor': '#0f3460'}}}%%
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Starting: first /api/tts/* hit
+    Starting --> Ready: model loaded (~75 s on RTX 5090 Laptop)
+    Starting --> Idle: spawn failed
+    Ready --> Synthesizing: synthesize request
+    Synthesizing --> Ready: synthesis done
+    Ready --> Switching: voice clone needs task_type=Base
+    Switching --> Starting: restart subprocess
+    Ready --> Idle: 10 min no activity
+    Idle --> [*]

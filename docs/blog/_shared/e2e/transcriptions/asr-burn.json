@@ -1,0 +1,37 @@
+[
+  {
+    "scene": 1,
+    "text": "Starling \u2014 the burn-server frontend. Voxtral-Mini-4B-Realtime, native Rust + candle, no Python in the loop.",
+    "duration": 4500
+  },
+  {
+    "scene": 2,
+    "text": "Same UI, different engine. Single Axum process owns the model on the GPU.",
+    "duration": 4000
+  },
+  {
+    "scene": 3,
+    "text": "broadcast_1_90s.wav \u2014 the same 90 seconds of Salzburg news as Post 1.",
+    "duration": 4000
+  },
+  {
+    "scene": 4,
+    "text": "candle-native-flash backend: FlashAttention v2 + fused RmsNorm + fused interleaved RoPE.",
+    "duration": 4500
+  },
+  {
+    "scene": 5,
+    "text": "14.6 ms per decode step. Encoder 4.6 s for 300 s of audio. 1.74\u00d7 faster than candle 0.9.",
+    "duration": 5000
+  },
+  {
+    "scene": 6,
+    "text": "Incremental KV cache + 8-frame boundary margin. Only new audio gets re-encoded.",
+    "duration": 4500
+  },
+  {
+    "scene": 7,
+    "text": "Same captions, no Python. Next up: Voxtral-4B-TTS on the same Rust stack.",
+    "duration": 5000
+  }
+]

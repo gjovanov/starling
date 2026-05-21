@@ -1,0 +1,32 @@
+[
+  {
+    "scene": 1,
+    "text": "Voxtral-4B-TTS on vllm-server. 20 built-in voices, OpenAI-compatible HTTP, streaming WAV.",
+    "duration": 4500
+  },
+  {
+    "scene": 2,
+    "text": "TTS subprocess auto-spawns on first request \u2014 ASR and TTS swap on the 24 GB GPU.",
+    "duration": 4500
+  },
+  {
+    "scene": 3,
+    "text": "Same content as the ASR demo \u2014 ~150 words of Salzburg news.",
+    "duration": 4000
+  },
+  {
+    "scene": 4,
+    "text": "Generate. Upstream PCM \u2192 streaming WAV header \u2192 Web Audio API in the browser.",
+    "duration": 4500
+  },
+  {
+    "scene": 5,
+    "text": "Byte-aligned chunk carry, no-skip scheduling, 500 ms aggregation, per-block loudness normaliser.",
+    "duration": 5000
+  },
+  {
+    "scene": 6,
+    "text": "Synthesis ends, server idles. 10 minutes from now the TTS subprocess unloads itself.",
+    "duration": 5000
+  }
+]

@@ -1,0 +1,5 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#eee', 'lineColor': '#e94560', 'secondaryColor': '#0f3460'}}}%%
+pie title Decode step breakdown (14.6 ms total)
+    "Attention (QKV + RoPE + flash_attn + out proj)" : 41
+    "FFN (gate+up + SiLU + mul + down)" : 45
+    "Norms + residuals + ADA" : 14

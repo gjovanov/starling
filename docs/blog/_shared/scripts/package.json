@@ -1,0 +1,18 @@
+{
+  "name": "starling-blog-recording",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Playwright recording specs for the Starling blog series demo videos.",
+  "scripts": {
+    "install-browsers": "playwright install chromium",
+    "record:asr-vllm": "BACKEND=vllm playwright test --config=playwright.config.ts record-asr-demo.spec.ts",
+    "record:asr-burn": "BACKEND=burn playwright test --config=playwright.config.ts record-asr-demo.spec.ts",
+    "record:tts-vllm": "BACKEND=vllm playwright test --config=playwright.config.ts record-tts-demo.spec.ts",
+    "record:tts-burn": "BACKEND=burn playwright test --config=playwright.config.ts record-tts-demo.spec.ts"
+  },
+  "devDependencies": {
+    "@mermaid-js/mermaid-cli": "^11.15.0",
+    "@playwright/test": "^1.49.0",
+    "typescript": "^6.0.3"
+  }
+}

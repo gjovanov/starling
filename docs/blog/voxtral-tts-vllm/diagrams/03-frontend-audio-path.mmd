@@ -1,0 +1,18 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#eee', 'lineColor': '#e94560', 'secondaryColor': '#0f3460'}}}%%
+graph LR
+    NET["fetch().body.getReader()<br/>chunked PCM bytes"]
+    BYTE["1. Byte-alignment carry<br/>_pcmTail holds the odd byte"]
+    BLOCK["2. Chunk aggregation<br/>concat to ~500 ms"]
+    NORM["3. Per-block loudness normaliser<br/>RMS · 45/55 EMA · 8× boost · tanh soft-clip"]
+    SCHED["4. No-skip scheduling<br/>start(max(now, _nextStartAt))"]
+    AUDIO[(Web Audio API<br/>AudioBufferSourceNode)]
+
+    NET --> BYTE --> BLOCK --> NORM --> SCHED --> AUDIO
+
+    classDef netStyle fill:#0f3460,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef fixStyle fill:#533483,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef apiStyle fill:#e94560,stroke:#1a1a2e,stroke-width:2px,color:#fff
+
+    class NET netStyle
+    class BYTE,BLOCK,NORM,SCHED fixStyle
+    class AUDIO apiStyle

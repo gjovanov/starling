@@ -1,0 +1,17 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#eee', 'lineColor': '#e94560', 'secondaryColor': '#0f3460'}}}%%
+graph LR
+    H["WAV header (44 bytes)<br/>RIFF · 0xFFFFFFFF · WAVE<br/>fmt · 16 · PCM · 1ch · 24000 Hz · …<br/>data · 0xFFFFFFFF"]
+    P1[PCM chunk 1<br/>~400 ms s16le @ 24 kHz]
+    P2[PCM chunk 2]
+    P3[PCM chunk N]
+    EOF[EOF / TCP FIN]
+
+    H --> P1 --> P2 --> P3 --> EOF
+
+    classDef hdrStyle fill:#e94560,stroke:#1a1a2e,stroke-width:2px,color:#fff
+    classDef pcmStyle fill:#0f3460,stroke:#e94560,stroke-width:2px,color:#eee
+    classDef eofStyle fill:#16213e,stroke:#e94560,stroke-width:1px,color:#a0a0a0
+
+    class H hdrStyle
+    class P1,P2,P3 pcmStyle
+    class EOF eofStyle
