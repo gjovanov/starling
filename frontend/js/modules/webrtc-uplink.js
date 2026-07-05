@@ -392,8 +392,6 @@ export async function captureSpeakersStream(sourceId) {
       }
       throw e;
     }
-    // Strip video tracks; we only need audio for transcription
-    stream.getVideoTracks().forEach(t => { try { t.stop(); } catch (_) {} stream.removeTrack(t); });
     if (stream.getAudioTracks().length === 0) {
       stream.getTracks().forEach(t => { try { t.stop(); } catch (_) {} });
       throw new Error(
@@ -402,6 +400,36 @@ export async function captureSpeakersStream(sourceId) {
         '"Window" capture does not include audio.'
       );
     }
+
+    // Keep the VIDEO track alive but unused. Chrome anchors the lifetime
+    // of a display capture to its video track — our previous behaviour
+    // (stop + remove it here) silently killed the capture: the audio
+    // track stayed `readyState: 'live'` but delivered all-zero samples,
+    // which the server logged as rms48k=0.0000 and ASR transcribed as
+    // nothing. The video track is never added to the peer connection
+    // (startOffer only adds audio tracks), so keeping it costs only the
+    // capture itself, and disconnect() stops ALL tracks of the stream —
+    // which also dismisses Chrome's "sharing" bar.
+    const videoTrack = stream.getVideoTracks()[0];
+    if (videoTrack) {
+      videoTrack.addEventListener('ended', () => {
+        console.warn('[Speakers] Display capture ended (user clicked "Stop sharing" or browser revoked it) — audio will go silent');
+      });
+    }
+
+    // Surface capture-health signals that are otherwise invisible: a
+    // muted local track keeps its RTP flowing but encodes silence.
+    const audioTrack = stream.getAudioTracks()[0];
+    console.log(
+      `[Speakers] Audio track: label="${audioTrack.label}" muted=${audioTrack.muted} readyState=${audioTrack.readyState}`,
+    );
+    audioTrack.addEventListener('mute', () =>
+      console.warn('[Speakers] Audio track MUTED — server will receive silence'));
+    audioTrack.addEventListener('unmute', () =>
+      console.log('[Speakers] Audio track unmuted'));
+    audioTrack.addEventListener('ended', () =>
+      console.warn('[Speakers] Audio track ENDED — uplink is dead'));
+
     return stream;
   }
 

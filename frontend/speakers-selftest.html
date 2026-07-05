@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<!--
+  Speakers-uplink self-test — headless-automatable diagnostic page.
+
+  Plays a 440 Hz tone via WebAudio, captures audio through the REAL
+  speakers code path (js/modules/webrtc-uplink.js), streams it to a
+  live speakers session, and reports browser-side outbound stats. The
+  authoritative verdict is server-side: the uplink log line's
+  rms48k/rms16k values (a healthy capture shows rms48k ≈ 0.2 for the
+  tone; the video-track-stop bug shows rms48k=0.0000).
+
+  Usage (headless):
+    SID=$(curl -s -X POST :8091/api/sessions -H 'content-type: application/json' \
+          -d '{"model_id":"voxtral-mini-4b","source":"speakers","language":"de"}' \
+          | jq -r '.data.id')
+    curl -s -X POST :8091/api/sessions/$SID/start
+    chrome --headless=new --autoplay-policy=no-user-gesture-required \
+      --use-fake-ui-for-media-stream --use-fake-device-for-media-stream \
+      --auto-select-tab-capture-source-by-title=SpeakersSelfTest \
+      "http://localhost:8091/speakers-selftest.html?session=$SID&mode=display"
+    # then: grep -a rms48k /tmp/burn-server.log | tail
+
+  Modes:
+    ?mode=display  (default) — getDisplayMedia tab capture via
+                   captureSpeakersStream('display'); exercises the
+                   video-track-lifetime fix.
+    ?mode=device   — getUserMedia default input; with
+                   --use-fake-device-for-media-stream Chrome supplies a
+                   tone generator. Pipeline canary that skips the
+                   display-capture picker entirely.
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>SpeakersSelfTest</title>
+  <style>
+    body { font-family: monospace; background: #1a1a24; color: #d0d0d8; padding: 16px; }
+    .ok { color: #7fbf7f; } .bad { color: #dc8b8b; }
+  </style>
+</head>
+<body>
+<h3>Speakers uplink self-test</h3>
+<div id="out"></div>
+<script type="module">
+import { WebRTCUplinkClient, captureSpeakersStream } from './js/modules/webrtc-uplink.js';
+
+const out = document.getElementById('out');
+const log = (m, cls = '') => {
+  out.insertAdjacentHTML('beforeend', `<div class="${cls}">${m}</div>`);
+  console.log('[speakers-selftest]', m);
+};
+
+const RUN_SECS = 20;
+
+(async () => {
+  const qs = new URLSearchParams(location.search);
+  const sessionId = qs.get('session');
+  const mode = qs.get('mode') || 'display';
+  if (!sessionId) { log('missing ?session=&lt;id&gt;', 'bad'); return; }
+
+  // Make this tab audibly non-silent: 440 Hz tone at -10 dBFS.
+  const actx = new AudioContext();
+  const osc = actx.createOscillator();
+  osc.frequency.value = 440;
+  const gain = actx.createGain();
+  gain.gain.value = 0.3;
+  osc.connect(gain).connect(actx.destination);
+  osc.start();
+  if (actx.state === 'suspended') { try { await actx.resume(); } catch (_) {} }
+  log(`tone started (AudioContext state=${actx.state})`);
+
+  let stream;
+  try {
+    stream = mode === 'display'
+      ? await captureSpeakersStream('display')
+      : await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+          video: false,
+        });
+  } catch (e) {
+    log(`capture failed: ${e}`, 'bad');
+    await uploadResult({ sessionId, mode, pass: false, error: String(e) });
+    return;
+  }
+  const track = stream.getAudioTracks()[0];
+  log(`captured: "${track.label}" muted=${track.muted} state=${track.readyState}`);
+
+  const cfg = await (await fetch('/api/config')).json();
+  const client = new WebRTCUplinkClient(`ws://${location.host}/ws/${sessionId}`, {
+    iceServers: cfg.iceServers,
+    iceTransportPolicy: cfg.iceTransportPolicy || 'all',
+    stream,
+  });
+  client.connect().catch((e) => log(`connect error: ${e}`, 'bad'));
+
+  const t0 = Date.now();
+  const samples = [];
+  const timer = setInterval(async () => {
+    const pc = client.pc;
+    let packetsSent = 0;
+    let audioLevel = null;
+    if (pc) {
+      try {
+        (await pc.getStats()).forEach((r) => {
+          if (r.type === 'outbound-rtp' && r.kind === 'audio') packetsSent = r.packetsSent;
+          if (r.type === 'media-source' && r.kind === 'audio') audioLevel = r.audioLevel ?? null;
+        });
+      } catch (_) {}
+    }
+    const s = {
+      t: +((Date.now() - t0) / 1000).toFixed(1),
+      conn: pc?.connectionState ?? 'no-pc',
+      packetsSent,
+      audioLevel,
+      trackMuted: track.muted,
+    };
+    samples.push(s);
+    log(`t=${s.t}s conn=${s.conn} sent=${s.packetsSent} srcLevel=${audioLevel?.toFixed?.(3) ?? 'n/a'} muted=${s.trackMuted}`,
+        (s.conn === 'connected' && (audioLevel ?? 0) > 0.01) ? 'ok' : '');
+
+    if ((Date.now() - t0) / 1000 >= RUN_SECS) {
+      clearInterval(timer);
+      const last = samples[samples.length - 1];
+      // Browser-side pass: connected, RTP flowing, and the LOCAL source
+      // reports non-silence. Server rms48k is the authoritative check.
+      const pass = last.conn === 'connected' && last.packetsSent > 0 && (last.audioLevel ?? 0) > 0.01;
+      log(`VERDICT (browser-side): ${pass ? 'PASS' : 'FAIL'}`, pass ? 'ok' : 'bad');
+      document.title = pass ? 'SPEAKERS-PASS' : 'SPEAKERS-FAIL';
+      await uploadResult({ sessionId, mode, pass, final: last, samples });
+    }
+  }, 1000);
+
+  async function uploadResult(result) {
+    try {
+      const fd = new FormData();
+      fd.append('file',
+        new Blob([JSON.stringify(result, null, 2)], { type: 'application/json' }),
+        'speakers_selftest_result.json');
+      await fetch('/api/media/upload', { method: 'POST', body: fd });
+      log('result uploaded to media/speakers_selftest_result.json');
+    } catch (e) {
+      log(`result upload failed: ${e}`);
+    }
+  }
+})();
+</script>
+</body>
+</html>
