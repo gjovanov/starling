@@ -194,7 +194,11 @@ async function connect() {
   // Create WebRTC client with ICE servers and transport policy from server config
   webrtcClient = new WebRTCClient(url, {
     iceServers: config.iceServers,
-    iceTransportPolicy: config.iceTransportPolicy || 'all'
+    iceTransportPolicy: config.iceTransportPolicy || 'all',
+    // burn-server advertises 'client-offer' (browser offers, server
+    // answers → Rust stays in the DTLS-client role). Absent for
+    // vllm-server/parakeet-rs → legacy server-offer flow.
+    webrtcFlow: config.webrtcFlow,
   });
 
   // WebRTC events

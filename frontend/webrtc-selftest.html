@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<!--
+  WebRTC downlink self-test — headless-automatable diagnostic page.
+
+  Drives the REAL receiver code path (js/modules/webrtc.js) against a
+  live session and reports ICE/DTLS/RTP progress once per second. After
+  ~20 s it uploads a JSON verdict via POST /api/media/upload so a
+  headless driver (CI, agent, curl-watcher) can read the result from the
+  media directory without DevTools access.
+
+  Usage:
+    1. Create + start a media session:
+         MEDIA=$(curl -s :8091/api/media | jq -r '.data[0].id')
+         SID=$(curl -s -X POST :8091/api/sessions -H 'content-type: application/json' \
+               -d "{\"model_id\":\"voxtral-mini-4b\",\"media_id\":\"$MEDIA\"}" | jq -r '.data.id')
+         curl -s -X POST :8091/api/sessions/$SID/start
+    2. Open (headless works):
+         http://localhost:8091/webrtc-selftest.html?session=$SID
+    3. Read the verdict:
+         media/webrtc_selftest_result.json  (also rendered in the DOM)
+
+  PASS = connectionState 'connected' AND packetsReceived increasing.
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>WebRTC self-test</title>
+  <style>
+    body { font-family: monospace; background: #1a1a24; color: #d0d0d8; padding: 16px; }
+    .ok { color: #7fbf7f; } .bad { color: #dc8b8b; } .warn { color: #ffd866; }
+  </style>
+</head>
+<body>
+<h3>WebRTC downlink self-test</h3>
+<div id="out"></div>
+<script type="module">
+import { WebRTCClient } from './js/modules/webrtc.js';
+
+const out = document.getElementById('out');
+const log = (m, cls = '') => {
+  out.insertAdjacentHTML('beforeend', `<div class="${cls}">${m}</div>`);
+  console.log('[selftest]', m);
+};
+
+const RUN_SECS = 20;
+
+(async () => {
+  const sessionId = new URLSearchParams(location.search).get('session');
+  if (!sessionId) {
+    log('missing ?session=&lt;id&gt; query param', 'bad');
+    return;
+  }
+
+  const cfg = await (await fetch('/api/config')).json();
+  log(`config: policy=${cfg.iceTransportPolicy} flow=${cfg.webrtcFlow ?? 'server-offer (legacy)'}`);
+
+  const wsUrl = `ws://${location.host}/ws/${sessionId}`;
+  const client = new WebRTCClient(wsUrl, {
+    iceServers: cfg.iceServers,
+    iceTransportPolicy: cfg.iceTransportPolicy || 'all',
+    webrtcFlow: cfg.webrtcFlow,
+    autoReconnect: false,
+  });
+
+  const audio = document.createElement('audio');
+  audio.autoplay = true;
+  audio.muted = true; // playback isn't under test; transport is
+  document.body.appendChild(audio);
+
+  client.connect(audio).catch((e) => log(`connect error: ${e}`, 'bad'));
+
+  const t0 = Date.now();
+  const samples = [];
+  const timer = setInterval(async () => {
+    const pc = client.pc;
+    let packets = 0;
+    if (pc) {
+      try {
+        (await pc.getStats()).forEach((r) => {
+          if (r.type === 'inbound-rtp' && r.kind === 'audio') packets = r.packetsReceived;
+        });
+      } catch (_) { /* pc may be closing */ }
+    }
+    const s = {
+      t: +((Date.now() - t0) / 1000).toFixed(1),
+      ice: pc?.iceConnectionState ?? 'no-pc',
+      conn: pc?.connectionState ?? 'no-pc',
+      packets,
+    };
+    samples.push(s);
+    log(`t=${s.t}s ice=${s.ice} conn=${s.conn} packets=${s.packets}`,
+        s.conn === 'connected' ? 'ok' : (s.conn === 'failed' ? 'bad' : ''));
+
+    if ((Date.now() - t0) / 1000 >= RUN_SECS) {
+      clearInterval(timer);
+      const last = samples[samples.length - 1];
+      const pass = last.conn === 'connected' && last.packets > 0;
+      const result = { sessionId, pass, final: last, samples };
+      log(`VERDICT: ${pass ? 'PASS' : 'FAIL'}`, pass ? 'ok' : 'bad');
+      document.title = pass ? 'SELFTEST-PASS' : 'SELFTEST-FAIL';
+      try {
+        const fd = new FormData();
+        fd.append('file',
+          new Blob([JSON.stringify(result, null, 2)], { type: 'application/json' }),
+          'webrtc_selftest_result.json');
+        await fetch('/api/media/upload', { method: 'POST', body: fd });
+        log('result uploaded to media/webrtc_selftest_result.json');
+      } catch (e) {
+        log(`result upload failed: ${e}`, 'warn');
+      }
+    }
+  }, 1000);
+})();
+</script>
+</body>
+</html>

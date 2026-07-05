@@ -544,6 +544,13 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
         "wsUrl": ws_url,
         "iceServers": ice_servers,
         "iceTransportPolicy": ice_transport_policy,
+        // Receiver sessions: the BROWSER creates the SDP offer (recvonly)
+        // and burn-server answers, keeping webrtc-rs in the DTLS-client
+        // role (modern Chrome as DTLS client vs webrtc-rs 0.11 as DTLS
+        // server fails the handshake). Legacy backends (vllm-server,
+        // parakeet-rs) don't send this field and the shared frontend
+        // falls back to the old server-offer flow.
+        "webrtcFlow": "client-offer",
         "audio": {"sampleRate": 16000, "channels": 1, "bufferSize": 4096},
         "subtitles": {"maxSegments": 1000, "autoScroll": true, "showTimestamps": true},
         "speakerColors": [

@@ -94,7 +94,8 @@ async fn test_list_sessions_after_create() {
         serde_json::json!({
             "model_id": "voxtral-mini-4b",
             "language": "de",
-            "mode": "growing_segments"
+            "mode": "growing_segments",
+            "media_id": "test.wav"
         }),
     )
     .await;
@@ -118,7 +119,8 @@ async fn test_get_session() {
         serde_json::json!({
             "model_id": "voxtral-mini-4b",
             "language": "en",
-            "mode": "speedy"
+            "mode": "speedy",
+            "media_id": "test.wav"
         }),
     )
     .await;
@@ -160,7 +162,8 @@ async fn test_stop_session() {
         "/api/sessions",
         serde_json::json!({
             "model_id": "voxtral-mini-4b",
-            "mode": "speedy"
+            "mode": "speedy",
+            "media_id": "test.wav"
         }),
     )
     .await;
@@ -210,9 +213,21 @@ async fn test_get_nonexistent_session() {
 #[tokio::test]
 async fn test_config_endpoint() {
     let app = build_test_app().await;
+    // /api/config returns raw camelCase JSON (no ApiResponse envelope) —
+    // the frontend spreads it directly over its defaults.
     let body = json_get(&app, "/api/config").await;
-    assert_eq!(body["success"], true);
-    assert!(body["data"]["ws_url"].is_string());
+    assert!(body["wsUrl"].is_string(), "wsUrl missing: {body}");
+    assert!(body["iceServers"].is_array(), "iceServers missing: {body}");
+    assert!(
+        body["iceTransportPolicy"].is_string(),
+        "iceTransportPolicy missing: {body}"
+    );
+    // Receiver sessions use the client-offer flow: the browser creates
+    // the SDP offer and burn-server answers, keeping webrtc-rs in the
+    // DTLS-client role (webrtc-rs 0.11 as DTLS server fails the
+    // handshake against modern Chrome). The shared frontend keys the
+    // flow off this field.
+    assert_eq!(body["webrtcFlow"], "client-offer");
 }
 
 #[tokio::test]
@@ -246,7 +261,8 @@ async fn test_create_session_with_quant() {
             "model_id": "voxtral-mini-4b",
             "language": "en",
             "mode": "speedy",
-            "quant": "bf16"
+            "quant": "bf16",
+            "media_id": "test.wav"
         }),
     )
     .await;

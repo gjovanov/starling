@@ -45,6 +45,9 @@ byteorder = "1.5"
 anyhow = "1.0"
 tracing = "0.1"
 memmap2 = "0.9"
+# Bridges `log`-crate records (webrtc-rs ICE/DTLS internals) to stderr.
+# Without a logger, DTLS handshake failures are silently dropped.
+env_logger = "0.11"
 
 # Pure candle (native CUDA, no burn abstraction)
 # Use 0.9.x to match burn-candle's candle-core version (avoids numerical drift)

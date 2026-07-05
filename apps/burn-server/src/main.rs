@@ -22,6 +22,15 @@ use webrtc::ice::network_type::NetworkType;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Surface `log`-crate records from webrtc-rs (ICE agent, DTLS
+    // handshake). Default `error` keeps normal runs quiet but makes
+    // handshake failures visible; RUST_LOG=webrtc=debug,webrtc_dtls=trace
+    // opts into full wire-level diagnostics.
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("error"),
+    )
+    .init();
+
     let config = Config::parse();
 
     eprintln!("===========================================");

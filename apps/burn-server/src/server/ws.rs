@@ -196,6 +196,26 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
                                 },
                             ));
 
+                            // Log PC + ICE state transitions. Without these the
+                            // server is silent about DTLS failures (webrtc-rs
+                            // reports them only through the `log` crate, which
+                            // needs RUST_LOG) — the 2026-07 downlink DTLS bug
+                            // was invisible server-side for exactly this reason.
+                            let pcs_cid = client_id_clone.clone();
+                            peer_connection.on_peer_connection_state_change(Box::new(
+                                move |s| {
+                                    eprintln!("[WS {}] PeerConnection state: {}", pcs_cid, s);
+                                    Box::pin(async {})
+                                },
+                            ));
+                            let ics_cid = client_id_clone.clone();
+                            peer_connection.on_ice_connection_state_change(Box::new(
+                                move |s| {
+                                    eprintln!("[WS {}] ICE connection state: {}", ics_cid, s);
+                                    Box::pin(async {})
+                                },
+                            ));
+
                             if is_uplink {
                                 // Speakers / uplink flow: wait for the client's SDP offer.
                                 //
@@ -251,8 +271,24 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
                                 // sent on WS open and used that to fire its startOffer().
                                 // We deliberately do NOT emit a second welcome here.
                             } else {
-                                // Receiver (media / SRT) flow: create outbound audio track
-                                // and send an SDP offer to the client.
+                                // Receiver (media / SRT) flow: create the outbound
+                                // audio track, then WAIT for the client's SDP offer
+                                // (client-offer flow, advertised via
+                                // /api/config::webrtcFlow).
+                                //
+                                // We used to create the offer server-side. That
+                                // makes Chrome the SDP answerer → DTLS active →
+                                // Chrome is the DTLS *client* and webrtc-rs 0.11
+                                // the DTLS *server*. Modern Chrome's ClientHello
+                                // (DTLS 1.3 offer + post-quantum key share) fails
+                                // against webrtc-dtls 0.10 in the server role: the
+                                // browser reaches ICE `connected` but
+                                // connectionState `failed`, and no RTP ever flows.
+                                // The speakers uplink — where the client offers and
+                                // webrtc-rs answers (DTLS client) — always worked.
+                                // Flipping the receiver flow to client-offer puts
+                                // webrtc-rs in the proven DTLS-client role for both
+                                // directions.
                                 let audio_track = Arc::new(TrackLocalStaticRTP::new(
                                     webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability {
                                         mime_type: webrtc::api::media_engine::MIME_TYPE_OPUS
@@ -285,36 +321,11 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
                                     }
                                 }
 
-                                // Create and send SDP offer
-                                let offer = match peer_connection.create_offer(None).await {
-                                    Ok(o) => o,
-                                    Err(e) => {
-                                        eprintln!(
-                                            "[WS {}] Failed to create offer: {}",
-                                            client_id_clone, e
-                                        );
-                                        continue;
-                                    }
-                                };
-
-                                if let Err(e) =
-                                    peer_connection.set_local_description(offer.clone()).await
-                                {
-                                    eprintln!(
-                                        "[WS {}] Failed to set local description: {}",
-                                        client_id_clone, e
-                                    );
-                                    continue;
-                                }
-
-                                let offer_msg = serde_json::json!({
-                                    "type": "offer",
-                                    "sdp": offer.sdp,
-                                });
-                                let _ = ws_out_for_recv.send(offer_msg.to_string()).await;
-                                eprintln!("[WS {}] SDP offer sent", client_id_clone);
-
                                 pc = Some(peer_connection);
+                                eprintln!(
+                                    "[WS {}] Receiver PC ready — waiting for client SDP offer",
+                                    client_id_clone
+                                );
                             }
                         }
 
@@ -341,7 +352,9 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
                         }
 
                         "offer" => {
-                            // Uplink flow: client sent us an SDP offer.
+                            // Client sent us an SDP offer (both flows: speakers
+                            // uplink and receiver client-offer). We answer, which
+                            // puts webrtc-rs in the DTLS-client role.
                             let peer_connection = match pc.as_ref() {
                                 Some(p) => p.clone(),
                                 None => {
@@ -576,6 +589,15 @@ async fn pump_inbound_opus(
     let mut send_errors = 0u64;
     let mut last_log = std::time::Instant::now();
     let started_at = std::time::Instant::now();
+    // Per-log-window signal-level accumulators. rms48k ≈ 0 → the browser
+    // is sending silence (capture-side problem: muted tab, wrong source,
+    // "share tab audio" unchecked); rms48k > 0 but rms16k ≈ 0 → the
+    // downsampler is broken; both healthy but ASR emits nothing → the
+    // problem is downstream in the accumulator/engine.
+    let mut win_sumsq_48k: f64 = 0.0;
+    let mut win_n_48k: u64 = 0;
+    let mut win_sumsq_16k: f64 = 0.0;
+    let mut win_n_16k: u64 = 0;
 
     loop {
         let read_result = track.read_rtp().await;
@@ -645,6 +667,15 @@ async fn pump_inbound_opus(
                 let samples_16k = downsampler.feed(&f32_samples);
                 total_samples_16k += samples_16k.len() as u64;
 
+                for s in &f32_samples {
+                    win_sumsq_48k += (*s as f64) * (*s as f64);
+                }
+                win_n_48k += f32_samples.len() as u64;
+                for s in &samples_16k {
+                    win_sumsq_16k += (*s as f64) * (*s as f64);
+                }
+                win_n_16k += samples_16k.len() as u64;
+
                 if !samples_16k.is_empty() {
                     if let Err(e) = audio_tx.send(samples_16k).await {
                         send_errors += 1;
@@ -665,14 +696,30 @@ async fn pump_inbound_opus(
                     );
                 }
                 if last_log.elapsed().as_secs() >= 5 {
+                    let rms48 = if win_n_48k > 0 {
+                        (win_sumsq_48k / win_n_48k as f64).sqrt()
+                    } else {
+                        0.0
+                    };
+                    let rms16 = if win_n_16k > 0 {
+                        (win_sumsq_16k / win_n_16k as f64).sqrt()
+                    } else {
+                        0.0
+                    };
                     eprintln!(
-                        "[WS {}] Uplink: {} pkts, {:.1}s audio, {} decode errors, {} send errors",
+                        "[WS {}] Uplink: {} pkts, {:.1}s audio, {} decode errors, {} send errors, rms48k={:.4} rms16k={:.4}",
                         client_id,
                         packets_seen,
                         total_samples_16k as f32 / 16000.0,
                         decode_errors,
-                        send_errors
+                        send_errors,
+                        rms48,
+                        rms16
                     );
+                    win_sumsq_48k = 0.0;
+                    win_n_48k = 0;
+                    win_sumsq_16k = 0.0;
+                    win_n_16k = 0;
                     last_log = std::time::Instant::now();
                 }
             }

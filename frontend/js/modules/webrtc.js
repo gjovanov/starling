@@ -89,7 +89,11 @@ export class WebRTCClient {
       this.ws.onopen = () => {
         console.log('[WebRTC] Signaling connected');
         this.reconnectAttempts = 0; // Reset on successful connection
-        this.setupPeerConnection();
+        this.setupPeerConnection().catch((e) => {
+          console.error('[WebRTC] setupPeerConnection failed:', e);
+          this.emit('error', e);
+          reject(e);
+        });
       };
 
       this.ws.onclose = (event) => {
@@ -190,9 +194,20 @@ export class WebRTCClient {
   }
 
   /**
-   * Set up WebRTC peer connection
+   * Set up WebRTC peer connection.
+   *
+   * Two signaling flows exist:
+   *  - Legacy (vllm-server, parakeet-rs): send `ready`, the SERVER
+   *    creates the SDP offer, we answer.
+   *  - Client-offer (burn-server, advertised via
+   *    `/api/config::webrtcFlow === 'client-offer'`): send `ready`,
+   *    then WE create a recvonly offer and the server answers. This
+   *    keeps the Rust side in the DTLS-client role — modern Chrome as
+   *    DTLS client against webrtc-rs 0.11 as DTLS server fails the
+   *    handshake (ICE reaches `connected` but connectionState goes
+   *    `failed` and no RTP flows).
    */
-  setupPeerConnection() {
+  async setupPeerConnection() {
     // Create peer connection with ICE transport policy from server config
     const rtcConfig = {
       iceServers: this.options.iceServers,
@@ -289,8 +304,19 @@ export class WebRTCClient {
       console.log('[WebRTC] ICE gathering state:', this.pc.iceGatheringState);
     };
 
-    // Signal ready to receive offer
+    // Signal ready to receive audio
     this.ws.send(JSON.stringify({ type: 'ready' }));
+
+    // Client-offer flow: create the recvonly offer ourselves. The `ready`
+    // message above is already in the WS send queue, so the server
+    // processes it (creating its PC + track) before this offer arrives.
+    if (this.options.webrtcFlow === 'client-offer') {
+      this.pc.addTransceiver('audio', { direction: 'recvonly' });
+      const offer = await this.pc.createOffer();
+      await this.pc.setLocalDescription(offer);
+      this.ws.send(JSON.stringify({ type: 'offer', sdp: offer.sdp }));
+      console.log('[WebRTC] Sent client offer (client-offer flow)');
+    }
   }
 
   /**
@@ -326,6 +352,22 @@ export class WebRTCClient {
           resolve();
         } catch (e) {
           console.error('[WebRTC] Error handling offer:', e);
+          this.emit('error', e);
+        }
+        break;
+
+      case 'answer':
+        // Client-offer flow: the server answered our recvonly offer.
+        console.log('[WebRTC] Received answer (client-offer flow)');
+        try {
+          await this.pc.setRemoteDescription({
+            type: 'answer',
+            sdp: msg.sdp,
+          });
+          console.log('[WebRTC] Remote answer applied');
+          resolve();
+        } catch (e) {
+          console.error('[WebRTC] Error applying answer:', e);
           this.emit('error', e);
         }
         break;
