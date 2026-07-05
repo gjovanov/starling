@@ -247,8 +247,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
     let app = app
-        // Static frontend (models served via symlink: frontend/models → ../models/cache)
-        .fallback_service(ServeDir::new(&frontend_path))
+        // Static frontend (models served via symlink: frontend/models → ../models/cache).
+        // `Cache-Control: no-cache` forces the browser to REVALIDATE every
+        // static asset (ES modules included) on each load — 304s keep it
+        // fast, but a plain reload always picks up frontend changes. The
+        // browser's heuristic caching otherwise keeps stale JS modules
+        // alive across normal reloads, which repeatedly masked frontend
+        // fixes (users kept running an old webrtc-uplink.js).
+        .fallback_service(
+            tower::ServiceBuilder::new()
+                .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+                    axum::http::header::CACHE_CONTROL,
+                    axum::http::HeaderValue::from_static("no-cache"),
+                ))
+                .service(ServeDir::new(&frontend_path)),
+        )
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)) // 2GB upload
         .layer(CorsLayer::permissive())
         .with_state(state);

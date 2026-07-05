@@ -29,7 +29,10 @@ cubecl = { version = "0.9", features = ["wgpu"], default-features = false }
 
 # HTTP server
 axum = { version = "0.7", features = ["ws", "multipart"] }
-tower-http = { version = "0.5", features = ["fs", "cors"] }
+# `util` is used by integration tests (oneshot); ServiceBuilder (used in
+# main.rs for the static-file Cache-Control layer) is in tower core.
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.5", features = ["fs", "cors", "set-header"] }
 tokio = { version = "1", features = ["full"] }
 
 # Audio processing
@@ -93,7 +96,8 @@ sha1 = "0.10"
 libc = "0.2"
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
+# (tower moved to [dependencies] — main.rs uses ServiceBuilder for the
+# static-file Cache-Control layer; tests keep using the util feature.)
 
 [features]
 default = ["native"]
