@@ -60,6 +60,10 @@ npm-debug.log*
 .npm/
 .yarn/
 
+# OCR runtime artifacts (media/ocr is covered by media/ above)
+results/ocr/
+apps/ocr-server/ocr.sqlite3*
+
 # Python test artifacts
 test-results/
 .pytest_cache/

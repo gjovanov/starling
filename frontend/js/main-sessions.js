@@ -20,6 +20,7 @@ import {
   deleteVoiceRef as ttsDeleteVoiceRef,
 } from './modules/tts-manager.js';
 import { TtsPlayer, exposePlayerForTests } from './modules/tts-player.js';
+import { setupOcrTab } from './modules/ocr.js';
 
 // Application state
 const state = {
@@ -121,6 +122,16 @@ async function init() {
   } catch (err) {
     console.warn('TTS tab init failed (server may be down):', err);
     setTtsAvailable(false);
+  }
+
+  // Initialize the OCR tab (served by ocr-server). Same policy as TTS:
+  // when the backend has no /api/ocr/config route, hide the tab entirely.
+  try {
+    await setupOcrTab();
+    setOcrAvailable(true);
+  } catch (err) {
+    console.warn('OCR tab init failed (server may be down):', err);
+    setOcrAvailable(false);
   }
 
   console.log('Multi-session application initialized');
@@ -1173,13 +1184,13 @@ function setupTopTabs() {
   } catch {
     // Some browsers refuse storage in private mode; safe to ignore.
   }
-  if (stored === 'stt' || stored === 'tts') {
+  if (stored === 'stt' || stored === 'tts' || stored === 'ocr') {
     setTopTab(stored, { persist: false });
   }
 }
 
 function setTopTab(name, { persist = true } = {}) {
-  if (name !== 'stt' && name !== 'tts') return;
+  if (name !== 'stt' && name !== 'tts' && name !== 'ocr') return;
   if (!elements.topTabs) return;
   const targetTab = Array.from(elements.topTabs).find(t => t.dataset.top === name);
   if (targetTab && targetTab.hidden) return;
@@ -1201,7 +1212,17 @@ function setTtsAvailable(available) {
   const ttsTab = Array.from(elements.topTabs).find(t => t.dataset.top === 'tts');
   if (!ttsTab) return;
   ttsTab.hidden = !available;
-  if (!available) {
+  if (!available && ttsTab.classList.contains('active')) {
+    setTopTab('stt', { persist: false });
+  }
+}
+
+function setOcrAvailable(available) {
+  if (!elements.topTabs) return;
+  const ocrTab = Array.from(elements.topTabs).find(t => t.dataset.top === 'ocr');
+  if (!ocrTab) return;
+  ocrTab.hidden = !available;
+  if (!available && ocrTab.classList.contains('active')) {
     setTopTab('stt', { persist: false });
   }
 }

@@ -417,6 +417,198 @@
     .btn-small:hover {
       opacity: 0.8;
     }
+
+    /* ─── OCR tab ─────────────────────────────────────────────── */
+    .ocr-toolbar {
+      display: grid;
+      grid-template-columns: 1fr 320px;
+      gap: 15px;
+      margin-bottom: 18px;
+    }
+    .ocr-options {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .ocr-section {
+      margin-top: 22px;
+    }
+    .ocr-section h3 {
+      color: #a0a0a0;
+      font-size: 0.95em;
+      font-weight: 600;
+      margin-bottom: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .ocr-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9em;
+    }
+    .ocr-table th {
+      text-align: left;
+      color: #a0a0a0;
+      font-weight: 500;
+      padding: 6px 10px;
+      border-bottom: 1px solid #1f4068;
+      font-size: 0.85em;
+    }
+    .ocr-table td {
+      padding: 8px 10px;
+      border-bottom: 1px solid #16213e;
+      vertical-align: middle;
+    }
+    .ocr-badge {
+      display: inline-block;
+      padding: 2px 10px;
+      border-radius: 10px;
+      font-size: 0.8em;
+      font-weight: 500;
+      background: #3a3a4a;
+      color: #a0a0a0;
+      white-space: nowrap;
+    }
+    .ocr-badge.queued   { background: #6c757d; color: white; }
+    .ocr-badge.running  { background: #ffc107; color: #000; }
+    .ocr-badge.done     { background: #28a745; color: white; }
+    .ocr-badge.failed   { background: #dc3545; color: white; }
+    .ocr-badge.valid    { background: #28a745; color: white; }
+    .ocr-badge.needs_review { background: #ff8c00; color: white; }
+    .ocr-badge.engine   { background: #667eea; color: white; }
+    .ocr-badge.live     { background: #28a745; color: white; }
+    .ocr-badge.offline  { background: #dc3545; color: white; }
+    .ocr-progress {
+      width: 110px;
+      height: 8px;
+      background: #16213e;
+      border-radius: 4px;
+      overflow: hidden;
+      display: inline-block;
+      vertical-align: middle;
+    }
+    .ocr-dur {
+      color: #7f8fb0;
+      font-size: 0.82em;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .ocr-pager {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-top: 12px;
+      font-size: 0.9em;
+    }
+    .ocr-progress-fill {
+      height: 100%;
+      background: #667eea;
+      width: 0%;
+      transition: width 0.2s;
+    }
+    .ocr-viewer {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 12px;
+      min-height: 300px;
+    }
+    .ocr-pane-box {
+      background: #16213e;
+      border: 1px solid #1f4068;
+      border-radius: 8px;
+      padding: 10px;
+      overflow: auto;
+      max-height: 560px;
+    }
+    /* Viewer tab control (4 tabs: Viewer / Markdown / Extraction / Download) */
+    .ocr-tabs {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 10px;
+      border-bottom: 1px solid #1f4068;
+    }
+    .ocr-tab {
+      padding: 7px 16px;
+      background: transparent;
+      border: 1px solid #1f4068;
+      border-bottom: none;
+      border-radius: 8px 8px 0 0;
+      color: #a0a0a0;
+      cursor: pointer;
+      font-size: 0.9em;
+      transition: all 0.15s;
+    }
+    .ocr-tab.active { background: #667eea; border-color: #667eea; color: white; }
+    .ocr-tab-pane { display: none; }
+    .ocr-tab-pane.active { display: block; }
+    .ocr-pane-tall { max-height: 65vh; }
+    .ocr-pane-tall img { max-width: 100%; border-radius: 4px; background: white; }
+    .ocr-tab-pagenav {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    #ocr-download-preview table { margin-bottom: 16px; }
+    #ocr-download-preview h4 {
+      color: #a0a0a0; font-size: 0.8em; font-weight: 600;
+      text-transform: uppercase; margin: 12px 0 6px;
+    }
+    .ocr-pane-box h4 {
+      color: #a0a0a0;
+      font-size: 0.8em;
+      font-weight: 600;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+    }
+    .ocr-pane-box img {
+      max-width: 100%;
+      border-radius: 4px;
+      background: white;
+    }
+    .ocr-pane-box pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: #eaeaea;
+      font-size: 0.85em;
+      line-height: 1.45;
+      font-family: 'SF Mono', Consolas, monospace;
+    }
+    .ocr-viewer-nav {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+    .ocr-check-fail { color: #ff6b6b; }
+    .ocr-check-pass { color: #50c878; }
+    .ocr-check-skip { color: #6c757d; }
+    .ocr-check-warn { color: #f0e68c; }
+    .ocr-diff-del { background: rgba(220, 53, 69, 0.28); display: block; }
+    .ocr-diff-add { background: rgba(40, 167, 69, 0.28); display: block; }
+    .ocr-doc-link { cursor: pointer; text-decoration: underline dotted; }
+    .ocr-doc-link:hover { color: #667eea; }
+    .ocr-engines-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .ocr-engine-row {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      background: #16213e;
+      border: 1px solid #1f4068;
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 0.9em;
+    }
+    .ocr-engine-row .grow { flex: 1; }
+    @media (max-width: 900px) {
+      .ocr-toolbar { grid-template-columns: 1fr; }
+      .ocr-viewer  { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
@@ -437,6 +629,7 @@
       <div class="top-tabs" role="tablist" aria-label="Mode">
         <button class="top-tab active" data-top="stt" role="tab" aria-selected="true">STT</button>
         <button class="top-tab" data-top="tts" role="tab" aria-selected="false">TTS</button>
+        <button class="top-tab" data-top="ocr" role="tab" aria-selected="false">OCR</button>
       </div>
 
       <!-- STT pane: sessions, create, media -->
@@ -920,6 +1113,131 @@
         </div>
       </div>
       </div><!-- /#tts-pane -->
+
+      <!-- OCR pane: upload, jobs, viewer, engines -->
+      <div id="ocr-pane" class="top-pane" role="tabpanel" aria-labelledby="ocr-tab">
+        <div id="ocr-content" class="session-content active">
+
+          <div class="ocr-toolbar">
+            <div class="upload-zone" id="ocr-upload-zone">
+              <input type="file" id="ocr-file-input" accept=".pdf,.png,.jpg,.jpeg" multiple>
+              <p>Drop documents here or click to upload</p>
+              <p class="media-meta">Supported: PDF, PNG, JPEG — invoices, receipts, financial documents</p>
+            </div>
+            <div class="ocr-options">
+              <div class="form-group">
+                <label for="ocr-engine-select">OCR engine</label>
+                <select id="ocr-engine-select"></select>
+              </div>
+              <div class="form-group">
+                <label for="ocr-language-hint">Language hint</label>
+                <input id="ocr-language-hint" type="text" value="bg,en">
+              </div>
+              <div class="form-group">
+                <label style="display:flex;gap:8px;align-items:center;cursor:pointer;font-weight:normal;">
+                  <input id="ocr-auto-extract" type="checkbox" checked>
+                  <span>Auto-extract structured data</span>
+                </label>
+              </div>
+              <div class="form-group" style="display:flex;justify-content:space-between;align-items:center;">
+                <span style="color:#a0a0a0;font-size:0.9em;">Live updates:</span>
+                <span id="ocr-ws-badge" class="ocr-badge">connecting</span>
+              </div>
+              <div id="ocr-upload-status" style="color:#a0a0a0;font-size:0.85em;min-height:1.2em;"></div>
+            </div>
+          </div>
+
+          <div class="ocr-section">
+            <h3>Jobs</h3>
+            <div id="ocr-jobs">
+              <div class="empty-state"><p>No documents yet — upload to start.</p></div>
+            </div>
+          </div>
+
+          <div class="ocr-section" id="ocr-viewer-section" style="display:none;">
+            <h3>Viewer</h3>
+            <div class="ocr-viewer-nav">
+              <span id="ocr-viewer-title" style="color:#eaeaea;"></span>
+              <span class="grow" style="flex:1;"></span>
+              <button id="ocr-extract-rerun" class="btn-small btn-primary" style="display:none;">Re-extract</button>
+              <button id="ocr-viewer-close" class="btn-small btn-danger">Close</button>
+            </div>
+            <div class="ocr-tabs" role="tablist">
+              <button class="ocr-tab active" data-otab="viewer" role="tab">Viewer</button>
+              <button class="ocr-tab" data-otab="markdown" role="tab">Markdown</button>
+              <button class="ocr-tab" data-otab="extraction" role="tab">Extraction</button>
+              <button class="ocr-tab" data-otab="download" role="tab">Download</button>
+            </div>
+            <div class="ocr-tab-pagenav" id="ocr-tab-pagenav">
+              <button id="ocr-page-prev" class="btn-small btn-primary">&larr; Prev</button>
+              <span id="ocr-page-indicator" style="color:#a0a0a0;"></span>
+              <button id="ocr-page-next" class="btn-small btn-primary">Next &rarr;</button>
+              <span id="ocr-viewer-source" class="ocr-badge"></span>
+            </div>
+
+            <div class="ocr-tab-pane active" data-otab-pane="viewer">
+              <div class="ocr-pane-box ocr-pane-tall">
+                <img id="ocr-viewer-image" alt="page image">
+              </div>
+            </div>
+            <div class="ocr-tab-pane" data-otab-pane="markdown">
+              <div class="ocr-pane-box ocr-pane-tall">
+                <pre id="ocr-viewer-markdown"></pre>
+              </div>
+            </div>
+            <div class="ocr-tab-pane" data-otab-pane="extraction">
+              <div class="ocr-pane-box ocr-pane-tall">
+                <div style="margin-bottom:8px;">
+                  <span id="ocr-viewer-validation" class="ocr-badge" style="display:none;"></span>
+                </div>
+                <div id="ocr-viewer-checks" style="font-size:0.85em;margin-bottom:8px;"></div>
+                <pre id="ocr-viewer-json"></pre>
+              </div>
+            </div>
+            <div class="ocr-tab-pane" data-otab-pane="download">
+              <div class="ocr-pane-box ocr-pane-tall">
+                <div style="display:flex;gap:12px;align-items:center;margin-bottom:14px;">
+                  <button id="ocr-download-csv" class="btn-small btn-primary">Download CSV</button>
+                  <span id="ocr-download-note" style="color:#a0a0a0;font-size:0.85em;"></span>
+                </div>
+                <div id="ocr-download-preview"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="ocr-section" id="ocr-compare-section" style="display:none;">
+            <h3>Compare</h3>
+            <div class="ocr-viewer-nav">
+              <span id="ocr-compare-title" style="color:#eaeaea;"></span>
+              <span class="grow" style="flex:1;"></span>
+              <select id="ocr-compare-rerun-engine"></select>
+              <button id="ocr-compare-rerun" class="btn-small btn-primary">Re-run</button>
+              <button id="ocr-compare-close" class="btn-small btn-danger">Close</button>
+            </div>
+            <div id="ocr-compare-grid" style="margin-bottom:12px;"></div>
+            <div class="ocr-viewer-nav">
+              <label style="color:#a0a0a0;">A: <select id="ocr-compare-a"></select></label>
+              <label style="color:#a0a0a0;">B: <select id="ocr-compare-b"></select></label>
+            </div>
+            <div class="ocr-viewer" style="grid-template-columns:1fr 1fr;">
+              <div class="ocr-pane-box">
+                <h4 id="ocr-compare-a-label">Run A</h4>
+                <pre id="ocr-compare-a-md"></pre>
+              </div>
+              <div class="ocr-pane-box">
+                <h4 id="ocr-compare-b-label">Run B</h4>
+                <pre id="ocr-compare-b-md"></pre>
+              </div>
+            </div>
+          </div>
+
+          <div class="ocr-section">
+            <h3>Engines</h3>
+            <div id="ocr-engines" class="ocr-engines-list"></div>
+          </div>
+
+        </div>
+      </div><!-- /#ocr-pane -->
     </section>
 
     <!-- Hidden audio element for WebRTC stream -->

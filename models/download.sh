@@ -5,12 +5,14 @@
 # All apps in this monorepo reference this directory to avoid duplicate downloads.
 #
 # Usage:
-#   ./download.sh              # Download all variants (BF16 + Q4 + TTS)
+#   ./download.sh              # Download all speech variants (BF16 + Q4 + TTS)
 #   ./download.sh --bf16-only  # Download BF16 SafeTensors only (~9GB)
 #   ./download.sh --q4-only    # Download Q4 GGUF only (~2.5GB)
 #   ./download.sh --tts-only   # Download Voxtral TTS only (~8GB)
 #   ./download.sh --no-tts     # Skip TTS download (useful on small disks)
 #   ./download.sh --chunk      # Also chunk Q4 GGUF into 64MB shards for WASM
+#   ./download.sh --ocr        # Also download OCR models (GLM-OCR + Qwen3-8B-FP8, ~11GB)
+#   ./download.sh --ocr-only   # Download OCR models only (used by apps/ocr-server/init.sh)
 #
 # Model storage layout:
 #   models/cache/
@@ -22,6 +24,9 @@
 #       consolidated.safetensors
 #       voice_embedding/       # 20 .pt voice presets bundled by Mistral
 #     tokenizer/               # Tekken tokenizer (shared)
+#     ocr/                     # OCR + extraction models — served by ocr-server
+#       glm-ocr/               # zai-org/GLM-OCR (0.9B, stage-1 OCR)
+#       qwen3-8b-fp8/          # Qwen/Qwen3-8B-FP8 (stage-2 structured extraction)
 #
 
 set -e
@@ -33,11 +38,14 @@ CACHE_DIR="$SCRIPT_DIR/cache"
 BF16_MODEL_ID="mistralai/Voxtral-Mini-4B-Realtime-2602"
 Q4_REPO_ID="TrevorJS/voxtral-mini-realtime-gguf"
 TTS_MODEL_ID="mistralai/Voxtral-4B-TTS-2603"
+OCR_GLM_MODEL_ID="zai-org/GLM-OCR"
+OCR_EXTRACT_MODEL_ID="Qwen/Qwen3-8B-FP8"
 
 # Parse args
 DOWNLOAD_BF16=true
 DOWNLOAD_Q4=true
 DOWNLOAD_TTS=true
+DOWNLOAD_OCR=false
 DO_CHUNK=false
 for arg in "$@"; do
     case "$arg" in
@@ -45,6 +53,8 @@ for arg in "$@"; do
         --q4-only)   DOWNLOAD_BF16=false; DOWNLOAD_TTS=false ;;
         --tts-only)  DOWNLOAD_BF16=false; DOWNLOAD_Q4=false ;;
         --no-tts)    DOWNLOAD_TTS=false ;;
+        --ocr)       DOWNLOAD_OCR=true ;;
+        --ocr-only)  DOWNLOAD_OCR=true; DOWNLOAD_BF16=false; DOWNLOAD_Q4=false; DOWNLOAD_TTS=false ;;
         --chunk)     DO_CHUNK=true ;;
     esac
 done
@@ -56,6 +66,7 @@ echo "  Cache: $CACHE_DIR"
 echo "  BF16:  $DOWNLOAD_BF16"
 echo "  Q4:    $DOWNLOAD_Q4"
 echo "  TTS:   $DOWNLOAD_TTS"
+echo "  OCR:   $DOWNLOAD_OCR"
 echo "  Chunk: $DO_CHUNK"
 echo ""
 
@@ -166,6 +177,47 @@ download_q4() {
     fi
 }
 
+# ─── OCR models (GLM-OCR + extraction LLM) ────────────────────────
+
+download_ocr() {
+    if [ "$DOWNLOAD_OCR" = false ]; then
+        return 0
+    fi
+
+    local glm_dir="$CACHE_DIR/ocr/glm-ocr"
+    if [ -f "$glm_dir/.download-complete" ]; then
+        echo "[OCR]  GLM-OCR already downloaded at $glm_dir"
+    else
+        echo "[OCR]  Downloading $OCR_GLM_MODEL_ID (~2GB)..."
+        hf_download "$OCR_GLM_MODEL_ID" "$glm_dir"
+        touch "$glm_dir/.download-complete"
+        echo "[OCR]  GLM-OCR done."
+    fi
+
+    local extract_dir="$CACHE_DIR/ocr/qwen3-8b-fp8"
+    if [ -f "$extract_dir/.download-complete" ]; then
+        echo "[OCR]  Qwen3-8B-FP8 already downloaded at $extract_dir"
+    else
+        echo "[OCR]  Downloading $OCR_EXTRACT_MODEL_ID (~9GB)..."
+        hf_download "$OCR_EXTRACT_MODEL_ID" "$extract_dir"
+        touch "$extract_dir/.download-complete"
+        echo "[OCR]  Qwen3-8B-FP8 done."
+    fi
+
+    # PP-DocLayout-V3 layout model (used by the glmocr SDK's CPU layout stage).
+    # Prefetched into the default HF cache — the SDK resolves the HF id from
+    # there, so first engine start works offline.
+    echo "[OCR]  Prefetching PaddlePaddle/PP-DocLayoutV3_safetensors (HF cache)..."
+    if command -v hf &>/dev/null; then
+        hf download "PaddlePaddle/PP-DocLayoutV3_safetensors" --quiet 2>&1 | tail -1
+    elif command -v huggingface-cli &>/dev/null; then
+        huggingface-cli download "PaddlePaddle/PP-DocLayoutV3_safetensors" --quiet 2>&1 | tail -1
+    else
+        python3 -c "from huggingface_hub import snapshot_download; snapshot_download('PaddlePaddle/PP-DocLayoutV3_safetensors')" 2>/dev/null \
+            || echo "  [WARN] could not prefetch layout model (will download on first use)"
+    fi
+}
+
 # ─── Chunk GGUF for WASM ──────────────────────────────────────────
 
 chunk_gguf() {
@@ -200,6 +252,7 @@ resolve_hf_token
 download_bf16
 download_q4
 download_tts
+download_ocr
 chunk_gguf
 
 echo ""

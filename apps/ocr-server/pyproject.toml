@@ -1,0 +1,31 @@
+[project]
+name = "ocr-server"
+version = "0.1.0"
+description = "Starling OCR + document-understanding server (GLM-OCR + structured extraction)"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "python-multipart>=0.0.18",
+    "aiosqlite>=0.20",
+    "pymupdf>=1.24",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[project.scripts]
+ocr-server = "ocr_server.main:run"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ocr_server*"]

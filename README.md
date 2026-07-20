@@ -1,18 +1,20 @@
 # Starling
 
-Multi-app monorepo for real-time **speech recognition (ASR)** and **text-to-speech (TTS)** powered by Mistral's Voxtral models. Two server implementations, one shared frontend, both running both models.
+Multi-app monorepo for real-time **speech recognition (ASR)**, **text-to-speech (TTS)** and **OCR + document understanding**. Three server apps, one shared frontend.
 
 - ASR: [Voxtral-Mini-4B-Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602)
 - TTS: [Voxtral-4B-TTS-2603](https://huggingface.co/mistralai/Voxtral-4B-TTS-2603)
+- OCR: [GLM-OCR](https://huggingface.co/zai-org/GLM-OCR) (stage 1) + [Qwen3-8B-FP8](https://huggingface.co/Qwen/Qwen3-8B-FP8) structured extraction (stage 2)
 
 ## Servers
 
-| Server | Stack | ASR | TTS | Where to run |
-|---|---|---|---|---|
-| [**vllm-server**](apps/vllm-server/) | Python · FastAPI · vLLM realtime · aiortc · vllm-omni | BF16, GPU | BF16, GPU | Reference / production-stable |
-| [**burn-server**](apps/burn-server/) | Rust · Axum · candle 0.10 + FlashAttention v2 (GPU) / ggml AVX-512 (CPU) | BF16 (GPU), Q4 (CPU), Q4 (WASM — partial) | BF16 (GPU) — native Rust port | Single-binary deployments, CPU laptops, in-browser experiments |
+| Server | Stack | Serves | Where to run |
+|---|---|---|---|
+| [**vllm-server**](apps/vllm-server/) | Python · FastAPI · vLLM realtime · aiortc · vllm-omni | ASR + TTS (BF16, GPU) | Reference / production-stable |
+| [**burn-server**](apps/burn-server/) | Rust · Axum · candle 0.10 + FlashAttention v2 (GPU) / ggml AVX-512 (CPU) | ASR (BF16 GPU, Q4 CPU, Q4 WASM — partial) + TTS (native Rust port) | Single-binary deployments, CPU laptops, in-browser experiments |
+| [**ocr-server**](apps/ocr-server/) | Python · FastAPI · vLLM · glmocr SDK | OCR → Markdown → validated invoice JSON; multi-engine bake-offs (GLM-OCR, tesseract) | Document digitization, engine comparisons on BG/EN financial documents |
 
-Both servers expose the same HTTP surface to a shared frontend in `frontend/`. A given browser session can hit either backend; both implement `POST /api/sessions` (ASR) and `POST /api/tts/synthesize` (TTS) with identical request/response shapes. The frontend reports which backend produced the current audio via an engine-identity badge.
+The speech servers expose the same HTTP surface to a shared frontend in `frontend/`. A given browser session can hit either backend; both implement `POST /api/sessions` (ASR) and `POST /api/tts/synthesize` (TTS) with identical request/response shapes. The frontend reports which backend produced the current audio via an engine-identity badge. ocr-server serves the same frontend and adds the OCR tab (`/api/ocr/*` + live WebSocket job updates).
 
 ## ASR — Voxtral-Mini-4B-Realtime
 
@@ -65,18 +67,25 @@ starling/
 │   │   ├── start-vllm.sh    # ASR vLLM realtime on :8001
 │   │   ├── start-vllm-tts.sh # TTS vllm-omni on :8002 (auto-spawned)
 │   │   └── start.sh         # FastAPI on :8090
-│   └── burn-server/         # Rust · Axum · candle 0.10
-│       ├── src/inference/
-│       │   ├── candle_native_flash/    # GPU BF16, FlashAttn v2, fused RmsNorm/RoPE
-│       │   ├── candle_cpu/             # CPU Q4 streaming engine, speculative decode
-│       │   └── voxtral_tts/            # Native Rust TTS (AR LLM + FMA + codec)
-│       └── start.sh         # Axum on :8091
+│   ├── burn-server/         # Rust · Axum · candle 0.10
+│   │   ├── src/inference/
+│   │   │   ├── candle_native_flash/    # GPU BF16, FlashAttn v2, fused RmsNorm/RoPE
+│   │   │   ├── candle_cpu/             # CPU Q4 streaming engine, speculative decode
+│   │   │   └── voxtral_tts/            # Native Rust TTS (AR LLM + FMA + codec)
+│   │   └── start.sh         # Axum on :8091
+│   └── ocr-server/          # Python · FastAPI · OCR + extraction pipeline
+│       ├── ocr_server/      # App (queue, engines, extraction, routes, WS)
+│       ├── start-vllm-ocr.sh     # GLM-OCR vLLM on :8003 (auto-spawned)
+│       ├── start-vllm-extract.sh # Qwen3-8B-FP8 vLLM on :8004 (auto-spawned)
+│       └── start.sh         # FastAPI on :8092
 ├── frontend/                # Shared HTML/CSS/JS (no build step)
 │   └── js/modules/tts-player.js  # 4-fix audio path
-├── media/                   # Shared audio files (uploads land here)
+├── media/                   # Shared audio files (uploads land here; media/ocr for documents)
 ├── models/                  # Shared model weights
-│   ├── download.sh          # Universal downloader (BF16 + Q4 + TTS + tokenizer)
-│   └── cache/{bf16,q4,tts,tokenizer}/
+│   ├── download.sh          # Universal downloader (BF16 + Q4 + TTS + tokenizer + OCR)
+│   └── cache/{bf16,q4,tts,tokenizer,ocr}/
+├── results/ocr/             # OCR run artifacts (markdown, JSON, bench CSVs)
+├── tools/ocr-bench.py       # Multi-engine OCR bake-off bench (CSV output)
 ├── libs/                    # Shared Rust crates (voxtral-core, ggml-matmul, wasm-engine)
 ├── docs/
 │   └── blog/                # 4-post technical blog series + demo videos
@@ -122,9 +131,31 @@ cd apps/burn-server
 
 For CPU streaming the ggml static libs from llama.cpp are needed; see [`apps/burn-server/README.md`](apps/burn-server/README.md) for the build recipe.
 
+### ocr-server (Python, GPU — mock engine works without)
+
+```bash
+cd apps/ocr-server
+./prerequisites.sh             # Python 3.10+, GPU check, optional tesseract recipe
+
+./init.sh                      # venv + vLLM + glmocr SDK + models (~11 GB)
+./init.sh --no-gpu --no-model  # CI / tests-only setup (mock engine)
+./start.sh                     # FastAPI — port 8092
+#   GLM-OCR (:8003) and the extraction LLM (:8004) auto-spawn on first use
+#   and idle-unload after 10 min. Upload invoices in the OCR tab; runs and
+#   extractions stream live over /api/ocr/ws.
+```
+
+Bake-off bench across engines:
+
+```bash
+./apps/ocr-server/.venv/bin/python tools/ocr-bench.py \
+    --dir apps/ocr-server/tests/fixtures --engines glm-ocr,tesseract-bul --extract auto
+# → results/ocr/bench-<timestamp>.csv + per-engine summary
+```
+
 ### Frontend
 
-Both servers serve the same `frontend/` automatically — open `http://localhost:8090` (vllm) or `http://localhost:8091` (burn) in Chrome. No npm install, no bundler.
+All servers serve the same `frontend/` automatically — open `http://localhost:8090` (vllm), `http://localhost:8091` (burn) or `http://localhost:8092` (ocr) in Chrome. No npm install, no bundler. Tabs whose backend is absent hide themselves.
 
 ## Tests
 

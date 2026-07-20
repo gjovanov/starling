@@ -1,6 +1,6 @@
 # Starling
 
-Multi-app monorepo for real-time **ASR** (Voxtral-Mini-4B-Realtime) and **TTS** (Voxtral-4B-TTS-2603). TTS runs on **both** apps:
+Multi-app monorepo for real-time **ASR** (Voxtral-Mini-4B-Realtime), **TTS** (Voxtral-4B-TTS-2603) and **OCR + document understanding** (GLM-OCR + Qwen3-8B extraction; see the ocr-server section). TTS runs on **both** speech apps:
 - **vllm-server**: Python/vllm-omni reference implementation (production-stable, full HTTP API + chat-template integration).
 - **burn-server**: Native Rust/Candle port (Phase 2 — end-to-end pipeline shipped 2026-05-02). FMA + codec architecture validated bit-exact against upstream; AR LLM forward pass validated on real 4B-param weights. Pre-tokenized HTTP API at `/api/tts/synthesize-codes`. Tokenizer/chat-template integration is the gating follow-up.
 
@@ -20,7 +20,10 @@ starling/
   apps/
     vllm-server/                     # App 1: Python/vLLM (BF16, GPU only)
     burn-server/                     # App 2: Rust/Candle+Burn (BF16+Q4, GPU + WASM)
+    ocr-server/                      # App 3: Python/FastAPI OCR + extraction (GPU; mock engine without)
 ```
+
+Additional shared dirs used by ocr-server: `models/cache/ocr/` (GLM-OCR + Qwen3-8B-FP8, via `models/download.sh --ocr-only`), `media/ocr/{doc_id}/` (originals + page rasters), `results/ocr/{run_id}/` (markdown/JSON artifacts + bench CSVs; gitignored), `tools/ocr-bench.py` (bake-off bench).
 
 ## Apps
 
@@ -523,6 +526,93 @@ The hidden-state magnitude through 26 decoder layers drifts on dzn — not from 
 - ❌ Upgrading Burn — 0.21 doesn't fix it, and even if a hypothetical future version did, browser drivers would still each have their own drift.
 - ❌ Removing the STREAMING_PAD mask in argmax — `cpu_softmax` test proved unmasked Q4-wgpu output is no better; it's just differently wrong.
 - ❌ More single-op precision tests in voxtral-core. Every primitive op is bit-correct in isolation; the bug is in their composition.
+
+### ocr-server (Python/FastAPI, OCR + structured extraction)
+- **Ports**: 8092 (FastAPI), 8003 (GLM-OCR vLLM — lazy-spawned), 8004 (Qwen3-8B-FP8 vLLM — lazy-spawned)
+- **Pipeline per document**: upload (PDF/PNG/JPEG, sha256-deduped) → **Stage 1 OCR** (per-page Markdown via a selectable engine) → **Stage 2 extraction** (Markdown → schema-constrained invoice JSON via vLLM guided JSON/xgrammar) → deterministic **validation** (arithmetic, IBAN mod-97, Bulgarian ЕИК checksum, VAT-id format, ISO dates/currency) → `valid` / `needs_review`. Every stage transition + per-page progress is pushed over `WS /api/ocr/ws` — the frontend never polls jobs.
+- **Unit of comparison is a document; each OCR attempt is a run (document × engine)** — bake-offs are first-class. SQLite (WAL) at `apps/ocr-server/ocr.sqlite3`; queued jobs survive restarts (`running` rows re-queue on boot).
+- **Engines**: `glm-ocr` (0.9B, vLLM :8003 + glmocr SDK: PP-DocLayout-V3 layout on CPU via transformers, parallel region recognition, markdown assembly), `tesseract-bul` (CPU baseline, auto-registered when a binary is found — PATH or the no-root `~/.local/tesseract` dpkg-x prefix; see prerequisites.sh), `mock` (deterministic, tests/CI). Engine interface in `ocr_server/engines/base.py`.
+- **VRAM policy** (24 GiB): glm-ocr util 0.20 + extractor util **0.55** coexist (~19 GiB total; 0.45 OOMs — FP8 weights leave <1 GiB KV). `vram_class='heavy'` engines (future qwen3-vl-8b) never coexist with each other **or with the extractor** — the manager stops the extractor before a heavy load, and the extractor's pre-start hook unloads heavy engines (`EngineManager.unload_heavy_ready`). Concurrent heavy-OCR + extraction workloads will swap back and forth per job — for heavy-engine bake-offs use `extract=off` and re-extract afterwards.
+- **Lifecycle**: vLLM subprocesses lazy-spawn on first use via `engines/vllm_process.py` (state machine + `Probe` test seams, mirroring vllm-server's TTS lifecycle). Subprocess logs land in `/tmp/ocr-<name>.log`. **Termination signals the whole process group** — vLLM forks setproctitle'd `VLLM::EngineCore` children that leak VRAM if only the master is killed. A crashed upstream mid-run marks the run `failed` with the cause and relaunches on the next request (`VllmProcess.state` reads IDLE when the child died — don't reintroduce a stale-READY fast path).
+- **Warm-start defaults** (tuned after profiling — cold boot is ~35 s (OCR) / ~66 s (extractor) vs sub-second/~17 s warm): the OCR engine **pre-warms at startup** (`OCR_ENGINE_PREWARM=1`, background/non-blocking — server health is up in <1 s while the engine boots; only fires for `vllm-subprocess`-kind engines, so mock/tesseract/CI skip it). **Both the OCR engine and the extractor never idle-unload** (`OCR_ENGINE_IDLE_UNLOAD_SECS=0`, `OCR_EXTRACT_IDLE_UNLOAD_SECS=0`) — otherwise the vLLM boot gets charged to the next request's timing after a >10 min gap (a re-extraction after idle looked like a 66 s "slow extraction" when 50 s of it was the extractor cold-booting; the idle-unload also raced with incoming requests → spurious "process died while READY" respawns). The extractor still lazy-loads on first use (not pre-warmed — avoids holding ~13.5 GiB when only OCR is used), then stays warm. **PP-DocLayout-V3 layout runs on GPU** (`OCR_LAYOUT_DEVICE=cuda`): ~0.9 s/page vs ~1.4 s on CPU (measured, 8-region invoice), +~1.5 GiB VRAM. Peak with glm-ocr + GPU layout + extractor all resident = **~20.6 GiB of 24.5** (headroom ~3.9 GiB); set `OCR_LAYOUT_DEVICE=cpu` or a nonzero idle-unload to reclaim VRAM if a heavy OCR engine needs the room. Per-page cost is region-count-driven: simple invoice ~0.9 s, dense multi-region bill ~4–7 s (each layout region is a parallel OCR request, `max_workers=8` in the SDK).
+
+#### WSL2 + RTX 5090 (sm_120) vLLM quirks — encoded in both start-vllm-*.sh, don't re-debug
+1. `VLLM_USE_V2_MODEL_RUNNER=0` — WSL2 CUDA has no UVA host-mapped memory; the V2 runner hard-fails with "UVA is not available".
+2. `VLLM_USE_FLASHINFER_SAMPLER=0` — FlashInfer's JIT arch probe produces an empty arch list on WSL2+sm_120 ("requires GPUs with sm75 or higher") and takes the top-k/top-p sampler down.
+3. `--attention-backend TRITON_ATTN` — same FlashInfer probe breaks the default attention path.
+
+#### glmocr SDK gotchas
+- **Never pass `config_path`** to `GlmOcr(...)` — it REPLACES the bundled config.yaml wholesale (losing label_task_mapping/prompts/id2label). Constructor overrides (`mode="selfhosted"`, `ocr_api_host/port`, `layout_device="cpu"`) layer on top of the bundled defaults, which already match our `--served-model-name glm-ocr`. Nested-dict kwargs are silently ignored.
+- `GlmOcr()` probes the OCR server during construction — the vLLM process must be healthy first (`ensure_ready` orders this).
+- `parse()` **swallows request failures and returns empty results** when the upstream dies mid-parse; `glm_ocr.py` treats an empty markdown + failed health probe as an EngineError. The upstream constraint applies to runs 20–22-era data: pages OCR'd while the server was dying may be empty.
+- PP-DocLayout-V3 runs via transformers (no paddle); prefetched into the HF cache by `models/download.sh --ocr-only`.
+
+#### Setup & Run
+```bash
+cd apps/ocr-server
+./init.sh                    # venv + vLLM + glmocr + models (~11 GB); --no-gpu/--no-model for CI
+./start.sh                   # FastAPI on :8092 (engine subprocesses spawn on demand)
+OCR_ENGINE=mock ./start.sh   # GPU-free demo/tests
+
+./.venv/bin/pytest           # 73 tests, no GPU needed (mock engine + probe-injected fakes)
+cd ../../tests/e2e && bun run test specs/ocr.spec.ts   # 8 Playwright tests against the real
+                             # server with the mock engine (spawned by fixtures/ocrServer.ts)
+
+# Bake-off bench → results/ocr/bench-<ts>.csv (+ per-engine summary table)
+./apps/ocr-server/.venv/bin/python tools/ocr-bench.py \
+    --dir apps/ocr-server/tests/fixtures --engines glm-ocr,tesseract-bul --extract auto
+```
+Measured on RTX 5090 Laptop (WSL2): GLM-OCR ~35 s cold boot (avoided by pre-warm + no idle-unload — see Warm-start defaults), **~0.9 s/page warm** on a simple invoice with GPU layout (~1.4 s with CPU layout; dense multi-region bills ~4–7 s); tesseract ~0.3 s/page; extraction ~70 s cold boot. Text-layer (born-digital) PDFs skip OCR entirely (~0 ms). Reference bench on the synthetic fixtures: glm-ocr 3/3 `valid` extractions, tesseract 1/3 (column interleaving confuses stage 2) at 40× the speed.
+
+**Extraction speed** (decode-bound; Qwen3-8B-FP8 is GPU/vLLM, ~180 tok/s with speculation): dominated by output size, which for Cyrillic invoices is large (~89 tokens/line-item — Cyrillic descriptions are token-heavy). **ngram speculative decoding is ON by default** (`OCR_EXTRACT_NGRAM=1` in start-vllm-extract.sh) — invoice JSON is highly repetitive (field names + schema-constrained structure), so drafting n-grams from the prompt/output-so-far ~**2.4× faster** (a dense 45-line BG invoice: 55 s → 22 s; 30-line: 40 s → 17 s; small: 9 s → 4 s), with byte-identical output (speculation is verified/exact). Further levers if needed: `OCR_EXTRACT_MODEL=qwen3-4b-instruct` (~2× faster, quality tradeoff on messy docs); flash attention would help but is blocked on WSL2/sm_120 (Triton attention only, ~73 tok/s unspeculated).
+
+#### API contract (stable boundary for any future Rust port)
+```
+POST   /api/ocr/documents                multipart files[] + engine/extract/extract_model/language_hint
+GET    /api/ocr/documents                listing + latest run/extraction summary
+GET/POST /api/ocr/documents/{id}/runs    bake-off runs (POST body: {engine, extract?, language_hint?})
+DELETE /api/ocr/documents/{id}           cascade-delete document + runs + extractions + files (409 while a run is processing)
+GET    /api/ocr/runs/{id}                run detail (pages, timings, extractions)
+GET    /api/ocr/runs/{id}/pages/{n}.png|.md   page artifacts; /runs/{id}/markdown = concatenated
+POST   /api/ocr/runs/{id}/extract        rerun stage 2 ({model?})
+GET    /api/ocr/extractions/{id}         JSON + validation report
+GET    /api/ocr/extractions/{id}/csv     invoice as CSV (metadata + line items; UTF-8 BOM for Cyrillic)
+GET    /api/ocr/engines                  registry + status + extractor status
+POST   /api/ocr/engines/{name}/load|unload
+GET    /api/ocr/config                   OCR-tab bootstrap
+WS     /api/ocr/ws                       {"type":"run"|"extraction"|"engine"|"document", ...} events
+                                         (extraction "done" carries ms; "document" status="deleted" prunes rows)
+```
+
+#### ocr-server Structure
+```
+apps/ocr-server/
+  init.sh / start.sh / prerequisites.sh   # setup (--no-gpu, --no-model, --dry-run)
+  start-vllm-ocr.sh / start-vllm-extract.sh  # engine launchers (WSL2 flags inside)
+  ocr_server/
+    main.py / config.py (OCR_* env) / state.py (app_state singleton)
+    db.py                # SQLite WAL: document / run / page_result / extraction
+    queue.py             # two asyncio workers (OCR serializes GPU; extraction parallel)
+    ws.py                # Broadcaster + /api/ocr/ws endpoint
+    ingest.py / pdf.py   # magic-byte sniffing, sha dedupe, text-layer fast path, raster
+    engines/             # base.py, manager.py (swap policy), vllm_process.py (lifecycle),
+                         # glm_ocr.py, tesseract.py, mock.py
+    extraction/          # schema.py (required-but-nullable!), extractor.py (guided JSON),
+                         # validate.py (pure functions), csv_export.py (invoice → CSV)
+    routes/              # documents.py, jobs.py, results.py, engines.py
+  tests/                 # 73 pytest; fixtures/generate_fixtures.py builds the synthetic
+                         # BG/EN invoices (checksums computed, not hardcoded)
+frontend/js/modules/ocr.js|ocr-jobs.js|ocr-viewer.js   # OCR tab (jobs table w/ per-step
+                         # durations + client-side pagination + delete; 4-tab viewer:
+                         # Viewer/Markdown/Extraction/Download-CSV; compare+diff). Jobs table
+                         # resyncs from the server on WS reconnect (events lost in the gap
+                         # would otherwise leave a row stuck, e.g. OCR "running" after a done).
+tests/e2e/specs/ocr.spec.ts + fixtures/ocrServer.ts    # Playwright vs real server (mock engine)
+```
+
+**Schema note**: every field in `extraction/schema.py` is required-but-nullable (no pydantic defaults) — fields with defaults drop out of JSON-Schema `required` and the constrained decoder then omits the keys entirely.
+
+**PDF text-layer fast path**: born-digital pages (≥32 extractable chars) convert straight to Markdown (`source='text-layer'`) and never touch the GPU; image-only pages rasterize at 200 DPI. Mixed PDFs are handled per page.
 
 ## Shared Infrastructure
 
