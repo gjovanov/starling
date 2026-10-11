@@ -68,6 +68,9 @@ def worker_main(conn, cfg: dict) -> None:
     _die_with_parent()
     t0 = time.monotonic()
     try:
+        import torch  # noqa: F401 — the heavy part of a cold start, timed on its own
+        import transformers  # noqa: F401
+
         from .synth import Renderer, load_voice
 
         import_secs = time.monotonic() - t0
@@ -81,7 +84,7 @@ def worker_main(conn, cfg: dict) -> None:
         "load_secs": round(renderer.load_secs, 2),
         "resident_vram_gib": round(renderer.resident_vram_gib, 2),
     })
-    voice_cache: dict[str, np.ndarray] = {}
+    voice_cache: dict[tuple[str, int], np.ndarray] = {}   # (path, mtime_ns): a re-made voice is re-read
     while True:
         try:
             msg = conn.recv()
@@ -95,9 +98,10 @@ def worker_main(conn, cfg: dict) -> None:
         try:
             arrays = []
             for path in msg["voices"]:
-                if path not in voice_cache:
-                    voice_cache[path] = load_voice(path)
-                arrays.append(voice_cache[path])
+                key = (path, os.stat(path).st_mtime_ns)
+                if key not in voice_cache:
+                    voice_cache[key] = load_voice(path)
+                arrays.append(voice_cache[key])
             res = renderer.render(
                 [tuple(t) for t in msg["turns"]], arrays,
                 seed=msg["seed"], cfg_scale=msg["cfg_scale"],
