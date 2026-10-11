@@ -1,10 +1,11 @@
 # Starling
 
-Multi-app monorepo for real-time **speech recognition (ASR)**, **text-to-speech (TTS)** and **OCR + document understanding**. Three server apps, one shared frontend.
+Multi-app monorepo for real-time **speech recognition (ASR)**, **text-to-speech (TTS)**, **OCR + document understanding** and **multi-speaker "podcast" TTS**. Four server apps, one shared frontend.
 
 - ASR: [Voxtral-Mini-4B-Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602)
 - TTS: [Voxtral-4B-TTS-2603](https://huggingface.co/mistralai/Voxtral-4B-TTS-2603)
 - OCR: [GLM-OCR](https://huggingface.co/zai-org/GLM-OCR) (stage 1) + [Qwen3-8B-FP8](https://huggingface.co/Qwen/Qwen3-8B-FP8) structured extraction (stage 2)
+- Podcast TTS: [VibeVoice-1.5B](https://huggingface.co/microsoft/VibeVoice-1.5B) (up to 4 speakers, one continuous render) via Hugging Face transformers
 
 ## Servers
 
@@ -13,6 +14,7 @@ Multi-app monorepo for real-time **speech recognition (ASR)**, **text-to-speech 
 | [**vllm-server**](apps/vllm-server/) | Python · FastAPI · vLLM realtime · aiortc · vllm-omni | ASR + TTS (BF16, GPU) | Reference / production-stable |
 | [**burn-server**](apps/burn-server/) | Rust · Axum · candle 0.10 + FlashAttention v2 (GPU) / ggml AVX-512 (CPU) | ASR (BF16 GPU, Q4 CPU, Q4 WASM — partial) + TTS (native Rust port) | Single-binary deployments, CPU laptops, in-browser experiments |
 | [**ocr-server**](apps/ocr-server/) | Python · FastAPI · vLLM · glmocr SDK | OCR → Markdown → validated invoice JSON; multi-engine bake-offs (GLM-OCR, tesseract) | Document digitization, engine comparisons on BG/EN financial documents |
+| [**podcast-server**](apps/podcast-server/) | Python · FastAPI · transformers (VibeVoice) in a spawned GPU worker | Script of turns → one multi-speaker WAV (API on 127.0.0.1:8093 + `podcast-tts` CLI) | Two-host narration, dialogue voice-overs — read its responsible-use section first |
 
 The speech servers expose the same HTTP surface to a shared frontend in `frontend/`. A given browser session can hit either backend; both implement `POST /api/sessions` (ASR) and `POST /api/tts/synthesize` (TTS) with identical request/response shapes. The frontend reports which backend produced the current audio via an engine-identity badge. ocr-server serves the same frontend and adds the OCR tab (`/api/ocr/*` + live WebSocket job updates).
 
@@ -73,11 +75,15 @@ starling/
 │   │   │   ├── candle_cpu/             # CPU Q4 streaming engine, speculative decode
 │   │   │   └── voxtral_tts/            # Native Rust TTS (AR LLM + FMA + codec)
 │   │   └── start.sh         # Axum on :8091
-│   └── ocr-server/          # Python · FastAPI · OCR + extraction pipeline
-│       ├── ocr_server/      # App (queue, engines, extraction, routes, WS)
-│       ├── start-vllm-ocr.sh     # GLM-OCR vLLM on :8003 (auto-spawned)
-│       ├── start-vllm-extract.sh # Qwen3-8B-FP8 vLLM on :8004 (auto-spawned)
-│       └── start.sh         # FastAPI on :8092
+│   ├── ocr-server/          # Python · FastAPI · OCR + extraction pipeline
+│   │   ├── ocr_server/      # App (queue, engines, extraction, routes, WS)
+│   │   ├── start-vllm-ocr.sh     # GLM-OCR vLLM on :8003 (auto-spawned)
+│   │   ├── start-vllm-extract.sh # Qwen3-8B-FP8 vLLM on :8004 (auto-spawned)
+│   │   └── start.sh         # FastAPI on :8092
+│   └── podcast-server/      # Python · FastAPI · VibeVoice-1.5B multi-speaker TTS
+│       ├── podcast_server/  # App (lifecycle engine, GPU worker process, routes, CLI)
+│       ├── voices/          # michael.wav + emma.wav (synthetic Kokoro prompts)
+│       └── start.sh         # FastAPI on 127.0.0.1:8093
 ├── frontend/                # Shared HTML/CSS/JS (no build step)
 │   └── js/modules/tts-player.js  # 4-fix audio path
 ├── media/                   # Shared audio files (uploads land here; media/ocr for documents)
@@ -153,9 +159,22 @@ Bake-off bench across engines:
 # → results/ocr/bench-<timestamp>.csv + per-engine summary
 ```
 
+### podcast-server (Python, GPU — mock engine works without)
+
+```bash
+cd apps/podcast-server
+./init.sh                      # venv + torch (cu130) + transformers 5.19.0 + VibeVoice-1.5B (~5.4 GB, HF cache)
+./start.sh                     # FastAPI — 127.0.0.1:8093 only
+#   POST /api/tts/podcast {"turns":[{"speaker":"michael","text":"…"},{"speaker":"emma","text":"…"}]} → audio/wav
+#   The GPU worker spawns on first use and exits after 10 min idle (all VRAM returned).
+.venv/bin/podcast-tts script.txt -o out.wav   # batch CLI, lines of `<speaker>: <text>`
+```
+
+API only — it does not serve the shared frontend. Read the [responsible-use section](apps/podcast-server/README.md#responsible-use-and-licence) before publishing its output.
+
 ### Frontend
 
-All servers serve the same `frontend/` automatically — open `http://localhost:8090` (vllm), `http://localhost:8091` (burn) or `http://localhost:8092` (ocr) in Chrome. No npm install, no bundler. Tabs whose backend is absent hide themselves.
+All servers except podcast-server serve the same `frontend/` automatically — open `http://localhost:8090` (vllm), `http://localhost:8091` (burn) or `http://localhost:8092` (ocr) in Chrome. No npm install, no bundler. Tabs whose backend is absent hide themselves.
 
 ## Tests
 
@@ -165,6 +184,9 @@ cargo test --release --features voxtral-tts --lib voxtral_tts::
 
 # Python (vllm-server) — 145 pytest cases for TTS, ASR, lifecycle, audit log, refs
 cd apps/vllm-server && pytest -xvs
+
+# Python (podcast-server) — 78 pytest cases, no GPU (mock engine + a real spawned fake worker)
+cd apps/podcast-server && .venv/bin/pytest
 
 # Playwright (shared frontend, mock-server) — 28 cases for speakers / TTS UI / cloning
 cd tests/e2e && bunx playwright test
