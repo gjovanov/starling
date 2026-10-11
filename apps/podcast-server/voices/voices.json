@@ -1,0 +1,40 @@
+{
+  "michael": {
+    "file": "michael.wav",
+    "gender": "male",
+    "accent": "American English",
+    "duration_secs": 17.3,
+    "sample_rate": 24000,
+    "sha256": "a66d321817a1ffea7c10e6bd4690b80e5b86602bb8ce7262207e767c7243b1ff",
+    "source": {
+      "engine": "kokoro",
+      "kokoro_version": "0.9.4",
+      "model": "hexgrad/Kokoro-82M",
+      "model_revision": "f3ff3571791e39611d31c381e3a41a3af07b4987",
+      "model_license": "Apache-2.0",
+      "voice": "am_michael",
+      "lang_code": "a",
+      "speed": 1.0,
+      "text": "The library opens at nine in the morning and closes just after six. Most visitors come in the afternoon, when the light through the tall windows is soft and warm. On the second floor there is a long table by the wall, where people sit quietly with their books and notes."
+    }
+  },
+  "emma": {
+    "file": "emma.wav",
+    "gender": "female",
+    "accent": "British English",
+    "duration_secs": 16.23,
+    "sample_rate": 24000,
+    "sha256": "2d400350f323e4b6c504d8206970254e9641d28e468adfad25c3010190d69846",
+    "source": {
+      "engine": "kokoro",
+      "kokoro_version": "0.9.4",
+      "model": "hexgrad/Kokoro-82M",
+      "model_revision": "f3ff3571791e39611d31c381e3a41a3af07b4987",
+      "model_license": "Apache-2.0",
+      "voice": "bf_emma",
+      "lang_code": "b",
+      "speed": 1.0,
+      "text": "The village sits at the edge of a wide valley, with a small river running beside the main road. In spring the fields turn green almost overnight, and the old stone bridge is busy with walkers and cyclists. Further up the hill, a narrow path leads through the woods to a quiet clearing above the valley."
+    }
+  }
+}

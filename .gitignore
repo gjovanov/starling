@@ -34,6 +34,9 @@ models/cache/
 # These are small (~10 MB total), versioned, and load-bearing for the
 # Rust port's bit-exact regression tests.
 !apps/burn-server/test_data/**
+# podcast-server's voice prompts: two ~16 s synthetic clips (Kokoro-82M,
+# Apache-2.0) the model clones speakers from — small, versioned, load-bearing.
+!apps/podcast-server/voices/*.wav
 
 # Logs
 *.log
