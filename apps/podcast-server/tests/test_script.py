@@ -43,8 +43,9 @@ def test_parse_rejects_an_empty_script():
 
 
 def test_plan_assigns_roles_by_first_appearance():
-    p = plan([Turn("emma", "a"), Turn("michael", "b"), Turn("emma", "c")], VOICES, Settings())
-    assert p.speakers == ("emma", "michael")
+    # michael first: first-appearance order differs from alphabetical order
+    p = plan([Turn("michael", "a"), Turn("emma", "b"), Turn("michael", "c")], VOICES, Settings())
+    assert p.speakers == ("michael", "emma")
     assert p.roles == (0, 1, 0)
 
 

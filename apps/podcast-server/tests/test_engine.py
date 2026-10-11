@@ -172,6 +172,16 @@ async def test_worker_crash_is_reported_and_the_next_request_respawns():
     assert len(f.made) == 2
 
 
+async def test_worker_that_died_between_requests_is_replaced():
+    f = Factory()
+    e = _engine(f)
+    await _synth(e)
+    await f.made[0].stop()                          # e.g. OOM-killed while idle
+    await _synth(e)                                 # must respawn, not error
+    assert len(f.made) == 2 and e.state is State.READY
+    await e.shutdown()
+
+
 class ErroringSynth(MockWorker):
     async def request(self, payload, timeout):
         raise WorkerError("ValueError: bad input")
