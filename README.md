@@ -211,4 +211,7 @@ Demo recording infrastructure lives under [`docs/blog/_shared/`](docs/blog/_shar
 
 ## License
 
-MIT
+Apache-2.0, see [LICENSE](LICENSE). [NOTICE](NOTICE) lists the third-party work the code derives from or
+vendors. Model weights are not part of this repository and keep their own licences; each app's README
+names them (read the podcast-server's [responsible-use section](apps/podcast-server/README.md#responsible-use-and-licence)
+before publishing its output).

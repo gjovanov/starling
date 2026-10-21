@@ -3,7 +3,7 @@ name = "voxtral-core"
 version = "0.1.0"
 edition = "2021"
 description = "Voxtral-Mini-4B-Realtime inference core — shared between native server and WASM browser"
-license = "MIT"
+license = "Apache-2.0"
 
 [dependencies]
 # ML framework (wgpu backend for Q4 kernels + shared layers)

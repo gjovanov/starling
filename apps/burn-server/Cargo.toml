@@ -3,7 +3,7 @@ name = "burn-server"
 version = "0.1.0"
 edition = "2021"
 description = "Real-time Voxtral ASR server using Burn ML framework with Q4/BF16 inference and WASM browser mode"
-license = "MIT"
+license = "Apache-2.0"
 
 [lib]
 name = "burn_server"

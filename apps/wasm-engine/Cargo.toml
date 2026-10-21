@@ -3,7 +3,7 @@ name = "wasm-engine"
 version = "0.1.0"
 edition = "2021"
 description = "Voxtral WASM inference engine — Q4 model running in the browser via WebGPU"
-license = "MIT"
+license = "Apache-2.0"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

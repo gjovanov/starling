@@ -1,0 +1,25 @@
+Starling
+Copyright 2026 Goran Jovanov
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It includes, or derives from, the following third-party work:
+
+- apps/burn-server: the Voxtral ASR inference path derives from voxtral-mini-realtime-rs
+  (https://github.com/TrevorS/voxtral-mini-realtime-rs), licensed under the Apache License,
+  Version 2.0.
+
+- apps/burn-server: the candle-native engine follows the architecture of voxtral.c
+  (https://github.com/antirez/voxtral.c), a reference implementation licensed under the MIT
+  License, Copyright (c) 2026 Salvatore Sanfilippo.
+
+- apps/burn-server/patches/: patched copies of burn-candle 0.20.1, cubecl-cuda 0.9.0,
+  cubecl-wgpu 0.9.0 and cubecl-wgpu 0.10.0-pre.3, each dual-licensed MIT OR Apache-2.0, with
+  their own licence files kept beside them.
+
+- apps/podcast-server/scripts/vibevoice_key_map.py: the key mapping of the VibeVoice checkpoint
+  converter, vendored verbatim from huggingface/transformers (Apache License, Version 2.0,
+  Copyright 2026 The HuggingFace Team).
+
+Model weights (Voxtral, VibeVoice, Kokoro, GLM-OCR and others) are downloaded at setup time, are not
+part of this repository, and keep their own licences; each app's README names them.
